@@ -1,0 +1,8 @@
+{
+	"//": "Tests and scripts: the worker's runtime types plus Node's (sockets, fs, http).",
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"types": ["./worker-configuration.d.ts", "node"]
+	},
+	"include": ["src", "test", "worker-configuration.d.ts"]
+}

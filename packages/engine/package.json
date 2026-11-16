@@ -1,0 +1,26 @@
+{
+	"name": "@magnet-stream/engine",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Browser BitTorrent engine: tunnel client, peer-wire, verified downloads",
+	"exports": {
+		".": "./src/index.ts",
+		"./metainfo": "./src/metainfo.ts",
+		"./bencode": "./src/bencode.ts",
+		"./blocks-stream": "./src/blocks-stream.ts"
+	},
+	"scripts": {
+		"test": "vitest run",
+		"typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json"
+	},
+	"dependencies": {
+		"@magnet-stream/tunnel-protocol": "0.1.0"
+	},
+	"devDependencies": {
+		"@magnet-stream/fake-peer": "0.1.0",
+		"@types/node": "^24.19.2",
+		"typescript": "^6.0.3",
+		"vitest": "^5.0.2"
+	}
+}

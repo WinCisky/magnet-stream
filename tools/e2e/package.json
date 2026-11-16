@@ -1,0 +1,20 @@
+{
+	"name": "@magnet-stream/e2e",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Hermetic end-to-end test: fake peer -> wrangler dev gateway -> engine",
+	"scripts": {
+		"e2e": "node src/tunnel-download.ts",
+		"typecheck": "tsc -p tsconfig.json"
+	},
+	"dependencies": {
+		"@magnet-stream/engine": "0.1.0",
+		"@magnet-stream/fake-peer": "0.1.0",
+		"@magnet-stream/harness": "0.1.0"
+	},
+	"devDependencies": {
+		"@types/node": "^24.19.2",
+		"typescript": "^6.0.3"
+	}
+}

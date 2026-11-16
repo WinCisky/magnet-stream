@@ -1,0 +1,25 @@
+{
+	"name": "@magnet-stream/spike",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Phase 0 spike: throughput, WebSocket messages, billed requests and connection limits of a tunnel gateway",
+	"bin": {
+		"spike": "./src/cli.ts"
+	},
+	"scripts": {
+		"start": "node src/cli.ts",
+		"test": "vitest run",
+		"typecheck": "tsc -p tsconfig.json"
+	},
+	"dependencies": {
+		"@magnet-stream/engine": "0.1.0",
+		"@magnet-stream/fake-peer": "0.1.0"
+	},
+	"devDependencies": {
+		"@magnet-stream/harness": "0.1.0",
+		"@types/node": "^24.19.2",
+		"typescript": "^6.0.3",
+		"vitest": "^5.0.2"
+	}
+}

@@ -1,0 +1,36 @@
+[package]
+name = "magnet-seeders"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Small, fast API that resolves a magnet link to its swarm's peer list (trackers + DHT), with short-lived caching."
+license = "MIT"
+
+[[bin]]
+name = "magnet-seeders"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
+axum = { version = "0.8", features = ["query", "json", "http1", "tokio"], default-features = false }
+tower = { version = "0.5", features = ["util", "timeout"] }
+tower-http = { version = "0.7", features = ["cors", "timeout", "trace"] }
+moka = { version = "0.12", features = ["future"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+mainline = "8"
+futures-lite = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+data-encoding = "2"
+hex = "0.4"
+percent-encoding = "2"
+rand = "0.8"
+thiserror = "2"
+url = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha1 = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+base64 = "0.22"
+bytes = "1"

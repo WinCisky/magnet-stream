@@ -1,0 +1,6 @@
+{
+	"//": "Runtime code: web platform APIs only (it runs in a browser worker). No Node types.",
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": { "lib": ["es2023", "webworker"] },
+	"include": ["src"]
+}

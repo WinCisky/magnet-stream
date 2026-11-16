@@ -1,0 +1,23 @@
+{
+	"name": "@magnet-stream/fake-peer",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Deterministic test torrents and a scriptable BitTorrent peer (tests only)",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"bin": {
+		"fake-peer": "./src/cli.ts"
+	},
+	"scripts": {
+		"start": "node src/cli.ts",
+		"test": "vitest run",
+		"typecheck": "tsc -p tsconfig.json"
+	},
+	"devDependencies": {
+		"@types/node": "^24.19.2",
+		"typescript": "^6.0.3",
+		"vitest": "^5.0.2"
+	}
+}

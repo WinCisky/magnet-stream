@@ -1,0 +1,21 @@
+{
+	"name": "@magnet-stream/tunnel-protocol",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Frame codec of the browser <-> gateway tunnel protocol (no runtime dependencies)",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"scripts": {
+		"test": "vitest run",
+		"typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
+		"fixtures": "node scripts/gen-fixtures.ts"
+	},
+	"devDependencies": {
+		"@types/node": "^24.19.2",
+		"fast-check": "^4.10.2",
+		"typescript": "^6.0.3",
+		"vitest": "^5.0.2"
+	}
+}

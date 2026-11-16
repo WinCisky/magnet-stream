@@ -1,0 +1,53 @@
+---
+import '../styles/global.css';
+import { createInitialModeExpression } from 'mode-watcher';
+import MagnetFlow from '../lib/components/magnet-flow.svelte';
+---
+
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<!-- The ICO first, with its size: otherwise Chrome picks it over the SVG. -->
+		<link rel="icon" href={`${import.meta.env.BASE_URL}/favicon.ico`} sizes="32x32" />
+		<link rel="icon" type="image/svg+xml" href={`${import.meta.env.BASE_URL}/favicon.svg`} />
+		<meta name="viewport" content="width=device-width" />
+		<meta name="generator" content={Astro.generator} />
+		<title>Magnet Watcher</title>
+		<script is:inline set:html={createInitialModeExpression()} />
+		<!--
+			Cross-origin isolation (see public/coi-sw.js). Once its service
+			worker controls the page, responses carry COOP/COEP; the first visit
+			reloads once to get there (never twice in a session).
+		-->
+		<script is:inline define:vars={{ worker: `${import.meta.env.BASE_URL}/coi-sw.js` }}>
+			(() => {
+				const key = "mw-coi-reload";
+				try {
+					if (window.crossOriginIsolated) sessionStorage.removeItem(key);
+				} catch {}
+				if (window.crossOriginIsolated || !window.isSecureContext || !("serviceWorker" in navigator)) return;
+				const reload = () => {
+					try {
+						if (sessionStorage.getItem(key)) return;
+						sessionStorage.setItem(key, "1");
+					} catch {
+						return;
+					}
+					location.reload();
+				};
+				navigator.serviceWorker
+					.register(worker)
+					.then((registration) => {
+						// Controlled yet not isolated: this browser can't; don't loop.
+						if (navigator.serviceWorker.controller) return;
+						if (registration.active) reload();
+						else navigator.serviceWorker.addEventListener("controllerchange", reload);
+					})
+					.catch(() => {});
+			})();
+		</script>
+	</head>
+	<body>
+		<MagnetFlow client:load />
+	</body>
+</html>

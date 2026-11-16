@@ -1,0 +1,170 @@
+//! Configuration, loaded entirely from environment variables. Every value has
+//! a sane default and a bad value is logged and ignored (falls back to the
+//! default) rather than crashing the process — this service should come up
+//! even if it's misconfigured.
+
+use std::env;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub bind_addr: SocketAddr,
+    pub cache_ttl: Duration,
+    pub empty_cache_ttl: Duration,
+    pub deadline: Duration,
+    pub allowed_origins: AllowedOrigins,
+    pub default_trackers: Vec<String>,
+    pub max_trackers: usize,
+    pub max_cache_entries: u64,
+    pub dht_port: u16,
+    /// Max peer probes in flight across all swarms.
+    pub probe_concurrency: usize,
+    /// Max peers probed per swarm refresh.
+    pub max_probe_peers: usize,
+    pub probe_connect_timeout: Duration,
+    /// Hard cap on one probe (connect + handshake + first messages).
+    pub probe_timeout: Duration,
+    /// How long a probe waits for an unchoke after saying it's interested.
+    pub probe_unchoke_wait: Duration,
+    /// Active swarms are re-announced and re-probed this often.
+    pub refresh_interval: Duration,
+    /// A swarm stays active this long after the last client request for it.
+    pub active_ttl: Duration,
+    pub metadata_deadline: Duration,
+    pub metadata_cache_bytes: u64,
+    /// Shared with magnet-worker, which only connects to peers carrying a
+    /// token signed with it. Unset: no tokens are issued.
+    pub worker_token_secret: Option<Secret>,
+    pub token_ttl: Duration,
+    /// Allow probing loopback/private peers. Only for local testing.
+    pub allow_private_peers: bool,
+}
+
+/// A config value that must never end up in logs (`Config` is logged at
+/// startup).
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl Secret {
+    #[cfg(test)]
+    pub fn new(value: impl Into<String>) -> Self {
+        Secret(value.into())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum AllowedOrigins {
+    /// No `ALLOWED_ORIGINS` configured: CORS headers are not sent, so only
+    /// non-browser clients can use the API.
+    None,
+    /// `ALLOWED_ORIGINS=*`
+    Any,
+    /// `ALLOWED_ORIGINS=https://a.com,https://b.com`
+    List(Vec<String>),
+}
+
+const DEFAULT_TRACKERS: &[&str] = &[
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.tracker.cl:1337/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "http://tracker.openbittorrent.com:80/announce",
+];
+
+impl Config {
+    pub fn from_env() -> Self {
+        Config {
+            bind_addr: env_parse("BIND_ADDR", "0.0.0.0:8080".parse().unwrap()),
+            cache_ttl: env_secs("CACHE_TTL_SECS", 300),
+            empty_cache_ttl: env_secs("EMPTY_CACHE_TTL_SECS", 30),
+            deadline: env_millis("DEADLINE_MS", 3000),
+            allowed_origins: AllowedOrigins::from_env(),
+            default_trackers: default_trackers_from_env(),
+            max_trackers: env_parse("MAX_TRACKERS", 20usize),
+            max_cache_entries: env_parse("MAX_CACHE_ENTRIES", 50_000u64),
+            dht_port: env_parse("DHT_PORT", 6881u16),
+            probe_concurrency: env_parse("PROBE_CONCURRENCY", 256usize).max(1),
+            max_probe_peers: env_parse("MAX_PROBE_PEERS", 1000usize),
+            probe_connect_timeout: env_millis("PROBE_CONNECT_TIMEOUT_MS", 2500),
+            probe_timeout: env_millis("PROBE_TIMEOUT_MS", 5000),
+            probe_unchoke_wait: env_millis("PROBE_UNCHOKE_WAIT_MS", 2500),
+            refresh_interval: env_secs("REFRESH_INTERVAL_SECS", 300),
+            active_ttl: env_secs("ACTIVE_TTL_SECS", 1800),
+            metadata_deadline: env_millis("METADATA_DEADLINE_MS", 12_000),
+            metadata_cache_bytes: env_parse("METADATA_CACHE_MB", 256u64) * 1024 * 1024,
+            worker_token_secret: env::var("WORKER_TOKEN_SECRET")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(Secret),
+            token_ttl: env_secs("TOKEN_TTL_SECS", 900),
+            allow_private_peers: env_parse("ALLOW_PRIVATE_PEERS", false),
+        }
+    }
+}
+
+impl AllowedOrigins {
+    fn from_env() -> Self {
+        match env::var("ALLOWED_ORIGINS") {
+            Ok(raw) if raw.trim() == "*" => AllowedOrigins::Any,
+            Ok(raw) if !raw.trim().is_empty() => {
+                let list = raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if list.is_empty() {
+                    AllowedOrigins::None
+                } else {
+                    AllowedOrigins::List(list)
+                }
+            }
+            _ => AllowedOrigins::None,
+        }
+    }
+}
+
+fn default_trackers_from_env() -> Vec<String> {
+    match env::var("DEFAULT_TRACKERS") {
+        Ok(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Err(_) => DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
+    match env::var(key) {
+        Ok(raw) => raw.trim().parse().unwrap_or_else(|_| {
+            tracing::warn!(key, value = %raw, "invalid config value, using default");
+            default
+        }),
+        Err(_) => default,
+    }
+}
+
+fn env_secs(key: &str, default_secs: u64) -> Duration {
+    Duration::from_secs(env_parse(key, default_secs))
+}
+
+fn env_millis(key: &str, default_millis: u64) -> Duration {
+    Duration::from_millis(env_parse(key, default_millis))
+}

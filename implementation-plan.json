@@ -1,0 +1,2191 @@
+{
+  "plan_version": "1.3",
+  "resolved_decisions": [
+    {
+      "id": "OQ-01",
+      "decision": "La monorepo è un nuovo repository git. L'agent ha accesso in sola lettura alle cartelle dei tre PoC e ne copia i file; la storia git dei PoC non viene importata.",
+      "applied_to": [
+        "M1-01"
+      ]
+    },
+    {
+      "id": "OQ-09",
+      "decision": "Il browser non si autentica verso il VPS. Gli endpoint del VPS sono pubblici, con CORS limitato all'origine del sito frontend; per i WebSocket la stessa restrizione è applicata lato server sull'intestazione Origin.",
+      "applied_to": [
+        "M2-02",
+        "M4-01",
+        "M5-04"
+      ]
+    },
+    {
+      "id": "OQ-10",
+      "decision": "uTP con libreria esistente solo se largamente utilizzata e se realizza esattamente quanto serve; altrimenti implementazione propria. La verifica è il task M4-03.",
+      "applied_to": [
+        "M4-03",
+        "M4-04",
+        "M4-05"
+      ]
+    },
+    {
+      "id": "OQ-13",
+      "decision": "Si segue il PoC e non il documento: ogni video aperto viene sempre salvato nel browser; i pezzi si eliminano solo su azione esplicita dell'utente. Su questo punto la decisione sostituisce docs/architecture.md §Storage and database e §Target architecture (riga Piece buffer).",
+      "applied_to": [
+        "M3-03",
+        "M3-04"
+      ]
+    },
+    {
+      "id": "OQ-04",
+      "decision": "Per ora la pagina non fa upload verso i peer.",
+      "applied_to": [
+        "M1-06",
+        "M5-03"
+      ]
+    },
+    {
+      "id": "OQ-05",
+      "decision": "I torrent solo-v2 (BEP 52) sono in scope, insieme a v1 e ibridi.",
+      "applied_to": [
+        "M2-02",
+        "M2-03",
+        "M2-04",
+        "M2-07",
+        "M3-02"
+      ]
+    },
+    {
+      "id": "OQ-06",
+      "decision": "Il sito statico passa a Cloudflare Pages: intestazioni di isolamento via `_headers`, rimozione di coi-sw.js.",
+      "applied_to": [
+        "M1-02",
+        "M2-10",
+        "M3-05"
+      ]
+    },
+    {
+      "id": "OQ-07",
+      "decision": "Timeout di sessione di 2 ore su entrambi i gateway (configurabile).",
+      "applied_to": [
+        "M2-01",
+        "M4-01"
+      ]
+    },
+    {
+      "id": "OQ-08",
+      "decision": "Rate limit minimale sul gateway: 30 upgrade WebSocket al minuto per IP (default configurabile). Turnstile non implementato.",
+      "applied_to": [
+        "M2-01",
+        "M4-01",
+        "M5-04"
+      ]
+    },
+    {
+      "id": "OQ-11",
+      "decision": "Soglie temporali con default esigenti ma configurabili: socket aggiuntivo dopo 30 s sotto il doppio del bitrate; pezzi scarsi con almeno 120 s di buffer; escalation al VPS dopo 90 s con meno di 2 peer che consegnano o con rate sotto il bitrate; avviso in pagina dopo 30 s.",
+      "applied_to": [
+        "M2-06",
+        "M3-01",
+        "M3-06",
+        "M4-06"
+      ]
+    },
+    {
+      "id": "OQ-12",
+      "decision": "Il VPS attuale è adatto ad annunciarsi negli swarm.",
+      "applied_to": [
+        "M4-02"
+      ]
+    },
+    {
+      "id": "OQ-14",
+      "decision": "Limiti minimali su /peers: 30 richieste al minuto e 4 stream concorrenti per IP, 200 stream totali (default configurabili). Discovery include i tracker HTTP, come nella tabella dei componenti.",
+      "applied_to": [
+        "M2-02"
+      ]
+    },
+    {
+      "id": "OQ-20",
+      "decision": "Deploy automatico per frontend (Cloudflare Pages) e worker; deploy del VPS manuale con procedura documentata.",
+      "applied_to": [
+        "M2-10",
+        "M5-04"
+      ]
+    }
+  ],
+  "source_document": {
+    "title": "Magnet Streaming Architecture",
+    "url": "https://claude.ai/artifact/55xoqok7f3ZCweiupbUr3P",
+    "repo_path": "docs/architecture.md",
+    "note": "Precondizione di M1-01: esportare il documento in Markdown (menu Export del doc) e fornirlo alla sessione; le sezioni citate nei task (§) sono i titoli di quel file."
+  },
+  "poc_repositories": {
+    "magnet-watcher": "apps/web",
+    "magnet-worker": "apps/gateway",
+    "magnet-seeders": "services/seeders"
+  },
+  "global_rules": [
+    "Le cartelle originali dei tre PoC (magnet-watcher, magnet-worker, magnet-seeders) sono accessibili in sola lettura come riferimento: non modificarle",
+    "Un task per sessione; ogni sessione parte senza memoria: leggere AGENTS.md, docs/architecture.md e i documenti citati nel task prima di iniziare",
+    "L'agent non esegue commit, push o deploy: lascia le modifiche nel working tree",
+    "Al termine di ogni task `npm run verify` deve terminare con exit 0 (e `npm run e2e` da M1-07 in poi)",
+    "Nessun segreto in codice o config versionati; solo variabili d'ambiente o secret store",
+    "Validare ogni input esterno (frame, messaggi peer-wire, magnet, parametri HTTP, dati letti da storage del browser)",
+    "Log senza dati sensibili: niente IP dei client, indirizzi dei peer, info-hash, magnet o nomi di file",
+    "In caso di conflitto tra docs/architecture.md e `resolved_decisions`, prevalgono le `resolved_decisions`",
+    "Se un task è bloccato da una open question, non assumere la risposta: fermarsi e segnalarlo",
+    "I task `executor: human` sono le revisioni manuali di fine milestone"
+  ],
+  "milestones": [
+    {
+      "id": "M1",
+      "name": "M1 - Fondamenta e fetta end-to-end minima",
+      "goal": "Monorepo, CI, harness e un download verificato browser-engine → gateway → peer finto; misura Phase 0"
+    },
+    {
+      "id": "M2",
+      "name": "M2 - Tunnel ed engine",
+      "goal": "Connessioni persistenti, discovery in streaming, metadati e PEX nel browser; rimozione di /v1/blocks"
+    },
+    {
+      "id": "M3",
+      "name": "M3 - Picker e buffer",
+      "goal": "Picker a deadline, verifica con attribuzione, OPFS, memoria di sessione, streaming via service worker"
+    },
+    {
+      "id": "M4",
+      "name": "M4 - Percorso pochi seeder",
+      "goal": "Gateway VPS con announce, ingresso, uTP e hole punching; escalation nell'engine"
+    },
+    {
+      "id": "M5",
+      "name": "M5 - Pulizia e sorgenti extra",
+      "goal": "Rimozione del legacy su VPS, web seed, WebRTC, runbook"
+    }
+  ],
+  "execution_order": [
+    {
+      "milestone": "M1",
+      "waves": [
+        [
+          "M1-01"
+        ],
+        [
+          "M1-02",
+          "M1-03",
+          "M1-04"
+        ],
+        [
+          "M1-05",
+          "M1-06"
+        ],
+        [
+          "M1-07"
+        ],
+        [
+          "M1-08"
+        ]
+      ]
+    },
+    {
+      "milestone": "M2",
+      "waves": [
+        [
+          "M2-01",
+          "M2-02",
+          "M2-03"
+        ],
+        [
+          "M2-04",
+          "M2-05"
+        ],
+        [
+          "M2-06"
+        ],
+        [
+          "M2-07"
+        ],
+        [
+          "M2-08"
+        ],
+        [
+          "M2-09",
+          "M2-10"
+        ],
+        [
+          "M2-11"
+        ]
+      ]
+    },
+    {
+      "milestone": "M3",
+      "waves": [
+        [
+          "M3-01",
+          "M3-03"
+        ],
+        [
+          "M3-02",
+          "M3-04",
+          "M3-05"
+        ],
+        [
+          "M3-06"
+        ],
+        [
+          "M3-07"
+        ]
+      ]
+    },
+    {
+      "milestone": "M4",
+      "waves": [
+        [
+          "M4-01"
+        ],
+        [
+          "M4-02",
+          "M4-03",
+          "M4-07"
+        ],
+        [
+          "M4-04",
+          "M4-06"
+        ],
+        [
+          "M4-05"
+        ],
+        [
+          "M4-08"
+        ],
+        [
+          "M4-09"
+        ]
+      ]
+    },
+    {
+      "milestone": "M5",
+      "waves": [
+        [
+          "M5-01",
+          "M5-02",
+          "M5-03"
+        ],
+        [
+          "M5-04"
+        ],
+        [
+          "M5-05"
+        ]
+      ]
+    }
+  ],
+  "open_questions": [
+    {
+      "id": "OQ-02",
+      "question": "Limite CPU di un Durable Object sul piano free (30 s o ~10 ms per evento): il documento lo dichiara non noto. Da esso dipendono percorso di default (oggetto free, Worker a pagamento, VPS) e cadenza del `ping`. Si chiude con lo spike in M1-08.",
+      "blocked_tasks": [
+        "M2-01",
+        "M5-04"
+      ]
+    },
+    {
+      "id": "OQ-03",
+      "question": "Il limite di 6 connessioni vale anche per socket aperti più tardi nella vita del WebSocket? Da misurare in M1-08.",
+      "blocked_tasks": [
+        "M2-06"
+      ]
+    },
+    {
+      "id": "OQ-19",
+      "question": "Dove vanno registrate le misure di fase (tre numeri)? Il documento esclude storage lato server; il piano le tiene nella diagnostica locale e in `docs/measurements.md` compilato a mano.",
+      "blocked_tasks": [
+        "M2-09"
+      ]
+    }
+  ],
+  "root_task": {
+    "id": "T0",
+    "parent_id": null,
+    "milestone": null,
+    "title": "Streaming di magnet nel browser con tunnel persistenti",
+    "description": "Realizzare in un'unica monorepo l'architettura di docs/architecture.md: client BitTorrent completo nel browser, gateway di tunnel su Cloudflare Durable Object, discovery e gateway di fallback sul VPS, nessun database e nessuno storage lato server.",
+    "depends_on": [],
+    "out_of_scope": [
+      "Database Postgres/Supabase",
+      "Cache dei pezzi lato server",
+      "Supporto a browser non Chromium",
+      "Upload verso i peer",
+      "Turnstile",
+      "Deploy automatico del VPS"
+    ],
+    "acceptance_criteria": [
+      "Tutti i task M1…M5 completati e revisionati",
+      "Le tre misure di fase registrate in docs/measurements.md"
+    ],
+    "automated_tests": [],
+    "functional_test": [],
+    "security": [
+      "Vedi global_rules"
+    ]
+  },
+  "tasks": [
+    {
+      "id": "M1-01",
+      "parent_id": "T0",
+      "milestone": "M1 - Fondamenta e fetta end-to-end minima",
+      "executor": "agent",
+      "title": "Scaffolding della monorepo e import dei tre PoC",
+      "description": "Creare la monorepo come NUOVO repository git (`git init` in una cartella vuota, senza importare la storia dei PoC) con npm workspaces + Cargo. I tre PoC sono disponibili in sola lettura nelle cartelle `magnet-watcher`, `magnet-worker`, `magnet-seeders` accessibili alla sessione (percorsi indicati all'avvio): copiarne i file, senza modificarle. Layout: `apps/web` (da magnet-watcher, Astro+Svelte), `apps/gateway` (da magnet-worker, Cloudflare Worker), `services/seeders` (da magnet-seeders, Rust), `packages/` e `tools/` vuoti con README, `docs/`. Copiare il codice dei tre PoC senza modifiche funzionali, adattando solo percorsi, package.json, tsconfig e Cargo workspace. Copiare in `docs/architecture.md` l'export Markdown del documento 'Magnet Streaming Architecture' fornito dall'umano (precondizione: il file deve essere messo a disposizione della sessione; l'agent non lo riscrive). Aggiungere script radice: `npm run build`, `npm run lint`, `npm run typecheck`, `npm test`, `npm run verify` (tutti i precedenti + `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`). Unire i CLAUDE.md/AGENTS.md esistenti in un `AGENTS.md` radice che descrive layout, comandi e le regole globali del piano (campo `global_rules`). Riferimento: docs/architecture.md §Target architecture (Repository mapping).",
+      "depends_on": [],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Modifiche funzionali al codice dei PoC",
+        "Modifiche alle cartelle originali dei PoC",
+        "Import della storia git dei PoC",
+        "Configurazione CI (M1-02)",
+        "Nuovi pacchetti (M1-03, M1-04)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "La monorepo è un nuovo repository git inizializzato, senza commit creati dall'agent; le cartelle originali dei PoC risultano invariate",
+        "La struttura `apps/web`, `apps/gateway`, `services/seeders`, `packages/`, `tools/`, `docs/` esiste e `npm ci` alla radice installa tutti i workspace",
+        "I test esistenti dei tre PoC (vitest di magnet-worker e magnet-watcher, cargo test di magnet-seeders) passano dalla radice",
+        "`docs/architecture.md` è presente e identico all'export fornito",
+        "`.gitignore` copre `node_modules`, `target`, `dist`, `.dev.vars`, `.env*` (eccetto `*.example`), `.wrangler`",
+        "Esistono `apps/gateway/.dev.vars.example` e `services/seeders/deploy/*.env.example` con soli segnaposto",
+        "`AGENTS.md` radice documenta layout, comandi e regole globali",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Suite esistenti dei tre PoC eseguite senza modifiche dai nuovi percorsi"
+        }
+      ],
+      "functional_test": [
+        "1. `npm ci` → exit 0",
+        "2. `npm run verify` → exit 0, tutte le suite importate verdi",
+        "3. `npm run build` → build di apps/web e typecheck di apps/gateway senza errori",
+        "4. `git status` → nessun file di segreti (.dev.vars, .env) tracciato"
+      ],
+      "security": [
+        "Nessun valore reale di TOKEN_SECRET / WORKER_TOKEN_SECRET o altri segreti importato dai PoC: solo file `.example`",
+        "Lockfile (`package-lock.json`, `Cargo.lock`) versionati per build riproducibili",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M1-02",
+      "parent_id": "T0",
+      "milestone": "M1 - Fondamenta e fetta end-to-end minima",
+      "executor": "agent",
+      "title": "Pipeline CI con scansione dipendenze e segreti",
+      "description": "Aggiungere `.github/workflows/ci.yml` che su push e pull request esegue: `npm ci`, `npm run verify`, build di apps/web, scansione dipendenze (npm audit a livello high + `cargo audit`, oppure osv-scanner su entrambi i lockfile) e secret scan (gitleaks) sull'intero albero. Cache per npm e cargo. Il workflow di deploy su GitHub Pages di magnet-watcher (`.github/workflows/deploy.yml`) non va importato: il sito passa a Cloudflare Pages e il deploy automatico arriva in M2-10.",
+      "depends_on": [
+        "M1-01"
+      ],
+      "parallel_with": [
+        "M1-03",
+        "M1-04"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Deploy automatico (M2-10)",
+        "Test e2e in CI (aggiunti in M1-07)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "La CI fallisce se lint, typecheck, test o build falliscono",
+        "La CI fallisce su vulnerabilità high/critical nelle dipendenze npm o cargo",
+        "La CI fallisce se la secret scan trova un segreto",
+        "`permissions:` del workflow è `contents: read` e non usa segreti del repository",
+        "Le action di terze parti sono fissate a uno SHA di commit",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "integration",
+          "covers": "Il workflow stesso: validato con `actionlint`; i job eseguono le suite esistenti"
+        }
+      ],
+      "functional_test": [
+        "1. `npx actionlint .github/workflows/ci.yml` (o equivalente) → nessun errore",
+        "2. Eseguire localmente gli stessi comandi dei job (`npm run verify`, scanner dipendenze, gitleaks) → exit 0",
+        "3. Introdurre temporaneamente una stringa tipo chiave AWS fittizia in un file → gitleaks fallisce; rimuoverla"
+      ],
+      "security": [
+        "Scansione dipendenze e secret scan obbligatorie e bloccanti",
+        "Token CI a privilegio minimo (`contents: read`), nessun segreto esposto ai job di PR",
+        "Action pinnate per SHA",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M1-03",
+      "parent_id": "T0",
+      "milestone": "M1 - Fondamenta e fetta end-to-end minima",
+      "executor": "agent",
+      "title": "Test harness: fake peer e swarm locale riutilizzabili",
+      "description": "Creare `tools/fake-peer` (pacchetto Node) partendo da `apps/gateway/scripts/fake-peer.mjs` e dagli scenari di `apps/gateway/scripts/e2e.mjs` (ex magnet-worker). Deve generare un torrent deterministico (seed, dimensione, piece length), restituire info dict, info-hash e magnet, e servire il peer-wire su TCP con comportamenti configurabili: seed completo, peer parziale (bitfield), ritardo di unchoke, mai unchoke, choke a metà, chiusura, dati corrotti, `reqq`, estensioni `ut_metadata` (BEP 9) e `ut_pex`. Esporre API programmatica (`startFakePeer(opts)`) e CLI (`npm run fake-peer -- --port … --size … --seed …`). Aggiungere helper `tools/harness` per avviare/fermare più peer e riservare porte libere. Riferimento: docs/architecture.md §What the proof of concept does (\"test harnesses with fake peers\").",
+      "depends_on": [
+        "M1-01"
+      ],
+      "parallel_with": [
+        "M1-02",
+        "M1-04"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Fake tracker / DHT (M4-08)",
+        "Modifiche al gateway",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "`startFakePeer` avvia un peer che completa handshake, bitfield, extended handshake e serve blocchi con hash corretti",
+        "Ogni comportamento elencato è selezionabile via opzioni e coperto da un test",
+        "Lo stesso seed produce sempre lo stesso info-hash",
+        "I peer ascoltano solo su 127.0.0.1 e porte effimere per default",
+        "Lo script e2e esistente di apps/gateway usa il nuovo pacchetto e resta verde",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Generazione deterministica del torrent, codifica bitfield, messaggi ut_metadata / ut_pex"
+        },
+        {
+          "type": "integration",
+          "covers": "Un client TCP di test scarica un torrent completo dal fake peer e verifica ogni pezzo; scenari choke, parziale, dati corrotti"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run fake-peer -- --port 6881 --size 8MiB --seed 1` → stampa magnet e info-hash, resta in ascolto",
+        "2. Rilanciare con lo stesso seed → stesso info-hash",
+        "3. `npm test -w tools/fake-peer` → verde"
+      ],
+      "security": [
+        "Bind esclusivamente su loopback; nessun contenuto reale: payload pseudo-casuale generato dal seed",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M1-04",
+      "parent_id": "T0",
+      "milestone": "M1 - Fondamenta e fetta end-to-end minima",
+      "executor": "agent",
+      "title": "Specifica e codec del protocollo di tunnel",
+      "description": "Creare `packages/tunnel-protocol` (TypeScript, senza dipendenze runtime) e `docs/tunnel-protocol.md`. Implementare encode/decode dei frame `[type u8][conn u16][length u32][payload]` con più frame per messaggio WebSocket binario, per i tipi `open`, `opened`, `failed`, `data`, `close`, `accept`, `ping` (docs/architecture.md §Tunnel protocol and request budget › Frames). Il documento di architettura non definisce i payload: questo task li specifica e li documenta (indirizzo IPv4/IPv6 + porta per `open`, codici di motivo per `failed`/`close`, come l'info-hash è associato al socket, versione del protocollo). Il decoder deve essere incrementale e rifiutare input malformati senza eccezioni non gestite. Il codec sarà usato da browser, gateway Cloudflare e test.",
+      "depends_on": [
+        "M1-01"
+      ],
+      "parallel_with": [
+        "M1-02",
+        "M1-03"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Implementazione del gateway o dell'engine",
+        "Codec Rust (M4-01)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Encode/decode round-trip per ogni tipo di frame, inclusi messaggi con più frame concatenati",
+        "Il decoder rifiuta con errore tipizzato: tipo sconosciuto, length oltre un massimo configurato, frame troncato, payload `open` non valido",
+        "`docs/tunnel-protocol.md` descrive ogni frame byte per byte, i codici di motivo e le regole (handshake gate, 6 connessioni per socket, batching) con rimando a docs/architecture.md",
+        "Vettori di test binari in `packages/tunnel-protocol/fixtures` riutilizzabili da altre implementazioni",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Round-trip, vettori binari fissi, fuzz/property test del decoder su input casuali (nessun crash, nessun loop)"
+        }
+      ],
+      "functional_test": [
+        "1. `npm test -w packages/tunnel-protocol` → verde, inclusi i property test",
+        "2. Aprire `docs/tunnel-protocol.md` e verificare che ogni frame della tabella di docs/architecture.md sia specificato"
+      ],
+      "security": [
+        "Validazione input: limiti su length e numero di frame per messaggio, parsing a tempo e memoria limitati",
+        "Nessun `eval` o deserializzazione generica: solo parsing binario esplicito",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M1-05",
+      "parent_id": "T0",
+      "milestone": "M1 - Fondamenta e fetta end-to-end minima",
+      "executor": "agent",
+      "title": "Gateway minimo su Durable Object con handshake gate",
+      "description": "In `apps/gateway` aggiungere una classe Durable Object SQLite-backed (richiesta dal piano free; non memorizza nulla) e la route WebSocket che vi instrada la sessione. Implementare `open` → `connect()` TCP, scrittura dell'handshake BitTorrent a 68 byte da parte del gateway, attesa dell'handshake remoto valido per lo stesso info-hash, poi `opened` e inoltro bidirezionale dei byte come frame `data`; `failed` con motivo (refused, timeout, not BitTorrent) e `close`. Usare `packages/tunnel-protocol`. Riutilizzare `apps/gateway/src/wire.ts` e `peer.ts` (handshake, timeout) dove utile. Regole già in questo task: allow-list `Origin` da variabile `ALLOWED_ORIGINS`, rifiuto di indirizzi privati/riservati/loopback e porte < 1024, massimo 6 connessioni per WebSocket. Per i test locali è ammesso un flag `ALLOW_PRIVATE_PEERS` valido solo in `wrangler dev` (default disattivo). Mantenere per ora `/v1/blocks` invariato. Riferimenti: docs/architecture.md §Tunnel protocol and request budget (Frames, Rules), §Storage and database (\"The Durable Object stores nothing\").",
+      "depends_on": [
+        "M1-03",
+        "M1-04"
+      ],
+      "parallel_with": [
+        "M1-06"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Idle timeout, cap di sessione, ping, rate limit (M2-01)",
+        "Rimozione di `/v1/blocks` (M2-08)",
+        "Frame `accept` (solo VPS)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Un client WebSocket di test apre un tunnel verso un fake peer e scambia byte peer-wire in entrambe le direzioni",
+        "Nessun byte viene inoltrato prima di un handshake remoto valido per lo stesso info-hash; un server TCP non BitTorrent produce `failed` (not BitTorrent)",
+        "`open` verso indirizzo privato/riservato/loopback o porta < 1024 produce `failed` senza tentare la connessione (con `ALLOW_PRIVATE_PEERS` disattivo)",
+        "Richieste con `Origin` fuori allow-list ricevono 403 prima dell'upgrade",
+        "La settima `open` sullo stesso socket è rifiutata con motivo esplicito",
+        "Il Durable Object non scrive su storage",
+        "I log non contengono IP del client, indirizzi dei peer né info-hash",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Validazione indirizzi/porte (IPv4, IPv6, IPv4-mapped), controllo Origin, macchina a stati dell'handshake gate"
+        },
+        {
+          "type": "integration",
+          "covers": "wrangler dev + fake peer: open/data/close, failed per refused/timeout/non-BitTorrent, limite 6 connessioni"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run fake-peer -- --port 6881 --size 8MiB --seed 1`",
+        "2. `npm run dev -w apps/gateway` (wrangler dev su :8787 con `ALLOW_PRIVATE_PEERS=1` in `.dev.vars`)",
+        "3. `npm run test:integration -w apps/gateway` → verde",
+        "4. Con `ALLOW_PRIVATE_PEERS` rimosso ripetere una `open` verso 127.0.0.1 → frame `failed`",
+        "5. `curl -i -H 'Origin: https://evil.example' -H 'Upgrade: websocket' http://127.0.0.1:8787/<route>` → 403"
+      ],
+      "security": [
+        "Autorizzazione a privilegio minimo: il tunnel raggiunge solo endpoint che completano l'handshake BitTorrent per l'info-hash dichiarato",
+        "Validazione di ogni frame in ingresso; frame malformato chiude il socket",
+        "Blocco SSRF: indirizzi privati, riservati, loopback, link-local e porte < 1024",
+        "`ALLOW_PRIVATE_PEERS` non impostabile in `wrangler.jsonc` di produzione; test che ne verifica il default",
+        "Log strutturati senza IP, indirizzi peer, info-hash",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M1-06",
+      "parent_id": "T0",
+      "milestone": "M1 - Fondamenta e fetta end-to-end minima",
+      "executor": "agent",
+      "title": "Engine minimo: una connessione peer-wire su tunnel",
+      "description": "Creare `packages/engine` (TypeScript, eseguibile in un worker del browser e in Node per i test). Contenuto minimo: interfaccia `Transport` (stream di byte bidirezionale), `TunnelClient` (un WebSocket, multiplexing per `conn` con `packages/tunnel-protocol`), `PeerConnection` (peer-wire dopo l'handshake: bitfield/have, interested, unchoke, request, piece, keep-alive) e una funzione che scarica tutti i pezzi di un torrent da un singolo peer con metadati già noti, verificando lo SHA-1 di ogni pezzo con WebCrypto. Spostare e riusare `apps/web/src/lib/torrent/wire.ts`, `bencode.ts`, `metainfo.ts` (ex magnet-watcher) aggiornando gli import di apps/web. Riferimenti: docs/architecture.md §Target architecture (Torrent engine), §Chunk recovery › Verification.",
+      "depends_on": [
+        "M1-03",
+        "M1-04"
+      ],
+      "parallel_with": [
+        "M1-05"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Estensioni (ut_metadata, ut_pex), più peer, picker a deadline, batching upstream",
+        "Integrazione nella UI di apps/web",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "`PeerConnection` funziona su qualunque `Transport` (testata con un transport TCP diretto di Node verso il fake peer)",
+        "Download completo di un torrent di test da un fake peer con ogni pezzo verificato SHA-1",
+        "L'engine non fa upload: non invia mai `unchoke` né `piece` e ignora le `request` ricevute (decisione registrata)",
+        "Un pezzo corrotto viene scartato e segnalato, mai consegnato al chiamante",
+        "Il pacchetto non usa API solo-Node nel codice runtime (solo nei test)",
+        "apps/web compila e i suoi test restano verdi dopo lo spostamento dei codec",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Parser/serializer peer-wire su confini di chunk arbitrari, demultiplexing di TunnelClient con frame interleaved"
+        },
+        {
+          "type": "integration",
+          "covers": "Download completo dal fake peer via transport TCP diretto; scenario dati corrotti"
+        }
+      ],
+      "functional_test": [
+        "1. `npm test -w packages/engine` → verde",
+        "2. `npm run build -w apps/web` → build senza errori"
+      ],
+      "security": [
+        "Validazione dei messaggi peer-wire: lunghezze massime, indici di pezzo/offset entro i limiti del torrent, blocchi non richiesti scartati",
+        "Verifica SHA-1 obbligatoria prima di consegnare un pezzo",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M1-07",
+      "parent_id": "T0",
+      "milestone": "M1 - Fondamenta e fetta end-to-end minima",
+      "executor": "agent",
+      "title": "Fetta end-to-end e script di misura (Phase 0)",
+      "description": "Collegare M1-05 e M1-06. (a) Test e2e ermetico `npm run e2e`: avvia fake peer e `wrangler dev`, scarica un torrent di test attraverso il gateway con `packages/engine` e verifica tutti i pezzi; aggiungerlo alla CI. (b) `tools/spike`: script CLI che, dato l'URL di un gateway e un peer di test, scarica N byte e riporta throughput, numero di messaggi WebSocket inviati (richieste fatturate = upgrade + messaggi/20), comportamento all'apertura della settima connessione e di connessioni aperte più tardi nella vita del socket. (c) `docs/spike-report.md`: template con le tre misure richieste (CPU per gigabyte, limite di connessioni, richieste fatturate) e la decisione da prendere. Riferimento: docs/architecture.md §Risks, open questions and delivery (Risks, Delivery › Phase 0).",
+      "depends_on": [
+        "M1-05",
+        "M1-06"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Deploy su un account Cloudflare reale e misura (revisione manuale M1-08)",
+        "Ottimizzazioni di throughput",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "`npm run e2e` scarica e verifica al 100% un torrent di almeno 32 MiB attraverso gateway locale",
+        "La CI esegue `npm run e2e`",
+        "`tools/spike` produce un report JSON con throughput, messaggi inviati, richieste fatturate stimate, esito del test sulle connessioni",
+        "L'URL del gateway e l'indirizzo del peer sono passati via argomenti/variabili d'ambiente, mai codificati",
+        "`docs/spike-report.md` contiene le istruzioni per leggere il tempo CPU dai Workers Logs e i campi da compilare",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "e2e",
+          "covers": "Fake peer + wrangler dev + engine: download completo verificato, conteggio dei messaggi upstream"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run e2e` → exit 0, output 'verified N/N pieces'",
+        "2. `npm run spike -- --gateway ws://127.0.0.1:8787 --peer 127.0.0.1:6881 --bytes 64MiB` → report JSON stampato",
+        "3. Verificare che `docs/spike-report.md` elenchi le tre misure e le tre opzioni di decisione"
+      ],
+      "security": [
+        "Lo script di spike non registra né stampa credenziali; l'eventuale token Cloudflare è letto solo da ambiente dall'umano che esegue il deploy",
+        "Nessun endpoint reale o hostname di produzione nei file versionati dello spike",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M1-08",
+      "parent_id": "T0",
+      "milestone": "M1 - Fondamenta e fetta end-to-end minima",
+      "executor": "human",
+      "title": "Revisione manuale M1 e decisione Phase 0",
+      "description": "Revisione umana della milestone. Rivedere il diff, eseguire i test funzionali dei task M1, creare i commit. Poi eseguire lo spike su un account Cloudflare reale (piano free): deploy di `apps/gateway`, un seed di test raggiungibile pubblicamente, `tools/spike` per 1 GB. Compilare `docs/spike-report.md` e decidere il percorso dati di default: Durable Object free, Worker a pagamento, o gateway VPS. Risolve OQ-02 e OQ-03. Riferimento: docs/architecture.md §Risks, open questions and delivery › Phase 0, §Cost model.",
+      "depends_on": [
+        "M1-07"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Nuovo sviluppo"
+      ],
+      "acceptance_criteria": [
+        "Tutti i criteri di accettazione di M1-01…M1-07 verificati",
+        "`docs/spike-report.md` compilato con CPU per GB, comportamento del limite di 6 connessioni, richieste fatturate per GB",
+        "Decisione sul percorso di default registrata in `docs/spike-report.md` e in `open_questions` (OQ-02, OQ-03 chiuse)",
+        "Commit creati dall'umano; CI verde sul branch"
+      ],
+      "automated_tests": [],
+      "functional_test": [
+        "1. `npm ci && npm run verify && npm run e2e` → exit 0",
+        "2. `npx wrangler deploy` da `apps/gateway` con token personale a scope 'Edit Cloudflare Workers'",
+        "3. `npm run spike -- --gateway wss://<deploy> --peer <seed di test> --bytes 1GiB`",
+        "4. Leggere il tempo CPU nei Workers Logs e compilare il report",
+        "5. Registrare la decisione"
+      ],
+      "security": [
+        "Token Cloudflare a scope minimo, mai salvato nel repository",
+        "Verificare che il deploy di test abbia `ALLOWED_ORIGINS` restrittivo e `ALLOW_PRIVATE_PEERS` assente",
+        "Rimuovere o proteggere il deploy di test al termine"
+      ]
+    },
+    {
+      "id": "M2-01",
+      "parent_id": "T0",
+      "milestone": "M2 - Tunnel ed engine",
+      "executor": "agent",
+      "title": "Gateway: limiti, ping, batching e log",
+      "description": "Completare il gateway di `apps/gateway` secondo docs/architecture.md §Tunnel protocol and request budget › Rules: idle timeout di 90 s per connessione, timeout di sessione di 2 ore (default 7200 s, configurabile da variabile d'ambiente), limite minimale di richieste per IP sull'apertura dei WebSocket (default 30 upgrade al minuto per IP, configurabile; usare il binding Rate Limiting dei Workers dichiarato in `wrangler.jsonc` dopo averne verificato disponibilità e sintassi nella documentazione corrente, altrimenti un contatore equivalente nel Worker), frame `ping`, gestione di più frame per messaggio, motivi di `close` completi, chiusura di tutti i socket TCP alla chiusura del WebSocket, più WebSocket verso lo stesso oggetto di sessione (6 connessioni ciascuno). Applicare l'esito di `docs/spike-report.md`: se la decisione è 'Worker a pagamento', esporre lo stesso handler anche come Worker semplice; se è 'VPS di default', questo task resta valido ma il gateway Cloudflare diventa secondario. Contatori per sessione (messaggi ricevuti, byte inoltrati) restituiti nel `close` finale per le metriche.",
+      "depends_on": [
+        "M1-08"
+      ],
+      "parallel_with": [
+        "M2-02",
+        "M2-03"
+      ],
+      "blocked_by_open_questions": [
+        "OQ-02"
+      ],
+      "out_of_scope": [
+        "Turnstile (non previsto)",
+        "Rimozione di `/v1/blocks` (M2-08)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Una connessione senza traffico per 90 s viene chiusa con motivo `idle`",
+        "Dopo 2 ore (default) il gateway chiude WebSocket e socket TCP con motivo `session_timeout`; il valore è letto da env e validato",
+        "Oltre il limite di upgrade per IP la risposta è 429 e nessun Durable Object viene creato; il limite è configurabile",
+        "L'IP del client è usato solo come chiave del limitatore e non compare nei log",
+        "Alla chiusura del WebSocket nessun socket TCP resta aperto (verificato dal fake peer)",
+        "Un secondo WebSocket verso lo stesso oggetto di sessione ottiene altre 6 connessioni",
+        "`ping` non produce risposta né log",
+        "I log contengono solo contatori e codici di motivo",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Timer di idle e di sessione con clock simulato, validazione della configurazione"
+        },
+        {
+          "type": "integration",
+          "covers": "wrangler dev + fake peer: idle timeout, cap di sessione, cleanup dei socket, due WebSocket sulla stessa sessione"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run test:integration -w apps/gateway` → verde",
+        "2. `npm run e2e` → verde",
+        "3. Avviare gateway e fake peer, aprire un tunnel con lo script di spike e interromperlo con Ctrl-C → il fake peer registra la chiusura della connessione entro pochi secondi"
+      ],
+      "security": [
+        "Limiti di abuso applicati lato server e non aggirabili dal client",
+        "Configurazione validata all'avvio; valori fuori range rifiutati",
+        "Log senza IP client, indirizzi peer, info-hash",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M2-02",
+      "parent_id": "T0",
+      "milestone": "M2 - Tunnel ed engine",
+      "executor": "agent",
+      "title": "Discovery in streaming: `GET /peers` NDJSON",
+      "description": "In `services/seeders` aggiungere `GET /peers?ih=<info-hash>` (accettando anche `magnet=` per i tracker `tr=`, e info-hash v2 a 64 cifre hex troncato ai primi 20 byte per DHT e tracker, come da BEP 52) che risponde come stream NDJSON: una riga per indirizzo appena un tracker o un nodo DHT lo restituisce, deduplicata, e chiusura dopo circa 30 s (configurabile). Riusare `lookup.rs`, `dht.rs`, `tracker/udp.rs`, `tracker/http.rs`, `magnet.rs`, `netguard.rs`, la cache di 5 minuti di `cache.rs`. Nessun probing, nessun token. Documentare il formato in `docs/discovery-api.md`. Lasciare invariati `/swarm`, `/metadata`, `/files` (rimossi in M5-01). Riferimenti: docs/architecture.md §Chunk recovery › Session start (punto 2), §Target architecture (Discovery), §Storage and database.",
+      "depends_on": [
+        "M1-08"
+      ],
+      "parallel_with": [
+        "M2-01",
+        "M2-03"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Rimozione degli endpoint legacy",
+        "Gateway VPS (M4)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "La prima riga arriva appena la prima sorgente risponde, senza attendere le altre",
+        "Ogni indirizzo compare una sola volta; indirizzi privati/riservati sono filtrati",
+        "Lo stream si chiude al deadline configurato anche se le sorgenti non hanno finito",
+        "Superati i limiti per IP o globali la risposta è 429 senza avviare ricerche",
+        "`ih` non valido o assente → 400 con corpo JSON; nessuna richiesta di rete avviata",
+        "Una seconda richiesta per lo stesso info-hash entro 5 minuti è servita dalla cache",
+        "Endpoint pubblico senza autenticazione; CORS limitato alla sola origine del sito frontend, letta da variabile d'ambiente (più le origini di sviluppo locali solo in dev)",
+        "I log non contengono info-hash, magnet, IP dei client o dei peer",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Parsing di info-hash (hex 40, base32 32) e magnet, deduplica, filtro indirizzi"
+        },
+        {
+          "type": "integration",
+          "covers": "Tracker HTTP e UDP finti su loopback: ordine di arrivo, deadline, deduplica, cache, sorgente che fallisce"
+        }
+      ],
+      "functional_test": [
+        "1. `cargo run --release --manifest-path services/seeders/Cargo.toml`",
+        "2. `curl -N 'http://localhost:8080/peers?ih=<hash valido>'` → righe NDJSON che compaiono progressivamente, connessione chiusa dopo ~30 s",
+        "3. `curl -i 'http://localhost:8080/peers?ih=xyz'` → 400",
+        "4. `cargo test --manifest-path services/seeders/Cargo.toml` → verde"
+      ],
+      "security": [
+        "Validazione rigorosa di `ih`/`magnet` e limite sul numero di tracker `tr=` accettati",
+        "Filtro degli indirizzi privati/riservati in uscita",
+        "Limiti minimali, configurabili da env: 30 richieste al minuto e 4 stream concorrenti per IP, 200 stream concorrenti in totale; oltre il limite 429",
+        "L'IP del client è ricavato dall'intestazione impostata dal proxy fidato (nginx) e non viene registrato nei log",
+        "Log senza dati sensibili (info-hash, magnet, IP)",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M2-03",
+      "parent_id": "T0",
+      "milestone": "M2 - Tunnel ed engine",
+      "executor": "agent",
+      "title": "Engine: protocollo di estensione e metadati (BEP 9)",
+      "description": "In `packages/engine` aggiungere l'extended handshake (BEP 10) e `ut_metadata` (BEP 9): richiesta dei pezzi dell'info dict al primo peer che lo annuncia, riassemblaggio, verifica SHA-1 contro l'info-hash, parsing con `metainfo.ts` (piece length, hash dei pezzi, lista file con offset, come `services/seeders/src/files.rs`). Riprova su un altro peer in caso di rifiuto, timeout o hash errato. I torrent v1, ibridi e solo-v2 (BEP 52) sono tutti in scope: accettare magnet con `urn:btih:` e `urn:btmh:1220…`, verificare l'info dict con SHA-1 per v1 e SHA-256 per v2 (entrambi per gli ibridi), usare l'info-hash v2 troncato a 20 byte per handshake e discovery, leggere `file tree` e `pieces root` dei torrent v2. La verifica dei pezzi v2 è in M2-04. Riferimento: docs/architecture.md §Chunk recovery › Session start (punto 3).",
+      "depends_on": [
+        "M1-08"
+      ],
+      "parallel_with": [
+        "M2-01",
+        "M2-02"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Verifica dei pezzi v2 e messaggi hash (M2-04)",
+        "Peer exchange (M2-05)",
+        "UI",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "I metadati vengono ottenuti dal fake peer e accettati solo se lo SHA-1 coincide con l'info-hash",
+        "Metadati con hash errato sono scartati e richiesti a un altro peer",
+        "`metadata_size` oltre un limite configurato viene rifiutato",
+        "La lista file prodotta (percorso, dimensione, offset) coincide con quella di `/files` del PoC per i torrent di test",
+        "Per un torrent solo-v2 l'info dict è accettato solo se il suo SHA-256 coincide con l'info-hash del magnet, e la lista file deriva da `file tree`",
+        "Per un ibrido sono verificati entrambi gli hash",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Messaggi ut_metadata (request/data/reject), riassemblaggio, limiti di dimensione, parsing info dict v1, ibrido e solo-v2, magnet btih/btmh"
+        },
+        {
+          "type": "integration",
+          "covers": "Fake peer con ut_metadata: caso felice, reject, hash errato, peer che chiude a metà"
+        }
+      ],
+      "functional_test": [
+        "1. `npm test -w packages/engine` → verde",
+        "2. `npm run fake-peer -- --port 6881 --size 8MiB --seed 1` e lo script di esempio del pacchetto che stampa la lista file a partire dal solo info-hash → output coerente con il torrent generato"
+      ],
+      "security": [
+        "Validazione input: limite su `metadata_size`, numero di pezzi, profondità e dimensione del bencode",
+        "Percorsi dei file sanificati (niente `..`, separatori o caratteri di controllo) prima dell'uso in UI o storage",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M2-04",
+      "parent_id": "T0",
+      "milestone": "M2 - Tunnel ed engine",
+      "executor": "agent",
+      "title": "Engine: verifica dei pezzi per torrent v2 (BEP 52)",
+      "description": "Rendere scaricabili i torrent solo-v2 e completare gli ibridi. In `packages/engine`: messaggi `hash request` / `hashes` / `hash reject` per ottenere i piece layer dai peer, validati contro il `pieces root` di ogni file; verifica SHA-256 a merkle tree per blocco da 16 KiB e per pezzo; mappatura file ↔ pezzi dei torrent v2 (file allineati ai pezzi, un albero per file, file più piccoli di un pezzo). Astrarre la verifica dietro un'unica interfaccia usata sia da v1 (SHA-1 per pezzo) sia da v2. Estendere `tools/fake-peer` per generare e servire torrent solo-v2 e ibridi deterministici, inclusi i messaggi hash. Decisione del committente: i torrent solo-v2 sono in scope. Riferimenti: docs/architecture.md §Chunk recovery › Verification (esteso a SHA-256), BEP 52.",
+      "depends_on": [
+        "M2-03"
+      ],
+      "parallel_with": [
+        "M2-05"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Attribuzione dei blocchi ed esclusione dei peer (M3-02)",
+        "Picker a deadline",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Un torrent solo-v2 di test viene scaricato dal fake peer con ogni pezzo verificato via merkle SHA-256",
+        "Un torrent ibrido viene verificato e scaricato correttamente",
+        "Piece layer che non corrispondono al `pieces root` sono rifiutati e richiesti a un altro peer",
+        "Un blocco corrotto in un torrent v2 viene individuato e scartato",
+        "I torrent v1 continuano a passare tutte le suite esistenti",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Costruzione e verifica del merkle tree (foglie da 16 KiB, padding, file di un solo blocco), codec dei messaggi hash, mappatura file ↔ pezzi v2"
+        },
+        {
+          "type": "integration",
+          "covers": "Fake peer v2 e ibrido: download completo, hash reject, piece layer errati, blocco corrotto"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run fake-peer -- --port 6881 --size 8MiB --seed 1 --v2` → stampa un magnet `urn:btmh:`",
+        "2. `npm test -w packages/engine` e `npm test -w tools/fake-peer` → verdi"
+      ],
+      "security": [
+        "Validazione dei messaggi hash: limiti su numero di hash, livelli e indici richiesti/ricevuti",
+        "Nessun dato v2 accettato senza catena di prova fino al `pieces root` verificato",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M2-05",
+      "parent_id": "T0",
+      "milestone": "M2 - Tunnel ed engine",
+      "executor": "agent",
+      "title": "Engine: peer exchange e rubrica dei peer",
+      "description": "In `packages/engine` aggiungere `ut_pex` (BEP 11) e un `PeerBook`: insieme deduplicato di indirizzi con sorgente (discovery, pex), stato (mai provato, fallito con motivo, connesso, ha consegnato) e priorità di dial. Interfaccia `PeerSource` comune per alimentarlo (lo stream `/peers` verrà collegato in M2-07). Riferimenti: docs/architecture.md §Chunk recovery › Peer sources, §Connection management (\"Remember within the session\", solo in memoria in questo task).",
+      "depends_on": [
+        "M2-03"
+      ],
+      "parallel_with": [
+        "M2-04"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Persistenza in IndexedDB (M3-04)",
+        "Invio di messaggi pex in uscita",
+        "Tracker WebSocket e WebRTC (M5-03)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Gli indirizzi ricevuti via pex (IPv4 e IPv6) entrano nel PeerBook una sola volta",
+        "Indirizzi privati/riservati e porte < 1024 sono scartati prima del dial",
+        "Un indirizzo fallito non viene riproposto prima di un backoff",
+        "Il numero di indirizzi accettati per messaggio e in totale è limitato",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Decodifica dei messaggi pex compatti, deduplica, backoff, ordinamento per priorità"
+        },
+        {
+          "type": "integration",
+          "covers": "Fake peer che annuncia altri fake peer via pex: l'engine li scopre senza discovery"
+        }
+      ],
+      "functional_test": [
+        "1. `npm test -w packages/engine` → verde"
+      ],
+      "security": [
+        "Validazione degli indirizzi appresi da terzi prima di ogni `open`",
+        "Limiti contro il flooding di indirizzi da parte di un peer malevolo",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M2-06",
+      "parent_id": "T0",
+      "milestone": "M2 - Tunnel ed engine",
+      "executor": "agent",
+      "title": "Engine: gestione delle connessioni e batching upstream",
+      "description": "In `packages/engine` implementare il `ConnectionManager` secondo docs/architecture.md §Chunk recovery › Connection management e §Tunnel protocol and request budget › Rules: connessioni mantenute per tutta la sessione, race solo al dial (fino a 6 candidati per socket), sostituzione delle connessioni più lente o ancora choked mai di quelle che consegnano, punteggio su throughput, ritardo di unchoke, bitfield, `reqq`, reject; da 1 a 3 WebSocket verso la stessa sessione in base a una soglia fornita dal chiamante e valutata su una finestra di 30 s (default, configurabile): si aggiunge un socket solo se il rate resta sotto la soglia per l'intera finestra; riconnessione dopo la caduta del gateway con redial dei peer migliori e nuova richiesta dei blocchi non completati. Batching upstream: tutti i frame di un socket coalescenti in un messaggio al massimo ogni 300–500 ms (configurabile), i frame urgenti saltano il timer; limite di dati in volo di 16 MiB per socket; `ping` con cadenza da `docs/spike-report.md`. Riutilizzare la logica di punteggio di `apps/web/src/lib/torrent/swarm.ts`.",
+      "depends_on": [
+        "M2-01",
+        "M2-05"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [
+        "OQ-03"
+      ],
+      "out_of_scope": [
+        "Scelta dei blocchi a deadline (M3-01): qui basta una politica sequenziale semplice",
+        "Escalation verso il VPS (M4-06)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Con 10 fake peer di cui 6 morti, l'engine ottiene connessioni utili sostituendo i candidati falliti",
+        "Una connessione che consegna non viene mai chiusa per fare posto a un candidato",
+        "Il numero di messaggi WebSocket inviati per un download di test resta sotto un budget dichiarato nel test (derivato da ~1 messaggio/s per socket)",
+        "Dopo il riavvio del gateway durante un download, il download riprende e si completa con tutti i pezzi verificati",
+        "I dati in volo per socket non superano mai 16 MiB",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Punteggio, politica di sostituzione, coalescenza con clock simulato, percorso urgente, limite in volo"
+        },
+        {
+          "type": "integration",
+          "covers": "wrangler dev + più fake peer: race con peer morti/choked, riavvio del gateway, conteggio dei messaggi"
+        }
+      ],
+      "functional_test": [
+        "1. `npm test -w packages/engine` → verde",
+        "2. `npm run e2e` → verde, il report stampa i messaggi upstream per download"
+      ],
+      "security": [
+        "Il client non può essere indotto da un peer a superare i limiti di connessioni o di dati in volo",
+        "Nessun indirizzo peer o info-hash nei log di default; il debug dettagliato resta opt-in e locale (`mw-debug`)",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M2-07",
+      "parent_id": "T0",
+      "milestone": "M2 - Tunnel ed engine",
+      "executor": "agent",
+      "title": "Sessione completa nel browser dietro l'interfaccia dello scheduler esistente",
+      "description": "Collegare l'engine ad `apps/web`. Flusso di docs/architecture.md §Chunk recovery › Session start: parse del magnet e apertura del primo WebSocket in parallelo allo stream `/peers`; dial degli indirizzi man mano che arrivano; metadati via BEP 9; lista file per la UI esistente (`file-select-step.svelte`, `magnet/files.ts`, `tree.ts`); richieste di testa e coda del file scelto appena noti gli hash. L'engine gira in un dedicated worker e viene esposto dietro l'interfaccia che oggi `apps/web/src/lib/torrent/engine.ts` e `scheduler.ts` usano per ottenere blocchi, sostituendo le chiamate a `/v1/blocks` (`batch.ts`) e a `/swarm`, `/metadata`, `/files` (`magnet/api.ts`, `swarm.ts`). Lo store dei pezzi resta quello attuale (Cache Storage). URL dei servizi da `PUBLIC_SEEDERS_URL` e `PUBLIC_WORKER_URL` come oggi.",
+      "depends_on": [
+        "M2-02",
+        "M2-04",
+        "M2-06"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Nuovo picker (M3-01), OPFS (M3-03), service worker di streaming (M3-05)",
+        "Rimozione del codice legacy (M2-08)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Magnet v1, ibridi e solo-v2 sono accettati dal form e portano alla lista dei file",
+        "Incollando un magnet di test la pagina mostra la lista dei file senza chiamare `/files`, `/metadata`, `/swarm` né `/v1/blocks`",
+        "Il video di test viene recuperato e riprodotto con il player esistente",
+        "La sessione fa una sola richiesta a `/peers` e apre da 1 a 3 WebSocket",
+        "Alla fine del download i WebSocket vengono chiusi",
+        "Un server stub `/peers` per i test è disponibile in `tools/harness`",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Adattatore engine ↔ interfaccia scheduler, orchestrazione di avvio con sorgenti simulate"
+        },
+        {
+          "type": "e2e",
+          "covers": "Playwright (Chromium): stack locale con fake peer, stub `/peers` e wrangler dev; incolla magnet, sceglie il file, verifica pezzi recuperati e assenza di chiamate legacy"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run stack` (fake peer + stub /peers + wrangler dev)",
+        "2. `PUBLIC_SEEDERS_URL=http://127.0.0.1:8080 PUBLIC_WORKER_URL=http://127.0.0.1:8787 npx astro dev --background` in apps/web",
+        "3. Aprire la pagina in Chromium, incollare il magnet stampato dallo stack, scegliere il file → riproduzione avviata",
+        "4. DevTools › Network: 1 richiesta `/peers`, 1–3 WebSocket, nessuna `/v1/blocks`",
+        "5. `astro dev stop`"
+      ],
+      "security": [
+        "Il magnet e i nomi dei file sono trattati come input non fidato: nessun inserimento come HTML, percorsi sanificati",
+        "Nessuna telemetria verso server: diagnostica solo locale",
+        "Messaggi tra pagina e worker validati per tipo",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M2-08",
+      "parent_id": "T0",
+      "milestone": "M2 - Tunnel ed engine",
+      "executor": "agent",
+      "title": "Rimozione di `/v1/blocks` e del codice client legacy",
+      "description": "Rimuovere dal gateway `GET /v1/blocks`, `/v1/info`, la validazione dei token e il relativo codice (`apps/gateway/src/index.ts`, `params.ts`, `token.ts`, parti di `peer.ts` non più usate, test e script collegati). Rimuovere da `apps/web` il plumbing a richieste per batch e il polling dello swarm (`torrent/batch.ts`, parti di `swarm.ts`, `magnet/api.ts`) non più referenziati dopo M2-07. Rimuovere `TOKEN_SECRET` dalla configurazione del gateway. Riferimento: docs/architecture.md §Risks, open questions and delivery › Phase 1; §Alternatives considered (ultima riga).",
+      "depends_on": [
+        "M2-07"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Endpoint legacy di services/seeders (M5-01)",
+        "Modifiche di comportamento",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Nessun riferimento a `/v1/blocks`, `/v1/info` o ai token dei peer in `apps/gateway` e `apps/web`",
+        "`TOKEN_SECRET` non compare più in `wrangler.jsonc`, `.dev.vars.example` e documentazione del gateway",
+        "Il gateway risponde 404 alle route rimosse",
+        "`npm run e2e` e i test Playwright restano verdi",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "integration",
+          "covers": "Route rimosse → 404; suite del gateway aggiornata"
+        },
+        {
+          "type": "e2e",
+          "covers": "Regressione completa della sessione nel browser"
+        }
+      ],
+      "functional_test": [
+        "1. `grep -rn 'v1/blocks\\|TOKEN_SECRET' apps packages` → nessun risultato",
+        "2. `npm run verify && npm run e2e` → exit 0",
+        "3. `curl -i http://127.0.0.1:8787/v1/blocks` con il gateway in dev → 404"
+      ],
+      "security": [
+        "Superficie d'attacco ridotta: nessun endpoint o segreto inutilizzato resta attivo",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M2-09",
+      "parent_id": "T0",
+      "milestone": "M2 - Tunnel ed engine",
+      "executor": "agent",
+      "title": "Metriche di fase ed e2e di regressione nel browser",
+      "description": "Aggiungere alla diagnostica esistente (`apps/web/src/lib/diagnostics/*`, `diagnostics-menu.svelte`) i tre numeri di docs/architecture.md §Risks, open questions and delivery (ultima frase): secondi al primo pezzo verificato, megabyte al secondo sostenuti, richieste fatturate per gigabyte (upgrade + messaggi inviati / 20). Aggiungere un test Playwright che esegue una sessione completa su swarm misto (peer morti, choked, lenti, parziali) e fallisce se il budget di richieste per GB supera una soglia dichiarata. Il report resta locale al browser.",
+      "depends_on": [
+        "M2-08"
+      ],
+      "parallel_with": [
+        "M2-10"
+      ],
+      "blocked_by_open_questions": [
+        "OQ-19"
+      ],
+      "out_of_scope": [
+        "Invio delle metriche a un server",
+        "Ottimizzazioni del picker",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "I tre numeri sono visibili nel menu di diagnostica e nel report esportabile",
+        "Il test e2e misura e verifica il budget di richieste fatturate per GB",
+        "Il report di diagnostica non contiene indirizzi IP dei peer né il magnet completo salvo opt-in esplicito dell'utente",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Calcolo delle metriche (`stats.ts`, `report.ts`)"
+        },
+        {
+          "type": "e2e",
+          "covers": "Playwright: swarm misto, download completo verificato, asserzione sul budget di richieste"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run e2e` → verde",
+        "2. Avviare lo stack e la pagina come in M2-07, completare un download, aprire il menu di diagnostica → i tre numeri sono presenti e plausibili"
+      ],
+      "security": [
+        "Diagnostica senza dati sensibili per default (niente IP, niente magnet completo)",
+        "Nessuna trasmissione automatica della diagnostica",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M2-10",
+      "parent_id": "T0",
+      "milestone": "M2 - Tunnel ed engine",
+      "executor": "agent",
+      "title": "Deploy automatico di frontend e gateway",
+      "description": "Aggiungere `.github/workflows/deploy.yml`: al push su `main`, dopo il successo della CI, esegue il deploy del gateway (`wrangler deploy` da `apps/gateway`) e del frontend su Cloudflare Pages (`npm run build -w apps/web` e `wrangler pages deploy`). Adattare `apps/web/astro.config.mjs` (site/base) all'hosting su Pages al posto di GitHub Pages. Le credenziali (`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`) sono segreti dell'environment GitHub `production`; nome del progetto Pages e URL pubblici (`PUBLIC_SEEDERS_URL`, `PUBLIC_WORKER_URL`) sono variabili non segrete dell'environment. Il VPS NON è deployato automaticamente (procedura manuale documentata in M5-04). Documentare in `docs/operations.md` i prerequisiti: creazione del progetto Pages, del token e dell'environment. Decisione del committente: deploy automatico per frontend e worker, manuale per il VPS.",
+      "depends_on": [
+        "M2-08"
+      ],
+      "parallel_with": [
+        "M2-09"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Deploy del VPS",
+        "Esecuzione di un deploy reale da parte dell'agent",
+        "Ambienti di preview per le pull request",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Il workflow parte solo su push a `main` e solo se la CI è verde; mai su pull request o fork",
+        "`wrangler deploy --dry-run` di apps/gateway e la build di apps/web per Pages riescono in locale",
+        "Nessuna credenziale nel repository: il workflow legge solo `secrets.*` dell'environment `production`",
+        "`permissions:` è `contents: read`; le action sono fissate per SHA",
+        "`docs/operations.md` elenca i passi una tantum (progetto Pages, token, environment, variabili) e come fare rollback",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "integration",
+          "covers": "`actionlint` sul workflow; `wrangler deploy --dry-run`; build di produzione di apps/web con verifica della presenza di `_headers`/asset attesi in `dist`"
+        }
+      ],
+      "functional_test": [
+        "1. `npx actionlint .github/workflows/deploy.yml` → nessun errore",
+        "2. `npx wrangler deploy --dry-run` in apps/gateway → bundle prodotto senza errori",
+        "3. `npm run build -w apps/web` → `apps/web/dist` generata",
+        "4. `grep -rn 'CLOUDFLARE_API_TOKEN' .` → solo riferimenti a `secrets.CLOUDFLARE_API_TOKEN` e documentazione"
+      ],
+      "security": [
+        "Token Cloudflare a privilegio minimo (solo modifica di Workers e Pages dell'account), conservato esclusivamente come segreto dell'environment GitHub",
+        "Environment `production` limitato al branch `main`",
+        "Il job di deploy non stampa variabili d'ambiente né output con segreti",
+        "Scansione dipendenze e secret scan della CI sono prerequisito del deploy",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M2-11",
+      "parent_id": "T0",
+      "milestone": "M2 - Tunnel ed engine",
+      "executor": "human",
+      "title": "Revisione manuale M2",
+      "description": "Revisione umana: diff, test funzionali di M2-01…M2-10, configurazione una tantum del deploy automatico, prova con magnet reali su deploy di staging, confronto dei tre numeri con il PoC, commit.",
+      "depends_on": [
+        "M2-09",
+        "M2-10"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Nuovo sviluppo"
+      ],
+      "acceptance_criteria": [
+        "Criteri di accettazione di M2 verificati",
+        "Primo deploy automatico eseguito con successo dopo la configurazione di progetto Pages, token ed environment",
+        "Su almeno tre magnet reali con swarm sano: primo pezzo verificato e richieste fatturate per GB annotati in `docs/measurements.md`",
+        "Nessuna chiamata legacy osservata in rete",
+        "Commit creati dall'umano; CI verde"
+      ],
+      "automated_tests": [],
+      "functional_test": [
+        "1. `npm ci && npm run verify && npm run e2e`",
+        "2. Deploy di staging di gateway e seeders con variabili d'ambiente proprie",
+        "3. Sessioni reali in Chromium con DevTools aperto; annotare le misure"
+      ],
+      "security": [
+        "Controllare che i log di gateway e seeders in staging non contengano IP, info-hash o magnet",
+        "Verificare `ALLOWED_ORIGINS` di staging"
+      ]
+    },
+    {
+      "id": "M3-01",
+      "parent_id": "T0",
+      "milestone": "M3 - Picker e buffer",
+      "executor": "agent",
+      "title": "Picker dei blocchi a deadline",
+      "description": "Sostituire la politica di richiesta con il picker di docs/architecture.md §Chunk recovery › Piece picking, assegnando per blocco da 16 KiB: (1) indice del contenitore (testa e coda del file), (2) finestra di riproduzione dei prossimi 20–30 s, in ordine, solo dai peer più veloci, con seconda richiesta a un altro peer per i blocchi in ritardo, (3) read-ahead sequenziale su tutti i peer unchoked con 2–4 s di richieste in coda ciascuno entro `reqq`, (4) pezzi scarsi (posseduti da uno o due peer) quando il buffer è in vantaggio, (5) back-fill. Un seek annulla con `cancel` le richieste fuori dalla nuova finestra senza chiudere connessioni. Partire dalla logica di `apps/web/src/lib/torrent/scheduler.ts` (urgent/readahead/hedge/steal) portandola in `packages/engine`. Finestre e soglie configurabili. Default: finestra di riproduzione 30 s, read-ahead 4 s di richieste per peer, pezzi scarsi solo con almeno 120 s di video verificato davanti alla posizione di riproduzione.",
+      "depends_on": [
+        "M2-11"
+      ],
+      "parallel_with": [
+        "M3-03"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Calcolo del bitrate dal contenitore (M3-06): qui la finestra è espressa in byte dal chiamante",
+        "Escalation VPS",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "L'ordine di priorità dei cinque livelli è rispettato in simulazione",
+        "Un blocco in ritardo nella finestra viene richiesto a un secondo peer e il duplicato scartato",
+        "Dopo un seek partono `cancel` per le richieste fuori finestra e nessuna connessione viene chiusa",
+        "La coda per peer non supera `reqq` né la profondità temporale configurata",
+        "I pezzi posseduti da ≤ 2 peer vengono presi prima del back-fill quando il buffer supera la soglia configurata",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Simulazioni deterministiche con peer di velocità e bitfield diversi: priorità, hedging, seek, profondità di coda, pezzi scarsi"
+        },
+        {
+          "type": "integration",
+          "covers": "Fake peer lenti/veloci/parziali: la finestra di riproduzione è servita dai veloci"
+        }
+      ],
+      "functional_test": [
+        "1. `npm test -w packages/engine` → verde",
+        "2. `npm run e2e` → verde",
+        "3. Nello stack locale, fare seek a metà video → la strip dei pezzi mostra il recupero che riparte dalla nuova posizione entro pochi secondi"
+      ],
+      "security": [
+        "Limiti rigidi su richieste duplicate e in volo, indipendenti dal comportamento dei peer",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M3-02",
+      "parent_id": "T0",
+      "milestone": "M3 - Picker e buffer",
+      "executor": "agent",
+      "title": "Attribuzione dei blocchi ed esclusione dei peer che corrompono",
+      "description": "Implementare docs/architecture.md §Chunk recovery › Verification: ogni blocco è attribuito al peer che l'ha inviato; un pezzo che fallisce lo SHA-1 viene scartato e ri-richiesto; un peer che causa due pezzi falliti è escluso per la sessione (connessione chiusa, indirizzo marcato nel PeerBook). Quando un pezzo v1 fallito ha blocchi da più peer, ri-scaricarlo da un solo peer per isolare il responsabile; per i torrent v2 l'attribuzione è diretta perché ogni blocco è verificabile singolarmente. La verifica gira fuori dal thread principale.",
+      "depends_on": [
+        "M3-01"
+      ],
+      "parallel_with": [
+        "M3-04",
+        "M3-05"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Implementazione della verifica v2 (già in M2-04)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Nessun pezzo non verificato raggiunge lo store o il player",
+        "Un fake peer che invia dati corrotti viene escluso dopo due pezzi falliti e non più ricontattato nella sessione",
+        "Un peer onesto che ha contribuito a un pezzo misto non viene escluso",
+        "Nei torrent v2 il peer responsabile è individuato dal singolo blocco fallito",
+        "Il download si completa correttamente in presenza di un peer che corrompe",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Contabilità per peer, isolamento del responsabile su pezzi misti"
+        },
+        {
+          "type": "integration",
+          "covers": "Swarm con un fake peer che corrompe: esclusione e completamento"
+        }
+      ],
+      "functional_test": [
+        "1. `npm test -w packages/engine` → verde",
+        "2. `npm run e2e` → verde (scenario 'peer che corrompe' incluso)"
+      ],
+      "security": [
+        "Integrità: verifica crittografica obbligatoria prima di persistere o riprodurre",
+        "Un peer malevolo non può far escludere peer onesti con un solo pezzo misto",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M3-03",
+      "parent_id": "T0",
+      "milestone": "M3 - Picker e buffer",
+      "executor": "agent",
+      "title": "Store dei pezzi su OPFS",
+      "description": "Sostituire lo store su Cache Storage (`apps/web/src/lib/torrent/store.ts`, `library.ts`) con un file OPFS sparso per torrent, scritto e letto tramite synchronous access handle nel worker dell'engine, con mappa dei pezzi verificati. API: scrittura di un pezzo verificato, lettura per intervallo di byte di un file del torrent, stato dei pezzi, eliminazione. Ciclo di vita (decisione del committente, che su questo punto SOSTITUISCE docs/architecture.md §Storage and database): si segue il PoC, ogni video aperto viene sempre salvato nel browser man mano che è recuperato, senza eliminazione automatica alla chiusura; i pezzi si eliminano solo su azione esplicita dell'utente (singolo video o tutti, come nella lista 'Saved' del PoC). Mantenere la regola del PoC per cui eliminando un video restano i pezzi di bordo ancora necessari a un altro video salvato dello stesso torrent (`library.ts`). Migrare o, se non praticabile, eliminare i cache `mw-pieces-*` del PoC al primo avvio, documentando la scelta. Gestire l'errore di quota.",
+      "depends_on": [
+        "M2-11"
+      ],
+      "parallel_with": [
+        "M3-01"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "IndexedDB per metadati e note sui peer (M3-04)",
+        "Service worker di streaming (M3-05)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Scritture e letture casuali corrette su file di test > 1 GiB sparso",
+        "Una lettura che copre pezzi mancanti segnala quali mancano senza restituire byte non verificati",
+        "Ogni video aperto resta salvato dopo chiusura e reload senza alcuna azione dell'utente, anche se recuperato solo in parte",
+        "L'eliminazione avviene solo su azione esplicita dell'utente (un video o tutti) e rimuove il file OPFS, salvo i pezzi di bordo condivisi con un altro video salvato",
+        "Nessuna eliminazione automatica alla chiusura della sessione",
+        "L'errore di quota è riportato alla UI senza corrompere lo stato",
+        "Nessun dato dei pezzi lascia il browser",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Mappa dei pezzi, traduzione offset file ↔ pezzi (riuso di `ranges.ts`)"
+        },
+        {
+          "type": "e2e",
+          "covers": "Playwright: scrittura/lettura OPFS in Chromium, persistenza dopo reload di ogni video aperto, eliminazione esplicita"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run e2e` → verde",
+        "2. Avviare la pagina, recuperare un video, DevTools › Application › Storage → file OPFS presente",
+        "3. Chiudere la scheda e riaprire → il video compare in 'Saved' con la percentuale recuperata",
+        "4. Eliminarlo da 'Saved' → file OPFS assente"
+      ],
+      "security": [
+        "Nomi dei file OPFS derivati solo dall'info-hash validato (hex), mai dai nomi nel torrent",
+        "I dati restano nell'origine del sito; nessun upload",
+        "L'utente può sempre eliminare tutti i dati salvati con un'azione unica",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M3-04",
+      "parent_id": "T0",
+      "milestone": "M3 - Picker e buffer",
+      "executor": "agent",
+      "title": "Memoria di sessione in IndexedDB",
+      "description": "Persistere in IndexedDB, legati al file OPFS del torrent, metadati (info dict verificato), note sui peer (indirizzi che hanno consegnato o fallito) e posizione di riproduzione, come da docs/architecture.md §Storage and database (tabella) e §Chunk recovery › Connection management (\"Remember within the session\"). Al reload la sessione riparte senza rifare discovery e BEP 9 quando i dati sono presenti: redial diretto dei peer che avevano consegnato. I record seguono il ciclo di vita dei pezzi: salvati sempre, eliminati solo quando l'utente elimina il video. La lista 'Saved' mostra ogni video aperto, con stato parziale e percentuale come nel PoC; adattare (`saved-step.svelte`, `library.ts`).",
+      "depends_on": [
+        "M3-03"
+      ],
+      "parallel_with": [
+        "M3-02",
+        "M3-05"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Sincronizzazione tra dispositivi o server",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Ogni video aperto compare in 'Saved' dopo chiusura e riapertura, con percentuale recuperata",
+        "Dopo un reload, i metadati non vengono riscaricati e il primo dial usa i peer memorizzati",
+        "I metadati letti da IndexedDB sono ri-verificati contro l'info-hash prima dell'uso",
+        "Eliminando un video vengono eliminati anche i record associati",
+        "La posizione di riproduzione viene ripristinata",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Schema, migrazione di versione, eliminazione a cascata"
+        },
+        {
+          "type": "e2e",
+          "covers": "Playwright: reload a metà download → nessuna richiesta `/peers` necessaria per riprendere, download completato"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run e2e` → verde",
+        "2. Recuperare metà video, ricaricare la pagina → ripresa immediata dalla lista 'Saved'"
+      ],
+      "security": [
+        "I dati letti da IndexedDB sono trattati come non fidati e validati (hash dei metadati, formato degli indirizzi)",
+        "Gli indirizzi dei peer restano solo nel browser e sono eliminati con il video",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M3-05",
+      "parent_id": "T0",
+      "milestone": "M3 - Picker e buffer",
+      "executor": "agent",
+      "title": "Service worker di streaming con richieste Range",
+      "description": "Aggiungere un service worker che serve `/stream/<info-hash>/<file>` con supporto `Range` leggendo dallo store dei pezzi tramite l'interfaccia `read(offset, length)`: una lettura di dati mancanti sposta la finestra di riproduzione e attende i pezzi. MP4 e WebM decodificabili da Chromium vengono riprodotti in un `<video>` nativo; lo stesso URL fornisce il link di download (sostituendo `download-button.svelte`/`fetch-file.ts` dove opportuno). Il sito è servito da Cloudflare Pages (decisione registrata): le intestazioni COOP/COEP vanno inviate dal sito con `apps/web/public/_headers` e in sviluppo dalla configurazione del dev server; rimuovere il service worker di isolamento `apps/web/public/coi-sw.js` e la sua registrazione in `src/pages/index.astro`, così il service worker di streaming è l'unico nello scope. Riferimento: docs/architecture.md §Playback.",
+      "depends_on": [
+        "M3-03"
+      ],
+      "parallel_with": [
+        "M3-02",
+        "M3-04"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Percorso libmedia e soglie di avvio (M3-06)",
+        "Configurazione del progetto Pages e del deploy (M2-10)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "`GET /stream/<ih>/<file>` con `Range` risponde 206 con `Content-Range`, `Accept-Ranges` e `Content-Type` corretti; senza Range risponde 200",
+        "Range non soddisfacibile → 416",
+        "Un MP4 di test si riproduce in `<video>` nativo con seek funzionante su dati non ancora scaricati",
+        "`coi-sw.js` è rimosso; `_headers` imposta COOP e COEP e in pagina `crossOriginIsolated === true` (libmedia continua a usare SharedArrayBuffer)",
+        "Info-hash o indice di file non validi → 404, senza accesso allo store",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Parsing di `Range`, calcolo delle risposte parziali"
+        },
+        {
+          "type": "e2e",
+          "covers": "Playwright: riproduzione nativa di un MP4 di test, seek in avanti, download dal link"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run e2e` → verde",
+        "2. Nello stack locale aprire un torrent con MP4: il video parte nel player nativo; fare seek oltre il buffer → riprende dopo il recupero",
+        "3. DevTools › Network: richieste `/stream/...` con stato 206"
+      ],
+      "security": [
+        "Validazione di info-hash, indice di file e intestazione Range",
+        "Il service worker serve solo file di torrent aperti nella sessione corrente; nessun percorso arbitrario",
+        "`Content-Disposition` e `Content-Type` derivati da valori sanificati, con `X-Content-Type-Options: nosniff`",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M3-06",
+      "parent_id": "T0",
+      "milestone": "M3 - Picker e buffer",
+      "executor": "agent",
+      "title": "Integrazione del player: letture come hint, soglie e bitrate",
+      "description": "Completare docs/architecture.md §Playback: il player (`apps/web/src/lib/player/*`, `torrent/stream.ts`) legge solo tramite `read(offset, length)` e ogni lettura è un hint per il picker; scelta automatica tra `<video>` nativo (M3-05) e libmedia in base ai codec (`player/codecs.ts`); avvio quando indice del contenitore e circa 10 s di video sono verificati; rebuffer solo a finestra vuota e ripresa a 5 s; il bitrate medio, noto dopo il parsing del contenitore, imposta la dimensione in byte della finestra del picker e la soglia per aggiungere socket (rate sotto il doppio del bitrate per 30 s, default configurabile).",
+      "depends_on": [
+        "M3-01",
+        "M3-05"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Nuovi codec o formati",
+        "Soglia di escalation al VPS (M4-06)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Il player non effettua richieste di rete proprie",
+        "La riproduzione parte solo dopo indice + ~10 s verificati e riprende a 5 s dopo un rebuffer",
+        "La finestra del picker in byte cambia con il bitrate rilevato",
+        "MKV/HEVC/AC3 continuano a funzionare via libmedia; MP4/WebM compatibili usano il player nativo",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Logica delle soglie di avvio/rebuffer, conversione bitrate → finestra"
+        },
+        {
+          "type": "e2e",
+          "covers": "Playwright: MP4 (nativo) e MKV (libmedia) di test, avvio, seek, rebuffer simulato con peer lento"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run e2e` → verde",
+        "2. Nello stack locale riprodurre un MP4 e un MKV di test, fare seek in entrambi → riproduzione corretta"
+      ],
+      "security": [
+        "Nessun nuovo canale di rete dal player; i decoder wasm sono caricati solo dall'origine del sito",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M3-07",
+      "parent_id": "T0",
+      "milestone": "M3 - Picker e buffer",
+      "executor": "human",
+      "title": "Revisione manuale M3",
+      "description": "Revisione umana: diff, test funzionali di M3, prove con file reali di formati diversi, verifica dell'uso di storage e della pulizia, commit.",
+      "depends_on": [
+        "M3-02",
+        "M3-04",
+        "M3-06"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Nuovo sviluppo"
+      ],
+      "acceptance_criteria": [
+        "Criteri di accettazione di M3 verificati",
+        "Misure dei tre numeri aggiornate in `docs/measurements.md`",
+        "Verificati il salvataggio automatico di ogni video e l'eliminazione esplicita",
+        "Commit creati dall'umano; CI verde"
+      ],
+      "automated_tests": [],
+      "functional_test": [
+        "1. `npm ci && npm run verify && npm run e2e`",
+        "2. Sessioni reali con MP4 e MKV, seek ripetuti, reload a metà",
+        "3. DevTools › Application: controllare OPFS e IndexedDB dopo la chiusura e dopo l'eliminazione da 'Saved'"
+      ],
+      "security": [
+        "Confermare che nessun dato dei pezzi o indirizzo peer lasci il browser"
+      ]
+    },
+    {
+      "id": "M4-01",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "Gateway di tunnel sul VPS (TCP in uscita)",
+      "description": "In `services/seeders` aggiungere un endpoint WebSocket che implementa lo stesso protocollo di `docs/tunnel-protocol.md` per connessioni TCP in uscita: codec Rust validato sui vettori di `packages/tunnel-protocol/fixtures`, handshake gate identico al gateway Cloudflare, endpoint pubblico senza autenticazione del browser; stesse regole (controllo dell'intestazione `Origin` limitato alla sola origine del sito frontend, letta da env: per i WebSocket è l'equivalente del CORS, che il browser non applica agli upgrade; indirizzi privati/riservati, porte < 1024, idle 90 s, timeout di sessione di 2 ore, limite minimale di upgrade per IP come sul gateway Cloudflare, limite di connessioni per socket configurabile). Riusare `peerwire.rs` e `netguard.rs`. `packages/engine` deve poter usare questo gateway con il `TunnelClient` esistente cambiando solo l'URL. Riferimenti: docs/architecture.md §Target architecture (Fallback gateway), §Tunnel protocol and request budget.",
+      "depends_on": [
+        "M3-07"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Announce, listener in ingresso, uTP (M4-02…M4-05)",
+        "Configurazione nginx/TLS di produzione (M5-04)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "La suite e2e dell'engine passa puntando al gateway VPS invece che a wrangler dev",
+        "I vettori binari condivisi sono decodificati e ricodificati identici dal codec Rust",
+        "Nessun byte inoltrato prima dell'handshake valido; server non BitTorrent → `failed`",
+        "Indirizzi privati e porte < 1024 rifiutati; Origin fuori allow-list → 403",
+        "Il processo non richiede privilegi di root e l'unità systemd di esempio usa un utente dedicato",
+        "Log senza IP client, indirizzi peer, info-hash",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Codec Rust sui vettori condivisi, validazione indirizzi, macchina a stati del gate"
+        },
+        {
+          "type": "integration",
+          "covers": "Gateway Rust + fake peer: open/data/close, limiti, timeout"
+        },
+        {
+          "type": "e2e",
+          "covers": "Engine → gateway VPS locale → fake peer: download completo verificato"
+        }
+      ],
+      "functional_test": [
+        "1. `cargo run --release --manifest-path services/seeders/Cargo.toml`",
+        "2. `GATEWAY_URL=ws://127.0.0.1:8080/<route> npm run e2e` → verde",
+        "3. `cargo test --manifest-path services/seeders/Cargo.toml` → verde"
+      ],
+      "security": [
+        "Stesse garanzie anti-proxy del gateway Cloudflare, verificate dagli stessi scenari di test",
+        "Nessuna autenticazione del browser (decisione registrata): l'accesso è limitato dal controllo `Origin` sulla sola origine del frontend e, per i client non browser che possono falsificarla, dall'handshake gate e dai limiti di sessione",
+        "Nessun segreto condiviso tra browser e VPS",
+        "Esecuzione con utente non privilegiato; limiti di file descriptor e di sessioni concorrenti da env",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-02",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "VPS: announce di sessione e connessioni in ingresso",
+      "description": "Implementare il punto 3 di docs/architecture.md §Chunk recovery › Swarms with few seeders: su richiesta del browser (frame/comando definito in questo task e aggiunto a `docs/tunnel-protocol.md`) il gateway VPS entra nello swarm per l'info-hash della sessione: annuncia la propria porta a tracker e DHT (`announce_peer`), accetta connessioni TCP in ingresso, valida l'handshake del peer per un info-hash con sessione attiva e consegna la connessione al browser con il frame `accept`. Il VPS attuale è stato confermato adatto dal committente. L'announce avviene solo per sessioni attive e termina alla chiusura della sessione (docs/architecture.md §Risks: \"Announce only for active sessions and only when escalation is needed\"). In `packages/engine` gestire `accept` come una normale `PeerConnection` (handshake iniziato dal peer).",
+      "depends_on": [
+        "M4-01"
+      ],
+      "parallel_with": [
+        "M4-03",
+        "M4-07"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "uTP e hole punching",
+        "Regole di escalation nell'engine (M4-06)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Una connessione in ingresso per un info-hash senza sessione attiva viene chiusa senza risposta",
+        "Una connessione in ingresso valida produce `accept` e scambio di dati con il browser",
+        "Alla chiusura della sessione il gateway smette di annunciare e chiude il listener per quell'info-hash",
+        "Il numero di connessioni in ingresso per sessione e totale è limitato",
+        "Nessun announce parte senza richiesta esplicita della sessione",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Registro delle sessioni attive, validazione dell'handshake in ingresso"
+        },
+        {
+          "type": "integration",
+          "covers": "Tracker finto + fake peer che si connette in ingresso: accept, sessione inesistente, fine sessione"
+        }
+      ],
+      "functional_test": [
+        "1. `cargo test --manifest-path services/seeders/Cargo.toml` → verde",
+        "2. Avviare gateway VPS, tracker finto e un fake peer in modalità 'solo in uscita' dallo harness → lo script di esempio dell'engine riceve `accept` e scarica dal peer"
+      ],
+      "security": [
+        "Il listener accetta solo handshake BitTorrent per info-hash con sessione attiva; tutto il resto è chiuso subito",
+        "Limiti di connessioni in ingresso e timeout di handshake contro l'esaurimento di risorse",
+        "Log senza IP dei peer o info-hash",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-03",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "Valutazione delle librerie uTP (decision record)",
+      "description": "Decidere, con evidenze, se il trasporto uTP del gateway VPS userà una libreria esistente o un'implementazione propria. Regola fissata dal committente: una libreria si adotta SOLO se è largamente utilizzata E realizza esattamente ciò che serve; nel dubbio si implementa in proprio. Requisiti funzionali da verificare su ogni candidata (da docs/architecture.md §Chunk recovery › Swarms with few seeders e §Target architecture): uTP BEP 29 interoperabile con i client diffusi, connessioni in ingresso e in uscita sullo stesso socket UDP, connessione simultanea verso un indirizzo dato (necessaria per BEP 55), integrazione con il runtime async di `services/seeders`, esposizione come stream di byte bidirezionale, licenza compatibile. Per 'largamente utilizzata' riportare dati verificabili (progetti noti che la usano in produzione, dipendenti, download, attività di manutenzione, issue aperte rilevanti) senza fissare soglie arbitrarie: l'esito è 'adottare' solo se le evidenze sono inequivocabili. Scrivere `docs/decisions/utp.md` con candidate, evidenze con fonti, matrice requisiti × candidate, esito. Se l'esito è 'implementazione propria', includere la proposta di suddivisione di M4-04 in sotto-task da una sessione ciascuno.",
+      "depends_on": [
+        "M4-01"
+      ],
+      "parallel_with": [
+        "M4-02",
+        "M4-07"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Scrivere codice di produzione o aggiungere dipendenze",
+        "Implementare uTP (M4-04)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "`docs/decisions/utp.md` elenca le candidate esaminate con fonti consultabili per ogni dato",
+        "Ogni requisito funzionale è marcato soddisfatto / non soddisfatto / non verificabile per ogni candidata, con riferimento a documentazione o codice",
+        "L'esito è 'adottare <libreria>' solo se tutti i requisiti sono soddisfatti e l'uso diffuso è documentato; in ogni altro caso è 'implementazione propria'",
+        "In caso di implementazione propria il documento propone la suddivisione di M4-04 in sotto-task",
+        "Nessuna dipendenza aggiunta al repository",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Nessun nuovo test: il task produce solo documentazione; le suite esistenti restano verdi"
+        }
+      ],
+      "functional_test": [
+        "1. Aprire `docs/decisions/utp.md` e verificare che ogni affermazione abbia una fonte",
+        "2. `git status` → modificati solo file sotto `docs/`",
+        "3. `npm run verify` → exit 0"
+      ],
+      "security": [
+        "Per ogni candidata riportare advisory di sicurezza note (RustSec) e stato di manutenzione",
+        "Considerare la superficie d'attacco UDP (amplificazione, esaurimento di stato) tra i criteri",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-04",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "VPS: trasporto uTP",
+      "description": "Seguire l'esito di `docs/decisions/utp.md` (M4-03): usare la libreria indicata, oppure l'implementazione propria secondo la suddivisione approvata in quel documento (in tal caso questo task copre solo il sotto-task assegnato alla sessione). Aggiungere al gateway VPS connessioni uTP (BEP 29) in ingresso e in uscita sullo stesso socket UDP, esposte al browser come normali tunnel (stessi frame; estendere `open` con il tipo di trasporto in `docs/tunnel-protocol.md`). Riferimento: docs/architecture.md §Chunk recovery › Swarms with few seeders (punti 3 e 4), §Target architecture (Fallback gateway).",
+      "depends_on": [
+        "M4-02",
+        "M4-03"
+      ],
+      "parallel_with": [
+        "M4-06"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Hole punching (M4-05)",
+        "Scegliere una libreria diversa da quella decisa in M4-03",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "L'implementazione corrisponde all'esito registrato in `docs/decisions/utp.md`",
+        "Un download completo via uTP da un peer di test viene verificato",
+        "Connessioni uTP in ingresso passano per lo stesso controllo di sessione attiva del TCP",
+        "Perdita e riordino di pacchetti simulati non corrompono lo stream",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Macchina a stati uTP o adattatore della libreria scelta"
+        },
+        {
+          "type": "integration",
+          "covers": "Peer uTP di test su loopback con perdita simulata: download completo"
+        }
+      ],
+      "functional_test": [
+        "1. `cargo test --manifest-path services/seeders/Cargo.toml` → verde"
+      ],
+      "security": [
+        "Protezione da amplificazione/riflessione UDP: nessuna risposta a pacchetti non associati a una connessione o sessione valida",
+        "Limiti di stato per indirizzo remoto",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-05",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "Hole punching (BEP 55)",
+      "description": "Implementare `ut_holepunch`: l'engine nel browser invia il messaggio di rendezvous tramite un peer già connesso che supporta l'estensione e chiede al gateway VPS di avviare la connessione uTP simultanea verso il peer dietro NAT; il risultato è un tunnel come gli altri. Riferimento: docs/architecture.md §Chunk recovery › Swarms with few seeders (punto 4).",
+      "depends_on": [
+        "M4-04"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Fare da relay per altri peer",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "I messaggi rendezvous/connect/error di BEP 55 sono codificati e gestiti",
+        "In un test con NAT simulato il peer bersaglio viene raggiunto tramite un relay",
+        "Un errore di rendezvous marca il candidato senza bloccare la sessione",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Codec dei messaggi ut_holepunch, gestione degli errori"
+        },
+        {
+          "type": "integration",
+          "covers": "Relay finto + peer bersaglio con NAT simulato"
+        }
+      ],
+      "functional_test": [
+        "1. `npm test -w packages/engine` e `cargo test --manifest-path services/seeders/Cargo.toml` → verdi"
+      ],
+      "security": [
+        "Il gateway avvia connessioni uTP solo verso indirizzi che superano le regole di validazione e solo per sessioni attive",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-06",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "Engine: regole di escalation e degrado dichiarato",
+      "description": "Implementare in `packages/engine` e `apps/web` la scala di docs/architecture.md §Chunk recovery › Swarms with few seeders: (1) pazienza sui tunnel Cloudflare restando connessi e interested in attesa dell'unchoke ottimistico, (2) uso dei peer parziali, (3) apertura del tunnel verso il gateway VPS e richiesta di ingresso nello swarm quando meno di 2 peer consegnano o il rate resta sotto il bitrate, (5) messaggio in pagina quando il rate è sotto il bitrate, con opzione di continuare a bufferizzare. URL del gateway VPS da variabile pubblica di build. Soglie configurabili con default volutamente esigenti (decisione registrata): l'escalation al VPS scatta solo se meno di 2 peer consegnano per 90 s consecutivi, oppure se il rate resta sotto il bitrate per 90 s consecutivi; l'avviso in pagina compare dopo 30 s di rate sotto il bitrate.",
+      "depends_on": [
+        "M4-02"
+      ],
+      "parallel_with": [
+        "M4-04"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "uTP e hole punching lato VPS",
+        "Upload verso i peer (escluso per decisione registrata)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Con swarm sano il tunnel VPS non viene mai aperto",
+        "Con meno di 2 peer che consegnano, o rate sotto il bitrate per la durata configurata, l'engine apre il tunnel VPS e richiede l'announce",
+        "Un seed che fa unchoke dopo ~30 s viene atteso e non scartato",
+        "La pagina mostra lo stato 'rate sotto il bitrate' e il file viene comunque completato",
+        "Senza URL del gateway VPS configurato l'escalation è disattivata senza errori",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Macchina a stati dell'escalation con clock simulato"
+        },
+        {
+          "type": "e2e",
+          "covers": "Playwright: swarm con un solo seed lento a fare unchoke; swarm con soli peer 'in ingresso' che richiede il VPS"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run e2e` → verde",
+        "2. Nello stack locale avviare lo scenario 'solo peer NATed' → la UI mostra l'escalation e il download procede via VPS"
+      ],
+      "security": [
+        "L'escalation non invia al VPS più di quanto necessario: info-hash e tracker del magnet",
+        "Il messaggio all'utente non espone indirizzi dei peer",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-07",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "Percorso dati di default configurabile",
+      "description": "Rendere il percorso di default una configurazione, come da docs/architecture.md §Risks (\"switching the default path is a configuration change\"): una variabile pubblica di build/deploy sceglie quale gateway (Cloudflare o VPS) è primario e quale di fallback. Documentare in `docs/operations.md`.",
+      "depends_on": [
+        "M4-01"
+      ],
+      "parallel_with": [
+        "M4-02",
+        "M4-03"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Selezione automatica a runtime in base a blocchi di Cloudflare",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Con la variabile su 'vps' la sessione completa non apre alcun WebSocket verso Cloudflare",
+        "Con la variabile su 'cloudflare' il comportamento è invariato",
+        "Un valore non valido fa fallire la build con messaggio chiaro",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Risoluzione della configurazione"
+        },
+        {
+          "type": "e2e",
+          "covers": "Sessione completa in entrambe le configurazioni"
+        }
+      ],
+      "functional_test": [
+        "1. `PUBLIC_DEFAULT_GATEWAY=vps npm run e2e` → verde",
+        "2. `PUBLIC_DEFAULT_GATEWAY=cloudflare npm run e2e` → verde"
+      ],
+      "security": [
+        "Solo URL pubblici nelle variabili `PUBLIC_*`; nessuna credenziale nel bundle del client",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-08",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "E2E del percorso pochi seeder",
+      "description": "Estendere `tools/harness` con tracker finto e peer 'solo in uscita' (simula un seeder dietro NAT che si connette agli indirizzi annunciati) e aggiungere scenari e2e: unico seed NATed raggiunto via announce + ingresso; seed lento a fare unchoke; mix di leecher parziali che insieme coprono il file; caduta del gateway VPS a metà. Aggiornare le metriche per distinguere i byte per percorso (Cloudflare / VPS).",
+      "depends_on": [
+        "M4-05",
+        "M4-06",
+        "M4-07"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Test contro swarm reali",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Tutti gli scenari completano il download con pezzi verificati",
+        "La diagnostica riporta i byte passati da ciascun percorso",
+        "Gli scenari girano in CI entro un tempo dichiarato",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "e2e",
+          "covers": "Quattro scenari pochi-seeder sullo stack locale completo (gateway Cloudflare dev, gateway VPS, tracker finto, peer finti)"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run e2e` → verde, inclusi gli scenari 'few-seeders'"
+      ],
+      "security": [
+        "Harness confinato a loopback; nessun announce verso tracker o DHT reali durante i test",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-09",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "human",
+      "title": "Revisione manuale M4",
+      "description": "Revisione umana: diff, test funzionali di M4, prova su VPS di staging con torrent a pochi seeder, commit.",
+      "depends_on": [
+        "M4-08"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Nuovo sviluppo"
+      ],
+      "acceptance_criteria": [
+        "Criteri di accettazione di M4 verificati",
+        "Esito di `docs/decisions/utp.md` riesaminato e confermato",
+        "Almeno un torrent reale con seeder solo NATed recuperato tramite il gateway VPS",
+        "Commit creati dall'umano; CI verde"
+      ],
+      "automated_tests": [],
+      "functional_test": [
+        "1. `npm ci && npm run verify && npm run e2e`",
+        "2. Deploy di staging del gateway VPS con utente dedicato e firewall limitato alle porte necessarie",
+        "3. Sessione reale su torrent con pochi seeder; annotare le misure"
+      ],
+      "security": [
+        "Firewall del VPS: solo porte HTTP(S), listener BitTorrent e UDP necessarie",
+        "Verificare che l'announce cessi alla fine delle sessioni",
+        "Log di staging senza dati sensibili"
+      ]
+    },
+    {
+      "id": "M5-01",
+      "parent_id": "T0",
+      "milestone": "M5 - Pulizia e sorgenti extra",
+      "executor": "agent",
+      "title": "Rimozione degli endpoint legacy da services/seeders",
+      "description": "Rimuovere `/swarm`, `/metadata`, `/files`, il probing e i token da `services/seeders` (`swarm.rs`, `probe.rs`, `metadata.rs`, `files.rs`, `token.rs`, parti di `main.rs`, `config.rs`, `testpeer.rs` se non più usato) e `WORKER_TOKEN_SECRET` da config ed esempi. Valutare `/peers` (formato non streaming del PoC): rimuoverlo solo se nessun client lo usa. Aggiornare README e `docs/discovery-api.md`. Riferimento: docs/architecture.md §Risks, open questions and delivery › Phase 4.",
+      "depends_on": [
+        "M4-09"
+      ],
+      "parallel_with": [
+        "M5-02",
+        "M5-03"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Modifiche a discovery o gateway VPS",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Le route rimosse rispondono 404",
+        "Nessun riferimento a token o probing nel codice e nella configurazione",
+        "`cargo clippy -- -D warnings` senza codice morto",
+        "e2e completi verdi",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "integration",
+          "covers": "Route rimosse → 404; suite di discovery e gateway invariate"
+        },
+        {
+          "type": "e2e",
+          "covers": "Regressione completa"
+        }
+      ],
+      "functional_test": [
+        "1. `grep -rn 'WORKER_TOKEN_SECRET\\|/swarm\\|/metadata' services apps packages` → nessun risultato fuori dai documenti storici",
+        "2. `npm run verify && npm run e2e` → exit 0"
+      ],
+      "security": [
+        "Riduzione della superficie d'attacco e rimozione di un segreto condiviso non più necessario",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M5-02",
+      "parent_id": "T0",
+      "milestone": "M5 - Pulizia e sorgenti extra",
+      "executor": "agent",
+      "title": "Web seed come tipo di connessione",
+      "description": "Aggiungere a `packages/engine` i web seed (BEP 19): URL da `ws=` nel magnet e `url-list` nei metadati, richieste HTTP Range dirette dal browser quando CORS lo consente, esposti al picker come un peer che possiede tutti i pezzi. I dati passano dalla stessa verifica SHA-1. Riferimento: docs/architecture.md §Chunk recovery › Peer sources (riga Web seeds).",
+      "depends_on": [
+        "M4-09"
+      ],
+      "parallel_with": [
+        "M5-01",
+        "M5-03"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Proxy lato server per web seed senza CORS (non previsto dal documento)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Un torrent di test con web seed locale viene scaricato solo via HTTP e verificato",
+        "Un web seed senza CORS o che risponde con errori viene scartato senza bloccare la sessione",
+        "Sono accettati solo URL `http:`/`https:`; su pagina HTTPS solo `https:`",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Mappatura pezzo → URL e intervalli per torrent a file singolo e multi-file"
+        },
+        {
+          "type": "integration",
+          "covers": "Server HTTP di test con e senza Range/CORS"
+        }
+      ],
+      "functional_test": [
+        "1. `npm test -w packages/engine` → verde",
+        "2. `npm run e2e` → verde (scenario web seed)"
+      ],
+      "security": [
+        "Validazione dello schema e dell'host degli URL forniti dal magnet o dai metadati; nessuna credenziale inviata (`credentials: 'omit'`)",
+        "Limite sul numero di web seed e sulla dimensione delle risposte",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M5-03",
+      "parent_id": "T0",
+      "milestone": "M5 - Pulizia e sorgenti extra",
+      "executor": "agent",
+      "title": "Tracker WebSocket e peer WebRTC come tipo di connessione",
+      "description": "Aggiungere a `packages/engine` l'announce ai tracker WebSocket presenti nel magnet e le connessioni WebRTC (data channel) verso peer WebTorrent, esposte tramite la stessa interfaccia `Transport`. Riferimento: docs/architecture.md §Chunk recovery › Peer sources (riga WebSocket trackers and WebRTC peers), §Summary (ultima frase).",
+      "depends_on": [
+        "M4-09"
+      ],
+      "parallel_with": [
+        "M5-01",
+        "M5-02"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Fare da seed per peer WebRTC: nessun upload verso i peer (decisione registrata)",
+        "Aggiunta di tracker WebSocket non presenti nel magnet",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Con un tracker WebSocket e un peer WebRTC di test l'engine scarica e verifica i pezzi senza usare alcun gateway",
+        "L'assenza di peer WebRTC non introduce ritardi nella sessione",
+        "Sono contattati solo tracker `wss:` elencati nel magnet",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Messaggi di announce/offer/answer del tracker"
+        },
+        {
+          "type": "e2e",
+          "covers": "Playwright: tracker WebSocket di test e peer WebRTC di test"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run e2e` → verde (scenario WebRTC)"
+      ],
+      "security": [
+        "Validazione dei messaggi del tracker e degli SDP ricevuti; limiti sul numero di offerte",
+        "Solo `wss:` da pagina HTTPS",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M5-04",
+      "parent_id": "T0",
+      "milestone": "M5 - Pulizia e sorgenti extra",
+      "executor": "agent",
+      "title": "Runbook operativi e configurazione di deploy",
+      "description": "Scrivere `docs/operations.md` e aggiornare i file di esempio: rimando al deploy automatico di gateway e frontend (M2-10) con le sue variabili; procedura MANUALE completa di deploy del servizio VPS, passo per passo: build release, copia del binario, file env, unità systemd, nginx, verifica di salute, rollback (`services/seeders/deploy/*.service`, nginx con WebSocket e stream NDJSON senza buffering partendo da `deploy/nginx-magnet-seeders.conf` del PoC, endpoint pubblico con TLS e origine del frontend come unica origine ammessa, env example), del sito statico; limiti di richieste configurati (gateway e `/peers`) e come modificarli; Turnstile resta un'opzione non implementata; procedura per cambiare percorso di default; elenco completo delle variabili d'ambiente per componente. Riferimenti: docs/architecture.md §Cost model, §Tunnel protocol and request budget › Rules (Abuse limits), §Risks.",
+      "depends_on": [
+        "M5-01",
+        "M5-02",
+        "M5-03"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [
+        "OQ-02"
+      ],
+      "out_of_scope": [
+        "Esecuzione del deploy",
+        "Automazione del deploy del VPS",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "La procedura manuale di deploy e rollback del VPS è eseguibile seguendo solo `docs/operations.md`",
+        "Ogni variabile d'ambiente usata dal codice è documentata con scopo, default e se è segreta",
+        "I file di esempio contengono solo segnaposto",
+        "L'unità systemd usa utente dedicato, `NoNewPrivileges`, e solo le capability necessarie",
+        "La configurazione nginx disabilita il buffering per `/peers` e supporta l'upgrade WebSocket",
+        "Un test automatico verifica che ogni variabile letta dal codice compaia nella documentazione",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Controllo di coerenza tra variabili lette dal codice e `docs/operations.md` / file example"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run verify` → exit 0",
+        "2. `nginx -t -c <config di esempio adattata>` e `systemd-analyze verify services/seeders/deploy/*.service` → nessun errore"
+      ],
+      "security": [
+        "Segreti solo via `wrangler secret` e file env fuori dal repository con permessi 600",
+        "Privilegio minimo per servizio VPS e token di deploy",
+        "Raccomandazioni di logging: nessun IP, info-hash, magnet nei log applicativi; access log nginx senza query string",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M5-05",
+      "parent_id": "T0",
+      "milestone": "M5 - Pulizia e sorgenti extra",
+      "executor": "human",
+      "title": "Revisione manuale finale",
+      "description": "Revisione umana conclusiva: diff, test funzionali di M5, deploy di produzione seguendo `docs/operations.md`, misure finali dei tre numeri, chiusura o rinvio delle open question residue, commit.",
+      "depends_on": [
+        "M5-04"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Nuovo sviluppo"
+      ],
+      "acceptance_criteria": [
+        "Criteri di accettazione di M5 verificati",
+        "Deploy di produzione eseguito seguendo solo il runbook",
+        "Misure finali registrate in `docs/measurements.md` e confrontate con gli obiettivi del documento (2–4 s al primo pezzo, ~40 richieste per film da 2 GB)",
+        "Open question residue aggiornate",
+        "Commit creati dall'umano; CI verde"
+      ],
+      "automated_tests": [],
+      "functional_test": [
+        "1. `npm ci && npm run verify && npm run e2e`",
+        "2. Deploy secondo `docs/operations.md`",
+        "3. Sessioni reali: swarm sano, swarm con pochi seeder, MP4 e MKV"
+      ],
+      "security": [
+        "Revisione finale di segreti, allow-list, regola di rate limit, permessi dei token e contenuto dei log in produzione"
+      ]
+    }
+  ]
+}

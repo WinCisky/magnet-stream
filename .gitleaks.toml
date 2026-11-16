@@ -1,0 +1,15 @@
+# gitleaks: default rules, minus generated/third-party trees.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "dependencies, build output, local tool state"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)target/''',
+  '''(^|/)dist/''',
+  '''(^|/)\.astro/''',
+  '''(^|/)\.wrangler/''',
+  '''^gitleaks$''',
+  '''apps/web/public/libmedia/''',
+]

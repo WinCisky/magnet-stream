@@ -1,0 +1,18 @@
+{
+	"//": "Shared by packages/* and tools/*. Erasable syntax only, so Node runs the sources as is (type stripping).",
+	"compilerOptions": {
+		"target": "es2023",
+		"lib": ["es2023"],
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"strict": true,
+		"noEmit": true,
+		"isolatedModules": true,
+		"verbatimModuleSyntax": true,
+		"erasableSyntaxOnly": true,
+		"allowImportingTsExtensions": true,
+		"noFallthroughCasesInSwitch": true,
+		"skipLibCheck": true,
+		"types": []
+	}
+}

@@ -1,0 +1,31 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "magnet-stream-gateway",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-09-01",
+	// request.signal fires when the browser disconnects: that's how an idle
+	// pipe learns to close the peer socket (it only notices on its next write).
+	"compatibility_flags": ["enable_request_signal"],
+	"workers_dev": true,
+	// No custom route: the gateway is served at the address Cloudflare
+	// generates, https://magnet-stream-gateway.<account-subdomain>.workers.dev
+	// Under `wrangler dev`, requests keep a loopback URL (instead of the
+	// route's hostname): ALLOW_PRIVATE_PEERS is only honoured for those.
+	"dev": { "host": "127.0.0.1" },
+	// Workers Logs: per-invocation CPU time, to confirm the pipe stays cheap.
+	"observability": { "enabled": true },
+	// Tunnel sessions (docs/tunnel-protocol.md): one Durable Object per
+	// WebSocket. SQLite-backed because that's what the free plan offers; it
+	// stores nothing.
+	"durable_objects": {
+		"bindings": [{ "name": "TUNNEL", "class_name": "TunnelSession" }]
+	},
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["TunnelSession"] }],
+	// ALLOW_PRIVATE_PEERS must never be set here (a test enforces it): it is
+	// for `wrangler dev` only, via .dev.vars or --var.
+	"vars": {
+		"ALLOWED_ORIGINS": "https://wincisky.github.io,http://localhost:4321"
+	}
+	// Secret, set with `npx wrangler secret put TOKEN_SECRET` (local dev reads
+	// it from .dev.vars): must equal magnet-seeders' WORKER_TOKEN_SECRET.
+}

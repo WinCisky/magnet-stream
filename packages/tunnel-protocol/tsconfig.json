@@ -1,0 +1,5 @@
+{
+	"//": "Runtime code: no Node or DOM types, so nothing platform-specific slips in.",
+	"extends": "../../tsconfig.base.json",
+	"include": ["src"]
+}

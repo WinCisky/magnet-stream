@@ -1,0 +1,27 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+target/
+.astro/
+apps/web/public/libmedia/
+
+# Cloudflare / wrangler local state and generated types
+.wrangler/
+worker-configuration.d.ts
+
+# secrets: only *.example files are versioned
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+!.env.example
+!*.env.example
+
+# logs and OS/editor files
+npm-debug.log*
+*.log
+.DS_Store
+.idea/

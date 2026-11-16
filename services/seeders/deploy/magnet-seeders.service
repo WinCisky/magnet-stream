@@ -1,0 +1,44 @@
+[Unit]
+Description=magnet-seeders API (magnet -> peer list)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/magnet-seeders/magnet-seeders
+EnvironmentFile=-/etc/magnet-seeders/magnet-seeders.env
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+# No persistent state, no manual user to manage: systemd creates an
+# ephemeral, unprivileged user/group for this unit at start.
+DynamicUser=yes
+
+# Sandboxing. If the unit fails to start and you can't tell why, comment
+# these out one at a time (SystemCallFilter and MemoryDenyWriteExecute
+# first) to find the culprit, then `systemctl daemon-reload && systemctl
+# restart magnet-seeders`.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

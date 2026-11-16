@@ -1,0 +1,407 @@
+// A scriptable BitTorrent peer for tests: serves a FakeTorrent over the
+// peer-wire protocol on TCP, with configurable misbehaviour. Listens on
+// loopback and an ephemeral port unless told otherwise.
+
+import { randomBytes } from "node:crypto";
+import net from "node:net";
+import { bdecode, bencode, concat, type BDecoded } from "./bencode.ts";
+import { magnetFor, type FakeTorrent } from "./torrent.ts";
+
+export const MSG = {
+	CHOKE: 0,
+	UNCHOKE: 1,
+	INTERESTED: 2,
+	NOT_INTERESTED: 3,
+	HAVE: 4,
+	BITFIELD: 5,
+	REQUEST: 6,
+	PIECE: 7,
+	CANCEL: 8,
+	HAVE_ALL: 0x0e,
+	HAVE_NONE: 0x0f,
+	REJECT: 0x10,
+	EXTENDED: 20,
+} as const;
+
+/** Extension ids this peer assigns in its BEP 10 handshake (`m`). */
+export const OUR_EXTENSIONS = { ut_metadata: 1, ut_pex: 2 } as const;
+export const METADATA_PIECE = 16 * 1024;
+const MAX_MESSAGE = 1 << 20;
+const MAX_REQUEST = 128 * 1024;
+const PROTOCOL = Buffer.from("BitTorrent protocol", "latin1");
+
+export interface PeerBehaviour {
+	/** Listen address (default 127.0.0.1). */
+	host?: string;
+	/** Listen port (default 0: ephemeral). */
+	port?: number;
+	/** Pieces held: all (default), none, or a list (partial peer, sent as a bitfield). */
+	have?: "all" | "none" | readonly number[];
+	/** BEP 6 fast extension (default true): have-all/none, reject. */
+	fast?: boolean;
+	/** BEP 10 extension protocol (default true): reqq, ut_metadata, ut_pex. */
+	extensions?: boolean;
+	/** Request queue depth advertised in the extension handshake (default 500). */
+	reqq?: number;
+	/** Unchoke on interested (default true). false: never unchoke. */
+	unchoke?: boolean;
+	/** Delay before the unchoke (default 0). */
+	unchokeDelayMs?: number;
+	/** Choke (and reject, with fast) once this many blocks were served. */
+	chokeAfterBlocks?: number;
+	/** Hang up right after the handshake. */
+	closeAfterHandshake?: boolean;
+	/** Hang up once this many blocks were served. */
+	closeAfterBlocks?: number;
+	/** Serve corrupted bytes: for every piece (true) or the listed ones. */
+	corrupt?: boolean | readonly number[];
+	/** Answer the handshake with another info-hash. */
+	wrongInfoHash?: boolean;
+	/** Wait this long before answering the handshake. */
+	handshakeDelayMs?: number;
+	/** Never answer the handshake (the connection stays open, silent). */
+	silent?: boolean;
+	/** Answer with these bytes instead of a handshake (a non-BitTorrent server). */
+	respondWith?: Uint8Array;
+	/** Serve the info dict over ut_metadata, BEP 9 (default true). */
+	metadata?: boolean;
+	/** Addresses (`ip:port`, `[ip6]:port`) to announce with ut_pex, BEP 11. */
+	pex?: readonly string[];
+	/** 20-byte peer id (default `-FP0001-` + random). */
+	peerId?: Uint8Array;
+}
+
+export interface PeerStats {
+	connections: number;
+	closed: number;
+	handshakes: number;
+	requests: number;
+	served: number;
+	rejected: number;
+	/** Ids of the first two messages each connection received after the handshake. */
+	firstMessages: number[];
+	metadataRequests: number;
+	pexSent: number;
+	/** Messages received that this peer never expects from a leecher that doesn't upload (piece, unchoke...). */
+	unexpected: number[];
+}
+
+export interface FakePeer {
+	host: string;
+	port: number;
+	/** `127.0.0.1:6881` or `[::1]:6881`. */
+	addr: string;
+	/** Magnet with an `x.pe` hint pointing at this peer. */
+	magnet: string;
+	torrent: FakeTorrent;
+	stats: PeerStats;
+	close(): Promise<void>;
+}
+
+export interface StartOptions extends PeerBehaviour {
+	torrent: FakeTorrent;
+}
+
+export function frame(id: number, payload: Uint8Array = new Uint8Array(0)): Buffer {
+	const buf = Buffer.alloc(5 + payload.length);
+	buf.writeUInt32BE(payload.length + 1, 0);
+	buf[4] = id;
+	buf.set(payload, 5);
+	return buf;
+}
+
+export function extended(extId: number, dict: Parameters<typeof bencode>[0], trailer?: Uint8Array): Buffer {
+	const body = bencode(dict);
+	return frame(MSG.EXTENDED, concat([Uint8Array.of(extId), body, trailer ?? new Uint8Array(0)]));
+}
+
+/** Start a fake peer serving `torrent`. */
+export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
+	const { torrent } = options;
+	const b = {
+		host: "127.0.0.1",
+		port: 0,
+		have: "all" as const,
+		fast: true,
+		extensions: true,
+		reqq: 500,
+		unchoke: true,
+		unchokeDelayMs: 0,
+		metadata: true,
+		...options,
+	};
+	const peerId = b.peerId ?? concat([Buffer.from("-FP0001-", "latin1"), randomBytes(12)]);
+	if (peerId.length !== 20) throw new RangeError("peerId must be 20 bytes");
+	const holds = havePredicate(b.have, torrent.pieceCount);
+	const corrupt =
+		b.corrupt === true ? () => true : Array.isArray(b.corrupt) ? (p: number) => (b.corrupt as readonly number[]).includes(p) : () => false;
+
+	const stats: PeerStats = {
+		connections: 0,
+		closed: 0,
+		handshakes: 0,
+		requests: 0,
+		served: 0,
+		rejected: 0,
+		firstMessages: [],
+		metadataRequests: 0,
+		pexSent: 0,
+		unexpected: [],
+	};
+	const sockets = new Set<net.Socket>();
+
+	const server = net.createServer((socket) => {
+		stats.connections++;
+		sockets.add(socket);
+		socket.setNoDelay(true);
+		socket.on("close", () => {
+			stats.closed++;
+			sockets.delete(socket);
+		});
+		socket.on("error", () => {});
+		const timers = new Set<ReturnType<typeof setTimeout>>();
+		socket.on("close", () => timers.forEach(clearTimeout));
+		const later = (ms: number, fn: () => void) => {
+			const t = setTimeout(() => {
+				timers.delete(t);
+				fn();
+			}, ms);
+			timers.add(t);
+		};
+
+		let buf: Buffer = Buffer.alloc(0);
+		let handshaken = false;
+		let unchoked = false;
+		let messages = 0;
+		let remoteExt: Map<string, BDecoded> | undefined;
+		let served = 0;
+
+		const send = (data: Uint8Array) => {
+			if (!socket.destroyed && socket.writable) socket.write(data);
+		};
+
+		const sendSetup = () => {
+			if (b.extensions) {
+				send(
+					extended(0, {
+						m: {
+							...(b.metadata ? { ut_metadata: OUR_EXTENSIONS.ut_metadata } : {}),
+							...(b.pex ? { ut_pex: OUR_EXTENSIONS.ut_pex } : {}),
+						},
+						reqq: b.reqq,
+						v: "FakePeer/1.0",
+						...(b.metadata ? { metadata_size: torrent.info.length } : {}),
+					}),
+				);
+			}
+			if (b.have === "all" && b.fast) send(frame(MSG.HAVE_ALL));
+			else if (b.have === "none" && b.fast) send(frame(MSG.HAVE_NONE));
+			else if (b.have !== "none") {
+				const bits = Buffer.alloc(Math.ceil(torrent.pieceCount / 8));
+				for (let p = 0; p < torrent.pieceCount; p++) if (holds(p)) bits[p >> 3] |= 0x80 >> (p & 7);
+				send(frame(MSG.BITFIELD, bits));
+			}
+		};
+
+		const answerHandshake = () => {
+			if (b.respondWith) {
+				send(b.respondWith);
+				return;
+			}
+			const reply = Buffer.alloc(68);
+			reply[0] = 19;
+			PROTOCOL.copy(reply, 1);
+			if (b.extensions) reply[25] |= 0x10;
+			if (b.fast) reply[27] |= 0x04;
+			(b.wrongInfoHash ? randomBytes(20) : Buffer.from(torrent.infoHash)).copy(reply, 28);
+			Buffer.from(peerId).copy(reply, 48);
+			send(reply);
+			if (b.closeAfterHandshake) {
+				socket.end();
+				return;
+			}
+			sendSetup();
+		};
+
+		const onExtended = (payload: Buffer) => {
+			if (payload.length < 1) return;
+			const id = payload[0];
+			const decoded = bdecode(payload.subarray(1));
+			if (!decoded || !(decoded.value instanceof Map)) return;
+			const dict = decoded.value;
+			if (id === 0) {
+				const m = dict.get("m");
+				remoteExt = m instanceof Map ? m : new Map();
+				const pexId = remoteExt.get("ut_pex");
+				if (b.pex && typeof pexId === "number" && pexId > 0) {
+					send(extended(pexId, pexMessage(b.pex)));
+					stats.pexSent++;
+				}
+				return;
+			}
+			if (id === OUR_EXTENSIONS.ut_metadata) {
+				const replyId = remoteExt?.get("ut_metadata");
+				const msgType = dict.get("msg_type");
+				const piece = dict.get("piece");
+				if (typeof replyId !== "number" || replyId <= 0 || msgType !== 0 || typeof piece !== "number") return;
+				stats.metadataRequests++;
+				const pieces = Math.ceil(torrent.info.length / METADATA_PIECE);
+				if (!b.metadata || piece < 0 || piece >= pieces) {
+					send(extended(replyId, { msg_type: 2, piece }));
+					return;
+				}
+				const chunk = torrent.info.subarray(piece * METADATA_PIECE, (piece + 1) * METADATA_PIECE);
+				send(extended(replyId, { msg_type: 1, piece, total_size: torrent.info.length }, chunk));
+			}
+		};
+
+		const reject = (payload: Buffer) => {
+			stats.rejected++;
+			if (b.fast) send(frame(MSG.REJECT, payload.subarray(0, 12)));
+		};
+
+		const onRequest = (payload: Buffer) => {
+			if (payload.length !== 12) return;
+			stats.requests++;
+			const piece = payload.readUInt32BE(0);
+			const begin = payload.readUInt32BE(4);
+			const length = payload.readUInt32BE(8);
+			const pieceSize = piece < torrent.pieceCount ? Math.min(torrent.pieceLength, torrent.totalLength - piece * torrent.pieceLength) : 0;
+			if (!unchoked || !holds(piece) || length === 0 || length > MAX_REQUEST || begin + length > pieceSize) {
+				reject(payload);
+				return;
+			}
+			if (b.chokeAfterBlocks !== undefined && served >= b.chokeAfterBlocks) {
+				unchoked = false;
+				send(frame(MSG.CHOKE));
+				reject(payload);
+				return;
+			}
+			served++;
+			stats.served++;
+			const start = piece * torrent.pieceLength + begin;
+			let block = torrent.data.subarray(start, start + length);
+			if (corrupt(piece)) {
+				block = Uint8Array.from(block);
+				for (let i = 0; i < block.length; i += 997) block[i] ^= 0xff;
+			}
+			const header = Buffer.alloc(8);
+			header.writeUInt32BE(piece, 0);
+			header.writeUInt32BE(begin, 4);
+			send(frame(MSG.PIECE, concat([header, block])));
+			if (b.closeAfterBlocks !== undefined && served >= b.closeAfterBlocks) socket.end();
+		};
+
+		socket.on("data", (chunk: Buffer) => {
+			buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+			if (!handshaken) {
+				if (buf.length < 68) return;
+				if (buf[0] !== 19 || !buf.subarray(1, 20).equals(PROTOCOL) || !buf.subarray(28, 48).equals(Buffer.from(torrent.infoHash))) {
+					socket.destroy();
+					return;
+				}
+				handshaken = true;
+				stats.handshakes++;
+				buf = buf.subarray(68);
+				if (b.silent) return;
+				if (b.handshakeDelayMs) later(b.handshakeDelayMs, answerHandshake);
+				else answerHandshake();
+			}
+			while (buf.length >= 4 && !socket.writableEnded && !socket.destroyed) {
+				const len = buf.readUInt32BE(0);
+				if (len > MAX_MESSAGE) {
+					socket.destroy();
+					return;
+				}
+				if (buf.length < 4 + len) break;
+				const id = len > 0 ? buf[4] : -1;
+				const payload = buf.subarray(5, 4 + len);
+				buf = buf.subarray(4 + len);
+				if (len === 0) continue;
+				if (messages++ < 2) stats.firstMessages.push(id);
+				switch (id) {
+					case MSG.INTERESTED:
+						if (b.unchoke && !unchoked) {
+							later(b.unchokeDelayMs, () => {
+								unchoked = true;
+								send(frame(MSG.UNCHOKE));
+							});
+						}
+						break;
+					case MSG.REQUEST:
+						onRequest(payload);
+						break;
+					case MSG.EXTENDED:
+						onExtended(payload);
+						break;
+					case MSG.UNCHOKE:
+					case MSG.PIECE:
+						stats.unexpected.push(id);
+						break;
+				}
+			}
+		});
+	});
+
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(b.port, b.host, () => {
+			server.off("error", reject);
+			resolve();
+		});
+	});
+	const { port } = server.address() as net.AddressInfo;
+	const addr = b.host.includes(":") ? `[${b.host}]:${port}` : `${b.host}:${port}`;
+	let closing: Promise<void> | undefined;
+	return {
+		host: b.host,
+		port,
+		addr,
+		magnet: magnetFor(torrent.infoHashHex, torrent.name, addr),
+		torrent,
+		stats,
+		close: () =>
+			(closing ??= new Promise((resolve) => {
+				server.close(() => resolve());
+				for (const s of sockets) s.destroy();
+			})),
+	};
+}
+
+function havePredicate(have: "all" | "none" | readonly number[], pieceCount: number): (piece: number) => boolean {
+	if (have === "all") return (p) => p < pieceCount;
+	if (have === "none") return () => false;
+	const set = new Set(have);
+	return (p) => set.has(p);
+}
+
+/** ut_pex payload announcing `addrs` (IPv4 in `added`, IPv6 in `added6`). */
+export function pexMessage(addrs: readonly string[]): Parameters<typeof bencode>[0] {
+	const v4: Uint8Array[] = [];
+	const v6: Uint8Array[] = [];
+	for (const a of addrs) {
+		const m = /^(?:\[([0-9a-fA-F:]+)\]|(\d+\.\d+\.\d+\.\d+)):(\d+)$/.exec(a);
+		if (!m) throw new RangeError(`bad pex address ${a}`);
+		const port = Buffer.alloc(2);
+		port.writeUInt16BE(Number(m[3]));
+		if (m[2]) v4.push(concat([Uint8Array.from(m[2].split(".").map(Number)), port]));
+		else v6.push(concat([ipv6Bytes(m[1]), port]));
+	}
+	return {
+		added: concat(v4),
+		"added.f": new Uint8Array(v4.length).fill(0x02),
+		added6: concat(v6),
+		"added6.f": new Uint8Array(v6.length).fill(0x02),
+		dropped: new Uint8Array(0),
+	};
+}
+
+function ipv6Bytes(text: string): Uint8Array {
+	const [l, r = ""] = text.split("::");
+	const left = l ? l.split(":") : [];
+	const right = r ? r.split(":") : [];
+	const words = text.includes("::") ? [...left, ...Array<string>(8 - left.length - right.length).fill("0"), ...right] : left;
+	const out = Buffer.alloc(16);
+	words.forEach((w, i) => out.writeUInt16BE(parseInt(w, 16), i * 2));
+	return out;
+}
