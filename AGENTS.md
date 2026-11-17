@@ -49,8 +49,10 @@ npm run dev -w apps/web            # astro dev
 Astro dev server: prefer background mode (`astro dev --background`, then
 `astro dev stop|status|logs`). Astro docs: https://docs.astro.build.
 
-CI (`.github/workflows/ci.yml`): verify + web build, e2e, `npm audit
---audit-level=high` + `cargo audit`, gitleaks (working tree and history).
+CI (`.github/workflows/ci.yml`): verify + web build, e2e, dependency audit
+(`node scripts/audit-npm.mjs`: high/critical npm advisories fail unless
+accepted, with reason and expiry, in `audit-allowlist.json`; `cargo audit`),
+gitleaks (working tree and history).
 
 ## Global rules (from the plan's `global_rules`)
 

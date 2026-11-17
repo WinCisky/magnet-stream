@@ -66,8 +66,8 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-      - name: npm audit (fails on high/critical)
-        run: npm audit --audit-level=high
+      - name: npm audit (fails on high/critical not accepted in audit-allowlist.json)
+        run: node scripts/audit-npm.mjs
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-audit
