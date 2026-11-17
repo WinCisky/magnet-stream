@@ -1,33 +1,55 @@
 // Phase 0 spike (docs/architecture.md §Risks, open questions and delivery ›
-// Delivery, Phase 0; template in docs/spike-report.md): download N bytes from a test
-// peer through a tunnel gateway and report throughput, WebSocket messages,
-// estimated billed requests, and what happens to a 7th connection and to
-// connections opened later in the socket's life.
+// Delivery, Phase 0; template in docs/spike-report.md): download N bytes
+// through a tunnel gateway and report time to first verified piece,
+// throughput, WebSocket messages, estimated billed requests, and what
+// happens to a 7th connection and to connections opened later in the
+// socket's life.
 //
-// The peer must be a fake peer (tools/fake-peer) started with the same
-// --seed/--size/--piece-length: the spike rebuilds the torrent locally to
-// know its info-hash and verify every piece.
+// Two sources:
+//   - a fake peer (tools/fake-peer) started with the same --seed/--size/
+//     --piece-length: the spike rebuilds the torrent to know its info-hash;
+//   - a real torrent (--torrent file.torrent) and a list of candidate peers
+//     (--peer, --peers-file): the spike keeps up to --connections peers
+//     delivering, replacing the ones that fail, like the engine will.
+// Every piece is SHA-1 verified. The report holds counts only: no peer
+// addresses, no info-hash.
 
-import { randomBytes } from "node:crypto";
-import { PeerConnection, TunnelClient, TunnelOpenError, downloadAll, failReasonName, parseInfoDict, type Metainfo } from "@magnet-stream/engine";
-import { makeTorrent, type FakeTorrent } from "@magnet-stream/fake-peer";
+import { createHash, randomBytes } from "node:crypto";
+import {
+	PeerConnection,
+	TunnelClient,
+	TunnelOpenError,
+	DownloadError,
+	downloadAll,
+	failReasonName,
+	parseInfoDict,
+	type Metainfo,
+} from "@magnet-stream/engine";
+import { bdecode, makeTorrent } from "@magnet-stream/fake-peer";
+import { FailReason } from "@magnet-stream/tunnel-protocol";
+
+export interface SpikeSource {
+	kind: "fake" | "torrent";
+	meta: Metainfo;
+	infoHash: Uint8Array;
+	/** Candidate peers, best first. A fake source repeats its one peer. */
+	candidates: string[];
+}
 
 export interface SpikeOptions {
 	/** ws(s):// or http(s):// URL of the gateway (…/v1/tunnel is added if missing). */
 	gateway: string;
-	/** `ip:port` of the test peer. */
-	peer: string;
+	source: SpikeSource;
 	bytes: number;
-	seed: number;
-	size: number;
-	pieceLength: number;
-	/** Parallel connections for the throughput run (default 1). */
+	/** Peers kept delivering at once (spread over ceil(n/6) WebSockets). */
 	connections: number;
+	/** Give up after this long (the report says how far it got). */
+	maxSeconds: number;
 	/** Run the connection-limit probe. */
 	probe: boolean;
 	/** How long the probe waits before opening "later" connections. */
 	laterMs: number;
-	/** How many connections the probe tries to hold (6 + 1 to see the 7th). */
+	/** How many connections the probe tries to hold at once (6 + 1 to see the 7th). */
 	probeOpen: number;
 	log?: (line: string) => void;
 }
@@ -39,26 +61,28 @@ export interface ConnectionAttempt {
 	openMs: number;
 	/** Failure reason (gateway FailReason name, or local error). */
 	reason?: string;
-	/** A block actually came through (time to get it). */
+	/** Connections of the probe socket still open when this one was opened. */
+	heldBefore?: number;
+	/** A verified piece came through (time to get it). */
 	dataMs?: number;
 	dataError?: string;
 }
 
 export interface SpikeReport {
-	version: 1;
+	version: 2;
 	startedAt: string;
-	params: { bytes: number; torrentSize: number; pieceLength: number; seed: number; connections: number };
+	params: { source: "fake" | "torrent"; bytes: number; torrentSize: number; pieceLength: number; connections: number; candidates: number };
 	download: {
-		/** From opening the WebSocket to the first verified piece (a phase metric of docs/architecture.md › Delivery). */
+		/** From opening the first WebSocket to the first verified piece. */
 		firstPieceMs: number;
 		bytes: number;
 		ms: number;
 		mibPerSecond: number;
 		piecesVerified: number;
 		piecesCorrupt: number;
-		piecesMissing: number;
-		rounds: number;
+		complete: boolean;
 	};
+	peers: { tried: number; opened: number; delivered: number; failures: Record<string, number> };
 	websocket: {
 		upgrades: number;
 		messagesSent: number;
@@ -68,20 +92,12 @@ export interface SpikeReport {
 		framesReceived: number;
 		bytesReceived: number;
 	};
-	billing: {
-		formula: string;
-		estimatedRequests: number;
-		estimatedRequestsPerGiB: number;
-	};
-	connections?: {
-		initial: ConnectionAttempt[];
-		later: ConnectionAttempt[];
-		laterAfterMs: number;
-		seventh: string;
-	};
+	billing: { formula: string; estimatedRequests: number; estimatedRequestsPerGiB: number };
+	connections?: { reachablePeers: number; initial: ConnectionAttempt[]; later: ConnectionAttempt[]; laterAfterMs: number; seventh: string };
 }
 
 const GiB = 1024 ** 3;
+const MAX_PER_SOCKET = 6;
 
 export function tunnelUrl(gateway: string): string {
 	const url = new URL(gateway);
@@ -92,17 +108,67 @@ export function tunnelUrl(gateway: string): string {
 	return url.toString();
 }
 
+/** The fake peer's torrent, rebuilt from its parameters. */
+export async function fakeSource(peer: string, seed: number, size: number, pieceLength: number, connections: number): Promise<SpikeSource> {
+	const torrent = makeTorrent({ seed, size, pieceLength });
+	const meta = await parseInfoDict(torrent.info, torrent.infoHashHex);
+	return { kind: "fake", meta, infoHash: torrent.infoHash, candidates: Array<string>(Math.max(connections, 1) * 4).fill(peer) };
+}
+
+/** A real .torrent file and candidate peers. */
+export async function torrentSource(file: Uint8Array, candidates: string[]): Promise<SpikeSource> {
+	const info = infoDictOf(file);
+	const hex = createHash("sha1").update(info).digest("hex");
+	const meta = await parseInfoDict(info, hex);
+	return { kind: "torrent", meta, infoHash: Buffer.from(hex, "hex"), candidates: [...new Set(candidates)] };
+}
+
+/** The raw bytes of the `info` value of a .torrent (its SHA-1 is the info-hash). */
+export function infoDictOf(torrent: Uint8Array): Uint8Array {
+	if (torrent[0] !== 0x64 /* d */) throw new Error("not a torrent file");
+	let at = 1;
+	while (at < torrent.length && torrent[at] !== 0x65 /* e */) {
+		const key = bdecode(torrent.subarray(at));
+		if (!key || !(key.value instanceof Uint8Array)) break;
+		at += key.end;
+		const value = bdecode(torrent.subarray(at));
+		if (!value) break;
+		if (new TextDecoder().decode(key.value) === "info") return torrent.subarray(at, at + value.end);
+		at += value.end;
+	}
+	throw new Error("torrent file has no info dict");
+}
+
+/** The first pieces covering `bytes`, repeated (rounds) if the torrent is smaller. */
+export function piecesFor(meta: Metainfo, bytes: number): number[] {
+	const out: number[] = [];
+	let sum = 0;
+	while (sum < bytes) {
+		for (let p = 0; p < meta.pieceCount && sum < bytes; p++) {
+			out.push(p);
+			sum += pieceBytes(meta, p);
+		}
+	}
+	return out;
+}
+
 export async function runSpike(opts: SpikeOptions): Promise<SpikeReport> {
 	const log = opts.log ?? (() => {});
 	const url = tunnelUrl(opts.gateway);
-	log(`building the test torrent (seed ${opts.seed}, ${opts.size} bytes)…`);
-	const torrent = makeTorrent({ seed: opts.seed, size: opts.size, pieceLength: opts.pieceLength });
-	const meta = await parseInfoDict(torrent.info, torrent.infoHashHex);
+	const { meta, infoHash } = opts.source;
 	const report: SpikeReport = {
-		version: 1,
+		version: 2,
 		startedAt: new Date().toISOString(),
-		params: { bytes: opts.bytes, torrentSize: opts.size, pieceLength: opts.pieceLength, seed: opts.seed, connections: opts.connections },
-		download: { firstPieceMs: 0, bytes: 0, ms: 0, mibPerSecond: 0, piecesVerified: 0, piecesCorrupt: 0, piecesMissing: 0, rounds: 0 },
+		params: {
+			source: opts.source.kind,
+			bytes: opts.bytes,
+			torrentSize: meta.totalLength,
+			pieceLength: meta.pieceLength,
+			connections: opts.connections,
+			candidates: new Set(opts.source.candidates).size,
+		},
+		download: { firstPieceMs: 0, bytes: 0, ms: 0, mibPerSecond: 0, piecesVerified: 0, piecesCorrupt: 0, complete: false },
+		peers: { tried: 0, opened: 0, delivered: 0, failures: {} },
 		websocket: { upgrades: 0, messagesSent: 0, framesSent: 0, bytesSent: 0, messagesReceived: 0, framesReceived: 0, bytesReceived: 0 },
 		billing: { formula: "upgrades + ceil(client→gateway messages / 20)", estimatedRequests: 0, estimatedRequestsPerGiB: 0 },
 	};
@@ -113,40 +179,133 @@ export async function runSpike(opts: SpikeOptions): Promise<SpikeReport> {
 		report.websocket.upgrades++;
 		return client;
 	};
+	const fail = (why: string): void => {
+		report.peers.failures[why] = (report.peers.failures[why] ?? 0) + 1;
+	};
+	const good: string[] = [];
 
 	try {
-		// Throughput: `connections` connections on one WebSocket, pieces split between them.
-		log(`downloading ${opts.bytes} bytes through ${new URL(url).host}…`);
-		const t0 = Date.now();
-		const client = await connect(Math.max(6, opts.connections));
-		const conns = await Promise.all(
-			Array.from({ length: opts.connections }, async () => new PeerConnection(await client.open({ address: opts.peer, infoHash: torrent.infoHash, peerId: peerId() }), meta)),
-		);
+		log(`downloading ${opts.bytes} bytes through ${new URL(url).host} with up to ${opts.connections} peers…`);
 		const started = Date.now();
-		let remaining = opts.bytes;
-		while (remaining > 0) {
-			const pieces = piecesFor(meta, remaining);
-			const shares = conns.map((_, i) => pieces.filter((_, j) => j % conns.length === i));
-			const onPiece = () => {
-				if (report.download.firstPieceMs === 0) report.download.firstPieceMs = Date.now() - t0;
-			};
-			const results = await Promise.all(conns.map((c, i) => downloadAll(c, meta, { pieces: shares[i], onPiece })));
-			for (const r of results) {
-				report.download.piecesVerified += r.verified.length;
-				report.download.piecesCorrupt += r.corrupt.length;
-				report.download.piecesMissing += r.missing.length;
-				report.download.bytes += r.verified.reduce((n, p) => n + pieceBytes(meta, p), 0);
-			}
-			report.download.rounds++;
-			remaining -= pieces.reduce((n, p) => n + pieceBytes(meta, p), 0);
-			log(`  round ${report.download.rounds}: ${(report.download.bytes / 2 ** 20).toFixed(1)} MiB verified`);
-		}
-		report.download.ms = Date.now() - started;
-		report.download.mibPerSecond = round(report.download.bytes / 2 ** 20 / (report.download.ms / 1000));
-		for (const c of conns) c.close();
-		client.close();
+		const deadline = started + opts.maxSeconds * 1000;
+		const sockets = await Promise.all(Array.from({ length: Math.ceil(opts.connections / MAX_PER_SOCKET) }, () => connect()));
+		const queue = piecesFor(meta, opts.bytes);
+		const candidates = [...opts.source.candidates];
+		let active = 0;
+		let lastLog = 0;
 
-		if (opts.probe) report.connections = await probe(await connect(opts.probeOpen), torrent, meta, opts, log);
+		const worker = async (conn: PeerConnection, addr: string) => {
+			let delivered = false;
+			try {
+				for (;;) {
+					if (Date.now() > deadline || queue.length === 0) return;
+					// Next pieces this peer has (distinct), at most 8 at a time.
+					const batch: number[] = [];
+					for (let i = 0; i < queue.length && batch.length < 8; i++) {
+						const p = queue[i];
+						if (conn.has(p) && !batch.includes(p)) batch.push(...queue.splice(i--, 1));
+					}
+					if (batch.length === 0) {
+						// Nothing it has (yet): give it a moment to announce, then drop it.
+						if (conn.closed || conn.pieceCount > 0 || delivered) return fail("useless");
+						await new Promise((r) => setTimeout(r, 2_000));
+						if (conn.pieceCount === 0) return fail("no_pieces");
+						continue;
+					}
+					try {
+						const r = await downloadAll(conn, meta, {
+							pieces: batch,
+							stallTimeoutMs: 20_000,
+							onPiece: (p) => {
+								if (report.download.firstPieceMs === 0) report.download.firstPieceMs = Date.now() - started;
+								report.download.piecesVerified++;
+								report.download.bytes += pieceBytes(meta, p);
+							},
+						});
+						if (!delivered && r.verified.length > 0) {
+							delivered = true;
+							report.peers.delivered++;
+							good.push(addr);
+						}
+						report.download.piecesCorrupt += r.corrupt.length;
+						queue.unshift(...r.missing, ...r.corrupt);
+						if (r.corrupt.length > 0) return fail("corrupt");
+					} catch (e) {
+						const result = e instanceof DownloadError ? e.result : undefined;
+						if (result && !delivered && result.verified.length > 0) {
+							delivered = true;
+							report.peers.delivered++;
+							good.push(addr);
+						}
+						queue.unshift(...batch.filter((p) => !result?.verified.includes(p)));
+						return fail((e as Error).message.startsWith("no progress") ? "stalled" : "closed");
+					}
+					if (Date.now() - lastLog > 5_000) {
+						lastLog = Date.now();
+						log(`  ${(report.download.bytes / 2 ** 20).toFixed(0)} MiB verified, ${active} peers, ${queue.length} pieces left`);
+					}
+				}
+			} finally {
+				conn.close();
+			}
+		};
+
+		// Keep `connections` peers busy; replace whoever drops out.
+		await new Promise<void>((resolve) => {
+			const workers = new Set<Promise<void>>();
+			let opening = 0;
+			const pump = () => {
+				const done = queue.length === 0 || Date.now() > deadline;
+				if ((done || (candidates.length === 0 && opening === 0)) && active === 0 && opening === 0) return resolve();
+				if (done) return;
+				while (active + opening < opts.connections && candidates.length > 0) {
+					const client = sockets.find((c) => !c.closed && c.connections < MAX_PER_SOCKET);
+					if (!client) break;
+					const addr = candidates.shift()!;
+					opening++;
+					report.peers.tried++;
+					client
+						.open({ address: addr, infoHash, peerId: peerId(), timeoutMs: 20_000 })
+						.then(
+							(transport) => {
+								report.peers.opened++;
+								active++;
+								const w = worker(new PeerConnection(transport, meta), addr).finally(() => {
+									active--;
+									workers.delete(w);
+									pump();
+								});
+								workers.add(w);
+							},
+							(e: unknown) => {
+								// The gateway frees a slot only once the failed socket has
+								// closed (up to ~1 s): retry this candidate a bit later.
+								if (e instanceof TunnelOpenError && e.reason === FailReason.TOO_MANY_CONNECTIONS) {
+									report.peers.tried--;
+									candidates.unshift(addr);
+									return new Promise((r) => setTimeout(r, 500));
+								}
+								fail(e instanceof TunnelOpenError && e.reason ? failReasonName(e.reason) : "error");
+							},
+						)
+						.finally(() => {
+							opening--;
+							pump();
+						});
+				}
+			};
+			pump();
+		});
+
+		report.download.ms = Date.now() - started;
+		report.download.complete = report.download.bytes >= opts.bytes;
+		report.download.mibPerSecond = round(report.download.bytes / 2 ** 20 / (report.download.ms / 1000));
+		for (const c of sockets) c.close();
+
+		if (opts.probe) {
+			const peers = good.length > 0 ? good : opts.source.candidates.slice(0, 1);
+			report.connections = await probe(connect, opts.source, peers, opts, log);
+		}
 	} finally {
 		for (const c of clients) {
 			c.close();
@@ -163,65 +322,107 @@ export async function runSpike(opts: SpikeOptions): Promise<SpikeReport> {
 	return report;
 }
 
-/** 6 (+1) connections at once, then more after `laterMs`, each checked for real data. */
-async function probe(client: TunnelClient, torrent: FakeTorrent, meta: Metainfo, opts: SpikeOptions, log: (l: string) => void) {
-	log(`probing connection limits (${opts.probeOpen} at once, then later after ${opts.laterMs} ms)…`);
-	const attempt = async (label: string): Promise<{ a: ConnectionAttempt; conn?: PeerConnection }> => {
+/**
+ * Connection-limit probe on a fresh WebSocket:
+ *   1. find `probeOpen + 2` distinct reachable peers (on a scouting socket, one handshake each);
+ *   2. on the probe socket, open them one after the other while holding the
+ *      earlier ones: the 7th and later show what happens past 6 (the
+ *      gateway's own limit, or the platform's if TUNNEL_MAX_CONNECTIONS is raised);
+ *   3. check that every held connection delivers a verified piece;
+ *   4. after `laterMs`, free two slots and open three more ("later in the socket's life").
+ */
+async function probe(
+	connect: (max?: number) => Promise<TunnelClient>,
+	source: SpikeSource,
+	preferred: string[],
+	opts: SpikeOptions,
+	log: (l: string) => void,
+) {
+	log(`probing connection limits (${opts.probeOpen} held at once, then later after ${opts.laterMs} ms)…`);
+	const want = opts.probeOpen + 2;
+	const pool = [...new Set([...preferred, ...source.candidates])];
+	const reachable: string[] = [];
+	const scout = await connect();
+	while (reachable.length < want && pool.length > 0) {
+		const batch = pool.splice(0, Math.min(6, pool.length));
+		await Promise.all(
+			batch.map(async (addr) => {
+				try {
+					const t = await scout.open({ address: addr, infoHash: source.infoHash, peerId: peerId(), timeoutMs: 20_000 });
+					t.close();
+					reachable.push(addr);
+				} catch {}
+			}),
+		);
+		await new Promise((r) => setTimeout(r, 1_200)); // let the gateway free the slots
+	}
+	scout.close();
+	if (source.kind === "fake") while (reachable.length < want) reachable.push(source.candidates[0]);
+	log(`  ${reachable.length} reachable peers found`);
+
+	const client = await connect(16);
+	let next = 0;
+	const attempt = async (label: string, held: number): Promise<{ a: ConnectionAttempt & { heldBefore: number }; conn?: PeerConnection }> => {
+		const addr = reachable[next++ % reachable.length];
 		const started = Date.now();
 		try {
-			const transport = await client.open({ address: opts.peer, infoHash: torrent.infoHash, peerId: peerId(), timeoutMs: 15_000 });
-			const a: ConnectionAttempt = { label, ok: true, openMs: Date.now() - started };
-			const conn = new PeerConnection(transport, meta);
-			const t0 = Date.now();
-			try {
-				await downloadAll(conn, meta, { pieces: [0], stallTimeoutMs: 10_000 });
-				a.dataMs = Date.now() - t0;
-			} catch (e) {
-				a.dataError = (e as Error).message;
-			}
-			return { a, conn };
+			const transport = await client.open({ address: addr, infoHash: source.infoHash, peerId: peerId(), timeoutMs: 20_000 });
+			return { a: { label, heldBefore: held, ok: true, openMs: Date.now() - started }, conn: new PeerConnection(transport, source.meta) };
 		} catch (e) {
 			const reason = e instanceof TunnelOpenError ? (e.reason ? failReasonName(e.reason) : e.message) : (e as Error).message;
-			return { a: { label, ok: false, openMs: Date.now() - started, reason } };
+			return { a: { label, heldBefore: held, ok: false, openMs: Date.now() - started, reason } };
+		}
+	};
+	const checkData = async (a: ConnectionAttempt, conn: PeerConnection) => {
+		const t0 = Date.now();
+		try {
+			for (let i = 0; i < 30 && conn.pieceCount === 0 && !conn.closed; i++) await new Promise((r) => setTimeout(r, 100));
+			const piece = [...Array(source.meta.pieceCount).keys()].find((p) => conn.has(p));
+			if (piece === undefined) throw new Error("the peer announced no pieces");
+			const r = await downloadAll(conn, source.meta, { pieces: [piece], stallTimeoutMs: 15_000 });
+			if (r.verified.length === 1) a.dataMs = Date.now() - t0;
+			else a.dataError = "piece not verified";
+		} catch (e) {
+			a.dataError = (e as Error).message;
 		}
 	};
 
 	const initial: ConnectionAttempt[] = [];
-	const held: PeerConnection[] = [];
+	const held: { a: ConnectionAttempt; conn: PeerConnection }[] = [];
 	for (let i = 1; i <= opts.probeOpen; i++) {
-		const { a, conn } = await attempt(`initial-${i}`);
+		const { a, conn } = await attempt(`initial-${i}`, held.filter((h) => !h.conn.closed).length);
 		initial.push(a);
-		if (conn) held.push(conn);
+		if (conn) held.push({ a, conn });
 	}
+	await Promise.all(held.map((h) => checkData(h.a, h.conn)));
+
 	await new Promise((r) => setTimeout(r, opts.laterMs));
-	// Free two slots, then open two (and one more past the limit) later in the socket's life.
-	held.splice(0, 2).forEach((c) => c.close());
+	held.splice(0, 2).forEach((h) => h.conn.close());
 	await new Promise((r) => setTimeout(r, 1_500));
 	const later: ConnectionAttempt[] = [];
 	for (let i = 1; i <= 3; i++) {
-		const { a, conn } = await attempt(`later-${i}`);
+		const { a, conn } = await attempt(`later-${i}`, held.filter((h) => !h.conn.closed).length);
 		later.push(a);
-		if (conn) held.push(conn);
+		if (conn) {
+			held.push({ a, conn });
+			await checkData(a, conn);
+		}
 	}
-	held.forEach((c) => c.close());
+	held.forEach((h) => h.conn.close());
 	const seventh = initial[6];
 	return {
+		reachablePeers: reachable.length,
 		initial,
 		later,
 		laterAfterMs: opts.laterMs,
-		seventh: !seventh ? "not tried" : seventh.ok ? (seventh.dataMs !== undefined ? `opened, data in ${seventh.dataMs} ms` : `opened, no data (${seventh.dataError})`) : `failed: ${seventh.reason}`,
+		seventh: !seventh
+			? "not tried"
+			: seventh.ok
+				? seventh.dataMs !== undefined
+					? `opened with ${(seventh as { heldBefore?: number }).heldBefore} held, data in ${seventh.dataMs} ms`
+					: `opened, no data (${seventh.dataError})`
+				: `failed: ${seventh.reason}`,
 	};
-}
-
-/** The first pieces covering `bytes` (the whole torrent at most). */
-export function piecesFor(meta: Metainfo, bytes: number): number[] {
-	const out: number[] = [];
-	let sum = 0;
-	for (let p = 0; p < meta.pieceCount && sum < bytes; p++) {
-		out.push(p);
-		sum += pieceBytes(meta, p);
-	}
-	return out;
 }
 
 function pieceBytes(meta: Metainfo, p: number): number {

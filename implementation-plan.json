@@ -110,6 +110,22 @@
         "M2-10",
         "M5-04"
       ]
+    },
+    {
+      "id": "OQ-02",
+      "decision": "Chiusa dallo spike Phase 0 (M1-08, docs/spike-report.md). Il Durable Object sul piano free non è limitato a ~10 ms per evento: una sessione da 3 GiB ha usato 33,8 s di CPU in un solo evento senza essere interrotta, con messaggi in ingresso ogni ~80 ms che rinnovano la disponibilità di CPU. Costo misurato: ~11 s di CPU per GiB, ~80 richieste fatturate per GiB (senza batching upstream). Percorso dati di default: Durable Object sul piano free; Workers Paid solo se in produzione emergono limiti di durata o di CPU non documentati; il gateway VPS resta il fallback (M4). Cadenza del `ping`: con traffico upstream continuo non è servito; la cadenza nei periodi senza traffico upstream si fissa e si misura in M2-01.",
+      "applied_to": [
+        "M2-01",
+        "M5-04"
+      ]
+    },
+    {
+      "id": "OQ-03",
+      "decision": "Chiusa dallo spike Phase 0 (M1-08, docs/spike-report.md). Le connessioni aperte più tardi nella vita del WebSocket si comportano come le prime. Il limite della piattaforma non riguarda le connessioni stabilite (14 contemporanee su un WebSocket funzionanti con TUNNEL_MAX_CONNECTIONS=16) ma i connect ancora in corso: 6 connect verso host irraggiungibili bloccano ogni nuovo connect su quel WebSocket per ~20 s, anche dopo close(). Il gateway resta a 6 connessioni per socket (default, regola del protocollo); l'engine (M2-06) deve limitare i dial verso candidati non provati (al massimo 2–3 per socket, oppure un WebSocket dedicato all'esplorazione) e il gateway (M2-01) deve considerare occupato lo slot di un connect fallito per ~20 s o allineare il timeout di connessione a quello della piattaforma.",
+      "applied_to": [
+        "M2-01",
+        "M2-06"
+      ]
     }
   ],
   "source_document": {
@@ -280,21 +296,6 @@
     }
   ],
   "open_questions": [
-    {
-      "id": "OQ-02",
-      "question": "Limite CPU di un Durable Object sul piano free (30 s o ~10 ms per evento): il documento lo dichiara non noto. Da esso dipendono percorso di default (oggetto free, Worker a pagamento, VPS) e cadenza del `ping`. Si chiude con lo spike in M1-08.",
-      "blocked_tasks": [
-        "M2-01",
-        "M5-04"
-      ]
-    },
-    {
-      "id": "OQ-03",
-      "question": "Il limite di 6 connessioni vale anche per socket aperti più tardi nella vita del WebSocket? Da misurare in M1-08.",
-      "blocked_tasks": [
-        "M2-06"
-      ]
-    },
     {
       "id": "OQ-19",
       "question": "Dove vanno registrate le misure di fase (tre numeri)? Il documento esclude storage lato server; il piano le tiene nella diagnostica locale e in `docs/measurements.md` compilato a mano.",
@@ -717,9 +718,7 @@
         "M2-02",
         "M2-03"
       ],
-      "blocked_by_open_questions": [
-        "OQ-02"
-      ],
+      "blocked_by_open_questions": [],
       "out_of_scope": [
         "Turnstile (non previsto)",
         "Rimozione di `/v1/blocks` (M2-08)",
@@ -974,9 +973,7 @@
         "M2-05"
       ],
       "parallel_with": [],
-      "blocked_by_open_questions": [
-        "OQ-03"
-      ],
+      "blocked_by_open_questions": [],
       "out_of_scope": [
         "Scelta dei blocchi a deadline (M3-01): qui basta una politica sequenziale semplice",
         "Escalation verso il VPS (M4-06)",
@@ -2120,9 +2117,7 @@
         "M5-03"
       ],
       "parallel_with": [],
-      "blocked_by_open_questions": [
-        "OQ-02"
-      ],
+      "blocked_by_open_questions": [],
       "out_of_scope": [
         "Esecuzione del deploy",
         "Automazione del deploy del VPS",

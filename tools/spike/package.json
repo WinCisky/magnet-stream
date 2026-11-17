@@ -14,7 +14,8 @@
 	},
 	"dependencies": {
 		"@magnet-stream/engine": "0.1.0",
-		"@magnet-stream/fake-peer": "0.1.0"
+		"@magnet-stream/fake-peer": "0.1.0",
+		"@magnet-stream/tunnel-protocol": "0.1.0"
 	},
 	"devDependencies": {
 		"@magnet-stream/harness": "0.1.0",
