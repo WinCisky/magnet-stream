@@ -1,4 +1,4 @@
-// Test-only Transport over a direct Node TCP socket. It does the 68-byte
+// Node-only Transport over a direct TCP socket (tests and examples). It does the 68-byte
 // handshake itself (the gateway's job in production) and then hands the
 // stream to PeerConnection.
 

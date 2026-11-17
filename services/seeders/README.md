@@ -34,6 +34,12 @@ piece recovery, three more endpoints go further:
 - **`/files`** lists the torrent's files (paths, sizes, offsets) from that
   same info dict, as JSON: what the page shows to pick a video.
 
+> **Monorepo note:** the browser engine uses the **streamed**
+> `GET /peers?ih=…` (NDJSON, addresses written as found, closed after
+> ~30 s, per-IP limits): see `docs/discovery-api.md`. The JSON form below
+> (`?hash=`), `/swarm`, `/metadata` and `/files` are the PoC's and are
+> removed in M5-01.
+
 ## Running
 
 ```sh
@@ -190,6 +196,11 @@ never a hard crash).
 | `WORKER_TOKEN_SECRET` | *(none)* | Secret shared with magnet-worker. If unset, `/swarm` issues no tokens |
 | `TOKEN_TTL_SECS` | `900` | Lifetime of the tokens in a `/swarm` response |
 | `ALLOW_PRIVATE_PEERS` | `false` | Probe loopback/private peer addresses. Only for local testing |
+| `PEERS_STREAM_SECS` | `30` | Streamed `/peers?ih=`: the response closes after this long (1–120) |
+| `PEERS_PER_IP_PER_MINUTE` | `30` | Streamed `/peers`: requests per minute per client IP, then 429 |
+| `PEERS_STREAMS_PER_IP` | `4` | Streamed `/peers`: concurrent streams per client IP, then 429 |
+| `PEERS_STREAMS_TOTAL` | `200` | Streamed `/peers`: concurrent streams in total, then 429 |
+| `CLIENT_IP_HEADER` | `X-Real-IP` | Header with the client IP set by the reverse proxy; trusted only on connections from loopback |
 
 Example:
 

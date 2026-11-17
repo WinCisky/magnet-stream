@@ -78,8 +78,8 @@ export function closeReasonName(code: number): string {
 	return Object.entries(CloseReason).find(([, v]) => v === code)?.[0].toLowerCase() ?? `code_${code}`;
 }
 
-/** BEP 6 fast bit; no extension protocol yet (M2). */
-export const DEFAULT_RESERVED = Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0x04);
+/** BEP 10 extension protocol and BEP 6 fast bits. */
+export const DEFAULT_RESERVED = Uint8Array.of(0, 0, 0, 0, 0, 0x10, 0, 0x04);
 /** Largest `data` frame we send; bigger writes are split. */
 const MAX_DATA_FRAME = 256 * 1024;
 const WS_OPEN = 1;

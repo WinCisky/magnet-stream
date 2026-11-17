@@ -12,7 +12,8 @@
 	},
 	"scripts": {
 		"test": "vitest run",
-		"typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json"
+		"typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
+		"list-files": "node examples/list-files.ts"
 	},
 	"dependencies": {
 		"@magnet-stream/tunnel-protocol": "0.1.0"

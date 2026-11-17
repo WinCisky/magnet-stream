@@ -37,8 +37,12 @@ impl PeerCache {
     }
 }
 
-#[cfg(test)]
 impl PeerCache {
+    /// The cached result for `key`, if any (no lookup is started).
+    pub async fn get(&self, key: &[u8; 20]) -> Option<Arc<LookupResult>> {
+        self.inner.get(key).await
+    }
+
     pub async fn insert(&self, key: [u8; 20], value: Arc<LookupResult>) {
         self.inner.insert(key, value).await;
     }

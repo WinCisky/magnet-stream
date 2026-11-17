@@ -22,6 +22,7 @@ import {
 	DownloadError,
 	downloadAll,
 	failReasonName,
+	geometryOf,
 	parseInfoDict,
 	type Metainfo,
 } from "@magnet-stream/engine";
@@ -270,7 +271,7 @@ export async function runSpike(opts: SpikeOptions): Promise<SpikeReport> {
 							(transport) => {
 								report.peers.opened++;
 								active++;
-								const w = worker(new PeerConnection(transport, meta), addr).finally(() => {
+								const w = worker(new PeerConnection(transport, { geometry: geometryOf(meta) }), addr).finally(() => {
 									active--;
 									workers.delete(w);
 									pump();
@@ -367,7 +368,7 @@ async function probe(
 		const started = Date.now();
 		try {
 			const transport = await client.open({ address: addr, infoHash: source.infoHash, peerId: peerId(), timeoutMs: 20_000 });
-			return { a: { label, heldBefore: held, ok: true, openMs: Date.now() - started }, conn: new PeerConnection(transport, source.meta) };
+			return { a: { label, heldBefore: held, ok: true, openMs: Date.now() - started }, conn: new PeerConnection(transport, { geometry: geometryOf(source.meta) }) };
 		} catch (e) {
 			const reason = e instanceof TunnelOpenError ? (e.reason ? failReasonName(e.reason) : e.message) : (e as Error).message;
 			return { a: { label, heldBefore: held, ok: false, openMs: Date.now() - started, reason } };

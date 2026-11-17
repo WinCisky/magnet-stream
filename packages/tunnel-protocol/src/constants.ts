@@ -80,6 +80,10 @@ export const CloseReason = {
 	SESSION_ENDING: 4,
 	/** Anything else. */
 	INTERNAL_ERROR: 5,
+	/** No byte in either direction for the idle timeout (default 90 s). */
+	IDLE: 6,
+	/** The session reached its maximum length (default 2 h). */
+	SESSION_TIMEOUT: 7,
 } as const;
 export type CloseReasonCode = (typeof CloseReason)[keyof typeof CloseReason];
 

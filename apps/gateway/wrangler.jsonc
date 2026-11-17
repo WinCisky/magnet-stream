@@ -21,6 +21,12 @@
 		"bindings": [{ "name": "TUNNEL", "class_name": "TunnelSession" }]
 	},
 	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["TunnelSession"] }],
+	// Per-IP limit on tunnel upgrades, checked before any Durable Object is
+	// created. Fixed budget of 6000 units per minute: each upgrade consumes
+	// 6000 / TUNNEL_UPGRADES_PER_MINUTE (default 30) units, so the limit is
+	// set with that variable. `limit` must equal LIMITER_UNITS in
+	// src/tunnel/rate-limit.ts (a test enforces it).
+	"ratelimits": [{ "name": "UPGRADE_LIMITER", "namespace_id": "1001", "simple": { "limit": 6000, "period": 60 } }],
 	// ALLOW_PRIVATE_PEERS must never be set here (a test enforces it): it is
 	// for `wrangler dev` only, via .dev.vars or --var.
 	"vars": {

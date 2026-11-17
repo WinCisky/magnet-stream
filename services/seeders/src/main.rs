@@ -2,11 +2,14 @@ mod bencode;
 mod cache;
 mod config;
 mod dht;
+mod discovery;
 mod files;
 mod lookup;
 mod magnet;
 mod metadata;
 mod netguard;
+#[cfg(test)]
+mod peers_stream_tests;
 mod peerwire;
 mod probe;
 mod resolver;
@@ -16,8 +19,9 @@ mod testpeer;
 mod token;
 mod tracker;
 
-use axum::extract::{Query, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::body::Body;
+use axum::extract::{ConnectInfo, Query, State};
+use axum::http::{header, Extensions, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -27,8 +31,9 @@ use dht::DhtClient;
 use lookup::{Lookup, Sources};
 use resolver::GuardedResolver;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use swarm::SwarmService;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
@@ -39,6 +44,9 @@ struct AppState {
     config: Arc<Config>,
     lookup: Arc<Lookup>,
     cache: Arc<PeerCache>,
+    /// Finished streamed lookups (`/peers?ih=`), 5 minutes.
+    stream_cache: Arc<PeerCache>,
+    limiter: Arc<discovery::Limiter>,
     swarm: Arc<SwarmService>,
 }
 
@@ -69,15 +77,39 @@ async fn main() {
     swarm.spawn_refresher();
 
     let state = AppState {
+        stream_cache: Arc::new(PeerCache::new(cfg.max_cache_entries)),
+        limiter: discovery::Limiter::new(discovery::StreamLimits {
+            per_ip_per_minute: cfg.peers_per_ip_per_minute,
+            per_ip_streams: cfg.peers_streams_per_ip,
+            total_streams: cfg.peers_streams_total,
+        }),
         config: cfg.clone(),
         lookup,
         cache,
         swarm,
     };
 
+    let app = router(state);
+    let listener = tokio::net::TcpListener::bind(cfg.bind_addr)
+        .await
+        .unwrap_or_else(|e| panic!("failed to bind {}: {e}", cfg.bind_addr));
+    tracing::info!(addr = %cfg.bind_addr, "listening");
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .expect("server error");
+}
+
+fn router(state: AppState) -> Router {
+    let cfg = state.config.clone();
     // Each route gets a timeout just above its own worst case: an announce,
     // plus (for /swarm) two rounds of probes, or (for /metadata) the
-    // metadata deadline.
+    // metadata deadline. (For the streamed /peers it bounds the time to the
+    // response head only; the body ends at the stream deadline.)
     let slack = Duration::from_secs(2);
     let mut app = Router::new()
         .route("/health", get(health_handler))
@@ -98,22 +130,19 @@ async fn main() {
             "/files",
             get(files_handler).layer(timeout_layer(cfg.deadline + cfg.metadata_deadline + slack)),
         )
-        .layer(TraceLayer::new_for_http())
+        // Spans carry method and path only: query strings hold info-hashes
+        // and magnets, which never go to the logs.
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|req: &Request<Body>| {
+                tracing::debug_span!("http", method = %req.method(), path = %req.uri().path())
+            }),
+        )
         .with_state(state);
 
     if let Some(cors) = build_cors(&cfg.allowed_origins) {
         app = app.layer(cors);
     }
-
-    let listener = tokio::net::TcpListener::bind(cfg.bind_addr)
-        .await
-        .unwrap_or_else(|e| panic!("failed to bind {}: {e}", cfg.bind_addr));
-    tracing::info!(addr = %cfg.bind_addr, "listening");
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("server error");
+    app
 }
 
 fn init_tracing() {
@@ -194,6 +223,8 @@ async fn health_handler() -> &'static str {
 struct PeersQuery {
     magnet: Option<String>,
     hash: Option<String>,
+    /// Streamed `/peers`: 40 hex, 32 base32, or 64 hex (v2, truncated).
+    ih: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -220,7 +251,99 @@ fn bad_request(msg: impl Into<String>) -> Response {
         .into_response()
 }
 
-async fn peers_handler(State(state): State<AppState>, Query(query): Query<PeersQuery>) -> Response {
+/// `GET /peers`: with `ih=` and/or `magnet=`, the streamed NDJSON
+/// discovery (docs/discovery-api.md); with the legacy `hash=`, the PoC's
+/// JSON answer after a 3 s lookup (removed with /swarm in M5-01).
+async fn peers_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    extensions: Extensions,
+    Query(query): Query<PeersQuery>,
+) -> Response {
+    if query.hash.is_some() && query.ih.is_none() && query.magnet.is_none() {
+        return legacy_peers(state, query).await;
+    }
+    let (info_hash, trackers) = match resolve_stream_query(&query) {
+        Ok(v) => v,
+        Err(e) => return bad_request(e),
+    };
+    let ip = discovery::client_ip(
+        extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0),
+        headers
+            .get(state.config.client_ip_header.as_str())
+            .and_then(|v| v.to_str().ok()),
+    );
+    let permit = match state.limiter.try_acquire(ip, Instant::now()) {
+        Ok(p) => p,
+        Err(refusal) => {
+            tracing::info!(why = refusal.code(), "peers stream refused");
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorBody {
+                    error: refusal.code().to_string(),
+                }),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+            return response;
+        }
+    };
+
+    let body = match state.stream_cache.get(&info_hash).await {
+        Some(cached) => {
+            drop(permit);
+            Body::from(discovery::cached_body(&cached))
+        }
+        None => Body::from_stream(discovery::live(
+            state.lookup.clone(),
+            state.stream_cache.clone(),
+            state.config.clone(),
+            info_hash,
+            trackers,
+            permit,
+        )),
+    };
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/x-ndjson"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            // Ask proxies (nginx) not to buffer: lines must reach the page as found.
+            (
+                header::HeaderName::from_static("x-accel-buffering"),
+                HeaderValue::from_static("no"),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// `ih` names the info-hash; `magnet` adds its `tr=` trackers (and names the
+/// info-hash when `ih` is absent). Both given: they must agree.
+fn resolve_stream_query(query: &PeersQuery) -> Result<([u8; 20], Vec<String>), String> {
+    let ih = match query.ih.as_deref() {
+        Some(raw) => Some(magnet::decode_info_hash(raw).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let parsed = match query.magnet.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(raw) => Some(magnet::parse_magnet(raw).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    match (ih, parsed) {
+        (Some(ih), None) => Ok((ih, Vec::new())),
+        (None, Some(m)) => Ok((m.info_hash, m.trackers)),
+        (Some(ih), Some(m)) if m.info_hash == ih => Ok((ih, m.trackers)),
+        (Some(_), Some(_)) => Err("`ih` and the magnet's info-hash differ".to_string()),
+        (None, None) => Err("provide an `ih` (or `magnet`) query parameter".to_string()),
+    }
+}
+
+async fn legacy_peers(state: AppState, query: PeersQuery) -> Response {
     let (info_hash, magnet_trackers) = match resolve_query(query) {
         Ok(v) => v,
         Err(e) => return bad_request(e),

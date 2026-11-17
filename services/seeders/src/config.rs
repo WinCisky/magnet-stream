@@ -39,6 +39,17 @@ pub struct Config {
     pub token_ttl: Duration,
     /// Allow probing loopback/private peers. Only for local testing.
     pub allow_private_peers: bool,
+    /// Streamed `/peers`: the response closes after this long.
+    pub peers_stream_deadline: Duration,
+    /// Streamed `/peers`: requests per minute per client IP.
+    pub peers_per_ip_per_minute: u32,
+    /// Streamed `/peers`: concurrent streams per client IP.
+    pub peers_streams_per_ip: u32,
+    /// Streamed `/peers`: concurrent streams in total.
+    pub peers_streams_total: u32,
+    /// Header carrying the client IP, set by the reverse proxy (nginx's
+    /// `X-Real-IP`); trusted only on connections from loopback.
+    pub client_ip_header: String,
 }
 
 /// A config value that must never end up in logs (`Config` is logged at
@@ -113,6 +124,16 @@ impl Config {
                 .map(Secret),
             token_ttl: env_secs("TOKEN_TTL_SECS", 900),
             allow_private_peers: env_parse("ALLOW_PRIVATE_PEERS", false),
+            peers_stream_deadline: env_secs("PEERS_STREAM_SECS", 30)
+                .clamp(Duration::from_secs(1), Duration::from_secs(120)),
+            peers_per_ip_per_minute: env_parse("PEERS_PER_IP_PER_MINUTE", 30u32).max(1),
+            peers_streams_per_ip: env_parse("PEERS_STREAMS_PER_IP", 4u32).max(1),
+            peers_streams_total: env_parse("PEERS_STREAMS_TOTAL", 200u32).max(1),
+            client_ip_header: env::var("CLIENT_IP_HEADER")
+                .ok()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "x-real-ip".to_string()),
         }
     }
 }

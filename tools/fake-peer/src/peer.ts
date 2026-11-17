@@ -5,7 +5,7 @@
 import { randomBytes } from "node:crypto";
 import net from "node:net";
 import { bdecode, bencode, concat, type BDecoded } from "./bencode.ts";
-import { magnetFor, type FakeTorrent } from "./torrent.ts";
+import type { FakeTorrent } from "./torrent.ts";
 
 export const MSG = {
 	CHOKE: 0,
@@ -21,6 +21,9 @@ export const MSG = {
 	HAVE_NONE: 0x0f,
 	REJECT: 0x10,
 	EXTENDED: 20,
+	HASH_REQUEST: 21,
+	HASHES: 22,
+	HASH_REJECT: 23,
 } as const;
 
 /** Extension ids this peer assigns in its BEP 10 handshake (`m`). */
@@ -65,6 +68,14 @@ export interface PeerBehaviour {
 	respondWith?: Uint8Array;
 	/** Serve the info dict over ut_metadata, BEP 9 (default true). */
 	metadata?: boolean;
+	/** Serve an info dict with one byte flipped (its hash no longer matches). */
+	metadataCorrupt?: boolean;
+	/** Hang up after serving this many ut_metadata pieces. */
+	closeAfterMetadataPieces?: number;
+	/** Advertise this `metadata_size` instead of the real one. */
+	metadataSize?: number;
+	/** BEP 52 hash requests: answer (default), reject them, or answer with corrupted hashes. */
+	hashes?: "serve" | "reject" | "corrupt";
 	/** Addresses (`ip:port`, `[ip6]:port`) to announce with ut_pex, BEP 11. */
 	pex?: readonly string[];
 	/** 20-byte peer id (default `-FP0001-` + random). */
@@ -81,6 +92,7 @@ export interface PeerStats {
 	/** Ids of the first two messages each connection received after the handshake. */
 	firstMessages: number[];
 	metadataRequests: number;
+	hashRequests: number;
 	pexSent: number;
 	/** Messages received that this peer never expects from a leecher that doesn't upload (piece, unchoke...). */
 	unexpected: number[];
@@ -133,6 +145,7 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 	const peerId = b.peerId ?? concat([Buffer.from("-FP0001-", "latin1"), randomBytes(12)]);
 	if (peerId.length !== 20) throw new RangeError("peerId must be 20 bytes");
 	const holds = havePredicate(b.have, torrent.pieceCount);
+	const servedInfo = b.metadataCorrupt ? Uint8Array.from(torrent.info, (x, i) => (i === torrent.info.length >> 1 ? x ^ 0xff : x)) : torrent.info;
 	const corrupt =
 		b.corrupt === true ? () => true : Array.isArray(b.corrupt) ? (p: number) => (b.corrupt as readonly number[]).includes(p) : () => false;
 
@@ -145,6 +158,7 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 		rejected: 0,
 		firstMessages: [],
 		metadataRequests: 0,
+		hashRequests: 0,
 		pexSent: 0,
 		unexpected: [],
 	};
@@ -175,6 +189,7 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 		let messages = 0;
 		let remoteExt: Map<string, BDecoded> | undefined;
 		let served = 0;
+		let metadataServed = 0;
 
 		const send = (data: Uint8Array) => {
 			if (!socket.destroyed && socket.writable) socket.write(data);
@@ -190,7 +205,7 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 						},
 						reqq: b.reqq,
 						v: "FakePeer/1.0",
-						...(b.metadata ? { metadata_size: torrent.info.length } : {}),
+						...(b.metadata ? { metadata_size: b.metadataSize ?? torrent.info.length } : {}),
 					}),
 				);
 			}
@@ -213,6 +228,7 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 			PROTOCOL.copy(reply, 1);
 			if (b.extensions) reply[25] |= 0x10;
 			if (b.fast) reply[27] |= 0x04;
+			if (torrent.version !== 1) reply[27] |= 0x10; // BEP 52 v2 bit
 			(b.wrongInfoHash ? randomBytes(20) : Buffer.from(torrent.infoHash)).copy(reply, 28);
 			Buffer.from(peerId).copy(reply, 48);
 			send(reply);
@@ -250,8 +266,10 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 					send(extended(replyId, { msg_type: 2, piece }));
 					return;
 				}
-				const chunk = torrent.info.subarray(piece * METADATA_PIECE, (piece + 1) * METADATA_PIECE);
+				const chunk = servedInfo.subarray(piece * METADATA_PIECE, (piece + 1) * METADATA_PIECE);
 				send(extended(replyId, { msg_type: 1, piece, total_size: torrent.info.length }, chunk));
+				metadataServed++;
+				if (b.closeAfterMetadataPieces !== undefined && metadataServed >= b.closeAfterMetadataPieces) socket.end();
 			}
 		};
 
@@ -260,13 +278,21 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 			if (b.fast) send(frame(MSG.REJECT, payload.subarray(0, 12)));
 		};
 
+		/** BEP 52 hash request: `pieces root[32] base u32 index u32 length u32 proof layers u32`. */
+		const onHashRequest = (payload: Buffer) => {
+			if (payload.length !== 48) return;
+			stats.hashRequests++;
+			const answer = hashAnswer(torrent, payload, b.hashes ?? "serve");
+			send(answer ? frame(MSG.HASHES, answer) : frame(MSG.HASH_REJECT, payload));
+		};
+
 		const onRequest = (payload: Buffer) => {
 			if (payload.length !== 12) return;
 			stats.requests++;
 			const piece = payload.readUInt32BE(0);
 			const begin = payload.readUInt32BE(4);
 			const length = payload.readUInt32BE(8);
-			const pieceSize = piece < torrent.pieceCount ? Math.min(torrent.pieceLength, torrent.totalLength - piece * torrent.pieceLength) : 0;
+			const pieceSize = piece < torrent.pieceCount ? torrent.pieceSize(piece) : 0;
 			if (!unchoked || !holds(piece) || length === 0 || length > MAX_REQUEST || begin + length > pieceSize) {
 				reject(payload);
 				return;
@@ -334,6 +360,9 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 					case MSG.EXTENDED:
 						onExtended(payload);
 						break;
+					case MSG.HASH_REQUEST:
+						onHashRequest(payload);
+						break;
 					case MSG.UNCHOKE:
 					case MSG.PIECE:
 						stats.unexpected.push(id);
@@ -357,7 +386,7 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 		host: b.host,
 		port,
 		addr,
-		magnet: magnetFor(torrent.infoHashHex, torrent.name, addr),
+		magnet: `${torrent.magnet}&x.pe=${encodeURIComponent(addr)}`,
 		torrent,
 		stats,
 		close: () =>
@@ -366,6 +395,33 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 				for (const s of sockets) s.destroy();
 			})),
 	};
+}
+
+/**
+ * The `hashes` payload for a hash request, or undefined to reject it: the
+ * request header, `length` hashes of layer `base` from `index`, then up to
+ * `proof layers` uncle hashes from the requested subtree's root upwards
+ * (the root itself is never sent).
+ */
+export function hashAnswer(torrent: FakeTorrent, request: Uint8Array, mode: "serve" | "reject" | "corrupt"): Uint8Array | undefined {
+	if (mode === "reject" || request.length !== 48) return undefined;
+	const view = new DataView(request.buffer, request.byteOffset, request.byteLength);
+	const root = Buffer.from(request.subarray(0, 32)).toString("hex");
+	const base = view.getUint32(32);
+	const index = view.getUint32(36);
+	const length = view.getUint32(40);
+	const proofLayers = view.getUint32(44);
+	const tree = torrent.trees.get(root);
+	if (!tree || base >= tree.layers.length - 1) return undefined;
+	const layer = tree.layers[base];
+	if (length < 2 || length > 512 || (length & (length - 1)) !== 0 || index % length !== 0 || index + length > layer.length) return undefined;
+	const out: Uint8Array[] = [request.subarray(0, 48), ...layer.slice(index, index + length)];
+	let level = base + Math.log2(length);
+	let at = index / length;
+	for (let i = 0; i < proofLayers && level < tree.layers.length - 1; i++, level++, at >>= 1) out.push(tree.layers[level][at ^ 1]);
+	const bytes = concat(out);
+	if (mode === "corrupt") bytes[48] ^= 0xff;
+	return bytes;
 }
 
 function havePredicate(have: "all" | "none" | readonly number[], pieceCount: number): (piece: number) => boolean {

@@ -20,6 +20,7 @@ fn is_disallowed(ip: IpAddr) -> bool {
                 || v6.is_multicast()
                 || is_unique_local_v6(v6)
                 || is_unicast_link_local_v6(v6)
+                || is_documentation_v6(v6)
         }
     }
 }
@@ -33,6 +34,24 @@ fn is_disallowed_v4(v4: Ipv4Addr) -> bool {
         || v4.is_unspecified()
         || is_shared_cgnat(v4)
         || is_benchmarking(v4)
+        || is_reserved_v4(v4)
+}
+
+/// 0.0.0.0/8, 192.0.0.0/24 (IETF), the three documentation /24s
+/// (RFC 5737) and 240.0.0.0/4 (reserved).
+fn is_reserved_v4(v4: Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 0
+        || o[0] >= 240
+        || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+}
+
+/// 2001:db8::/32 (RFC 3849, documentation)
+fn is_documentation_v6(v6: Ipv6Addr) -> bool {
+    let s = v6.segments();
+    s[0] == 0x2001 && s[1] == 0x0db8
 }
 
 /// 100.64.0.0/10 (RFC 6598, Carrier-Grade NAT)
@@ -79,6 +98,11 @@ mod tests {
             "224.0.0.1",
             "100.64.0.5",
             "198.18.0.1",
+            "0.1.2.3",
+            "192.0.2.10",
+            "198.51.100.7",
+            "203.0.113.9",
+            "240.0.0.1",
         ] {
             assert!(!is_public(ip(s)), "{s} should not be public");
         }
@@ -100,6 +124,7 @@ mod tests {
             "fc00::1",
             "ff02::1",
             "::ffff:127.0.0.1",
+            "2001:db8::1",
         ] {
             assert!(!is_public(ip(s)), "{s} should not be public");
         }

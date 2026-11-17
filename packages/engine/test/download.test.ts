@@ -3,8 +3,8 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import { makeTorrent, startFakePeer, type FakePeer, type PeerBehaviour } from "@magnet-stream/fake-peer";
-import { MSG, PeerConnection, WireParser, downloadAll, parseInfoDict, type Metainfo } from "../src/index.ts";
-import { TcpTransport } from "./tcp-transport.ts";
+import { MSG, PeerConnection, WireParser, downloadAll, geometryOf, parseInfoDict, type Metainfo } from "../src/index.ts";
+import { TcpTransport } from "../examples/tcp-transport.ts";
 
 const torrent = makeTorrent({ seed: 5, size: 3 * 1024 * 1024 + 12_345, pieceLength: 256 * 1024 });
 let meta: Metainfo;
@@ -15,7 +15,7 @@ async function connect(b: PeerBehaviour = {}, reserved?: Uint8Array) {
 	const peer = await startFakePeer({ torrent, ...b });
 	peers.push(peer);
 	const transport = await TcpTransport.connect({ port: peer.port, infoHash: torrent.infoHash, reserved });
-	const conn = new PeerConnection(transport, { pieceCount: meta.pieceCount, pieceLength: meta.pieceLength, totalLength: meta.totalLength });
+	const conn = new PeerConnection(transport, { geometry: geometryOf(meta) });
 	return { peer, transport, conn };
 }
 
@@ -115,5 +115,56 @@ describe("download from one peer", () => {
 		controller.abort();
 		await expect(p).rejects.toThrow(/aborted/);
 		expect(conn.closed).toBe(true);
+	});
+});
+
+describe("v2 and hybrid downloads from one peer", () => {
+	const files = [
+		{ path: ["movie.mkv"], length: 20 * 64 * 1024 + 777 },
+		{ path: ["subs.srt"], length: 3_000 },
+	];
+
+	async function run(t: ReturnType<typeof makeTorrent>, b: PeerBehaviour = {}) {
+		const meta = await parseInfoDict(t.info, t.infoHashHex);
+		const peer = await startFakePeer({ torrent: t, ...b });
+		peers.push(peer);
+		const transport = await TcpTransport.connect({ port: peer.port, infoHash: t.infoHash });
+		const conn = new PeerConnection(transport, { geometry: geometryOf(meta) });
+		return { meta, peer, conn };
+	}
+
+	it("downloads a v2-only torrent, every piece verified with merkle SHA-256", async () => {
+		const t = makeTorrent({ seed: 41, files, pieceLength: 64 * 1024, version: 2 });
+		const { meta, peer, conn } = await run(t);
+		expect(conn.v2).toBe(true);
+		const delivered = new Map<number, Uint8Array>();
+		const result = await downloadAll(conn, meta, { onPiece: (p, d) => delivered.set(p, d.slice()) });
+		expect(result.verified).toEqual([...Array(meta.pieceCount).keys()]);
+		expect(peer.stats.hashRequests).toBe(1);
+		for (const [p, d] of delivered) expect(Buffer.from(d).equals(Buffer.from(t.data.subarray(p * t.pieceLength, p * t.pieceLength + t.pieceSize(p))))).toBe(true);
+		conn.close();
+	});
+
+	it("detects and drops a corrupt v2 piece", async () => {
+		const t = makeTorrent({ seed: 41, files, pieceLength: 64 * 1024, version: 2 });
+		const { meta, conn } = await run(t, { corrupt: [2] });
+		const result = await downloadAll(conn, meta);
+		expect(result.corrupt).toEqual([2]);
+		expect(result.verified).toHaveLength(meta.pieceCount - 1);
+		conn.close();
+	});
+
+	it("fails cleanly when the only peer refuses the piece layers", async () => {
+		const t = makeTorrent({ seed: 41, files, pieceLength: 64 * 1024, version: 2 });
+		const { meta, conn } = await run(t, { hashes: "reject" });
+		await expect(downloadAll(conn, meta)).rejects.toThrow(/piece layers/);
+	});
+
+	it("downloads a hybrid torrent (SHA-1, zero padding included)", async () => {
+		const t = makeTorrent({ seed: 42, files, pieceLength: 64 * 1024, version: "hybrid" });
+		const { meta, conn } = await run(t);
+		const result = await downloadAll(conn, meta);
+		expect(result.verified).toEqual([...Array(meta.pieceCount).keys()]);
+		conn.close();
 	});
 });

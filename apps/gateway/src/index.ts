@@ -13,8 +13,9 @@ import { MAX_OPEN, RaceLost, close, concat, race, type Outcome } from "./peer";
 import { verifyToken } from "./token";
 import { requests } from "./wire";
 import { SUBPROTOCOL } from "@magnet-stream/tunnel-protocol";
-import type { TunnelEnv } from "./tunnel/config";
+import { parseSessionName, parseTunnelConfig, type TunnelEnv } from "./tunnel/config";
 import { TunnelSession, log } from "./tunnel/durable-object";
+import { allowUpgrade, clientKey, type RateLimiterBinding } from "./tunnel/rate-limit";
 
 export { TunnelSession };
 
@@ -25,6 +26,8 @@ export interface Env extends TunnelEnv {
 	ALLOWED_ORIGINS?: string;
 	/** One Durable Object per tunnel WebSocket (docs/tunnel-protocol.md). */
 	TUNNEL: DurableObjectNamespace<TunnelSession>;
+	/** Per-IP limit on tunnel upgrades (wrangler.jsonc `ratelimits`). */
+	UPGRADE_LIMITER?: RateLimiterBinding;
 }
 
 /**
@@ -48,7 +51,7 @@ export default {
 
 		if (url.pathname === "/health") return new Response("ok", { headers: cors });
 		// Origin was checked above: a foreign one got its 403 before any upgrade.
-		if (url.pathname === "/v1/tunnel") return tunnel(request, env);
+		if (url.pathname === "/v1/tunnel") return tunnel(request, env, url);
 		// What this worker supports, so clients can adapt to older versions.
 		if (url.pathname === "/v1/info") {
 			return json(200, { v: 2, maxCandidates: MAX_CANDIDATES, maxOpen: MAX_OPEN }, cors);
@@ -149,8 +152,12 @@ async function blocks(
 	});
 }
 
-/** Hand a WebSocket upgrade to a fresh Durable Object: one per session. */
-async function tunnel(request: Request, env: Env): Promise<Response> {
+/**
+ * Hand a WebSocket upgrade to its session's Durable Object: a fresh one, or
+ * with `?session=<32 hex>` the one shared by that session's WebSockets.
+ * Everything that can be refused is refused here, before any object exists.
+ */
+async function tunnel(request: Request, env: Env, url: URL): Promise<Response> {
 	if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
 		return json(426, { error: "websocket_required" }, { upgrade: "websocket" });
 	}
@@ -159,8 +166,20 @@ async function tunnel(request: Request, env: Env): Promise<Response> {
 		log("tunnel.rejected", { why: "subprotocol" });
 		return json(400, { error: "unsupported_protocol", expected: SUBPROTOCOL }, {});
 	}
-	const stub = env.TUNNEL.get(env.TUNNEL.newUniqueId());
-	return stub.fetch(request);
+	const name = parseSessionName(url.searchParams.get("session"));
+	if (name === undefined) return json(400, { error: "bad_session" }, {});
+	const parsed = parseTunnelConfig(env);
+	if (!parsed.ok) {
+		// Names of the offending variables only, never their values.
+		log("tunnel.config_invalid", { vars: parsed.invalid.join(",") });
+		return json(500, { error: "gateway_misconfigured" }, {});
+	}
+	if (!(await allowUpgrade(env.UPGRADE_LIMITER, clientKey(request), parsed.config.upgradesPerMinute))) {
+		log("tunnel.rejected", { why: "rate_limited" });
+		return json(429, { error: "rate_limited" }, { "retry-after": "60" });
+	}
+	const id = name === null ? env.TUNNEL.newUniqueId() : env.TUNNEL.idFromName(name);
+	return env.TUNNEL.get(id).fetch(request);
 }
 
 async function checkTokens(req: BlocksRequest, secret: string): Promise<[Candidate[], Outcome[]]> {

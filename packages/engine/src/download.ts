@@ -1,11 +1,14 @@
 // Download every piece of a torrent from one peer, with the metadata
-// already known, verifying each piece's SHA-1 (WebCrypto) before handing it
-// over. A piece that fails verification is discarded and reported, never
+// already known, verifying each piece (SHA-1, or SHA-256 merkle trees for
+// v2: the piece layers are fetched from the same peer first) before handing
+// it over. A piece that fails verification is discarded and reported, never
 // delivered (docs/architecture.md §Chunk recovery › Verification).
 
-import { BLOCK_SIZE, verifyPiece, type Metainfo } from "./metainfo.ts";
+import { HashFetcher } from "./hashes.ts";
+import { BLOCK_SIZE, geometryOf, type Metainfo } from "./metainfo.ts";
 import type { PeerConnection } from "./peer-connection.ts";
 import { pieceSizeOf } from "./peer-wire.ts";
+import { V2Verifier, verifierFor, type PieceVerifier } from "./verify.ts";
 
 export interface DownloadOptions {
 	/** Block requests kept in flight (default 64); refilled in batches when half are answered. */
@@ -17,6 +20,8 @@ export interface DownloadOptions {
 	/** Only these pieces (default: all). */
 	pieces?: readonly number[];
 	signal?: AbortSignal;
+	/** How pieces are verified (default: for the torrent's version). */
+	verifier?: PieceVerifier;
 	/** A verified piece. */
 	onPiece?(piece: number, data: Uint8Array): void;
 	/** A piece that failed SHA-1 verification (its data is dropped). */
@@ -59,7 +64,9 @@ export function downloadAll(conn: PeerConnection, meta: Metainfo, opts: Download
 	const stallMs = opts.stallTimeoutMs ?? 30_000;
 	const retries = opts.retries ?? 1;
 	const started = Date.now();
-	const geometry = { pieceCount: meta.pieceCount, pieceLength: meta.pieceLength, totalLength: meta.totalLength };
+	const geometry = geometryOf(meta);
+	if (!conn.geometry) conn.setGeometry(geometry);
+	const verifier = opts.verifier ?? verifierFor(meta);
 	const wanted = [...new Set(opts.pieces ?? Array.from({ length: meta.pieceCount }, (_, i) => i))].filter(
 		(p) => Number.isInteger(p) && p >= 0 && p < meta.pieceCount,
 	);
@@ -90,6 +97,7 @@ export function downloadAll(conn: PeerConnection, meta: Metainfo, opts: Download
 			if (settled) return;
 			settled = true;
 			clearTimeout(stallTimer);
+			hashes?.stop();
 			opts.signal?.removeEventListener("abort", onAbort);
 			conn.events = {};
 			result.ms = Date.now() - started;
@@ -109,11 +117,28 @@ export function downloadAll(conn: PeerConnection, meta: Metainfo, opts: Download
 			if (complete()) finish();
 			else if (gone && verifying === 0) finish(gone);
 		};
+		// v2: the piece layers of the wanted files come first.
+		let hashes: HashFetcher | undefined;
+		if (verifier instanceof V2Verifier && verifier.missingLayers(wanted).length > 0) {
+			hashes = new HashFetcher(verifier, {
+				onLayer: () => {
+					if (verifier.missingLayers(wanted).length > 0) return;
+					hashes = undefined;
+					progress();
+					if (!conn.peerChoking) {
+						plan();
+						fill();
+					}
+				},
+			});
+			hashes.want(verifier.missingLayers(wanted));
+			hashes.offer(conn);
+		}
 		const plan = () => {
-			if (planned) return;
+			if (planned || hashes) return;
 			planned = true;
 			for (const piece of wanted) {
-				if (conn.has(piece)) queue.push(...blocksOf(piece));
+				if (conn.has(piece) && verifier.canVerify(piece)) queue.push(...blocksOf(piece));
 				else result.missing.push(piece);
 			}
 			maybeFinish();
@@ -142,7 +167,7 @@ export function downloadAll(conn: PeerConnection, meta: Metainfo, opts: Download
 			verifying++;
 			let ok: boolean;
 			try {
-				ok = await verifyPiece(meta, piece, w.buffer);
+				ok = await verifier.verify(piece, w.buffer);
 			} catch {
 				ok = false;
 			}
@@ -209,6 +234,15 @@ export function downloadAll(conn: PeerConnection, meta: Metainfo, opts: Download
 				}
 				queue.unshift([piece, begin, length]);
 				fill();
+			},
+			hashes: (request, data) => void hashes?.onHashes(conn, request, data),
+			hashReject: (request) => {
+				hashes?.onReject(conn, request);
+				// The only peer won't give the layers: nothing can be verified.
+				if (hashes && hashes.pending > 0) {
+					finish(new Error("the peer refused the v2 piece layers"));
+					conn.close();
+				}
 			},
 			close: (error) => {
 				gone = error ?? new Error("the peer closed the connection");

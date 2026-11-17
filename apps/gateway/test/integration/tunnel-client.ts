@@ -4,14 +4,15 @@ import { SUBPROTOCOL, decodeMessage, encodeFrames, type Frame } from "@magnet-st
 
 export interface RawTunnel {
 	frames: Frame[];
-	closed: Promise<{ code: number }>;
+	closed: Promise<{ code: number; reason: string }>;
 	send(...frames: Frame[]): void;
 	waitFor(pred: (f: Frame) => boolean, ms?: number): Promise<Frame>;
 	close(): void;
 }
 
-export async function openTunnel(base: string): Promise<RawTunnel> {
-	const ws = new WebSocket(base.replace(/^http/, "ws") + "/v1/tunnel", SUBPROTOCOL);
+export async function openTunnel(base: string, session?: string): Promise<RawTunnel> {
+	const query = session === undefined ? "" : `?session=${session}`;
+	const ws = new WebSocket(base.replace(/^http/, "ws") + "/v1/tunnel" + query, SUBPROTOCOL);
 	ws.binaryType = "arraybuffer";
 	const frames: Frame[] = [];
 	const waiters = new Set<() => void>();
@@ -21,7 +22,7 @@ export async function openTunnel(base: string): Promise<RawTunnel> {
 		frames.push(...r.frames);
 		for (const w of waiters) w();
 	});
-	const closed = new Promise<{ code: number }>((resolve) => ws.addEventListener("close", (e) => resolve({ code: e.code })));
+	const closed = new Promise<{ code: number; reason: string }>((resolve) => ws.addEventListener("close", (e) => resolve({ code: e.code, reason: e.reason })));
 	await new Promise<void>((resolve, reject) => {
 		ws.addEventListener("open", () => resolve(), { once: true });
 		ws.addEventListener("error", () => reject(new Error("websocket error")), { once: true });

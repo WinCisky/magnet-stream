@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import net from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { bdecode, bencode, makeTorrent, parseSize, pexMessage, startFakePeer, type FakePeer, type PeerBehaviour } from "../src/index.ts";
+import { bdecode, bencode, hashAnswer, makeTorrent, parseSize, pexMessage, startFakePeer, type FakePeer, type PeerBehaviour } from "../src/index.ts";
 import { download } from "./client.ts";
 
 const torrent = makeTorrent({ seed: 7, size: 600_000, pieceLength: 64 * 1024 });
@@ -232,3 +232,87 @@ function rawMetadataRequest(port: number): Promise<number | undefined> {
 		});
 	});
 }
+
+describe("v2, hybrid and multi-file torrents", () => {
+	const files = [
+		{ path: ["b", "movie.mkv"], length: 300_000 },
+		{ path: ["a.srt"], length: 1_000 },
+		{ path: ["empty.txt"], length: 0 },
+		{ path: ["b", "extra.bin"], length: 70_000 },
+	];
+
+	it("lays v1 multi-file torrents back to back", () => {
+		const t = makeTorrent({ seed: 3, files, pieceLength: 32 * 1024 });
+		expect(t.files.map((f) => [f.path, f.offset, f.length])).toEqual([
+			["b/movie.mkv", 0, 300_000],
+			["a.srt", 300_000, 1_000],
+			["empty.txt", 301_000, 0],
+			["b/extra.bin", 301_000, 70_000],
+		]);
+		expect(t.totalLength).toBe(371_000);
+		const info = bdecode(t.info)!.value as Map<string, unknown>;
+		expect((info.get("files") as unknown[]).length).toBe(4);
+	});
+
+	it("aligns v2 files to pieces, in file-tree order, with shorter last pieces", () => {
+		const t = makeTorrent({ seed: 3, files, pieceLength: 32 * 1024, version: 2 });
+		expect(t.files.map((f) => [f.path, f.offset])).toEqual([
+			["a.srt", 0],
+			["b/extra.bin", 32 * 1024],
+			["b/movie.mkv", 32 * 1024 * 4],
+			["empty.txt", 32 * 1024 * 4 + 300_000],
+		]);
+		expect(t.pieceSize(0)).toBe(1_000);
+		expect(t.pieceSize(3)).toBe(70_000 - 2 * 32 * 1024);
+		expect(t.pieceSize(4)).toBe(32 * 1024);
+		expect(t.infoHashV1).toBeUndefined();
+		expect(createHash("sha256").update(t.info).digest().subarray(0, 20).equals(Buffer.from(t.infoHash))).toBe(true);
+		expect(t.magnet).toMatch(/^magnet:\?xt=urn:btmh:1220[0-9a-f]{64}&dn=/);
+		const info = bdecode(t.info)!.value as Map<string, unknown>;
+		expect(info.get("meta version")).toBe(2);
+		expect(info.has("pieces")).toBe(false);
+		// Piece layers only for files larger than one piece; each matches its root.
+		const movie = t.files.find((f) => f.path === "b/movie.mkv")!;
+		const layer = t.pieceLayers.get(Buffer.from(movie.piecesRoot!).toString("hex"))!;
+		expect(layer.length).toBe(Math.ceil(300_000 / (32 * 1024)) * 32);
+		expect(t.pieceLayers.has(Buffer.from(t.files[0].piecesRoot!).toString("hex"))).toBe(false);
+	});
+
+	it("serves hash requests with proofs up to the root", () => {
+		const t = makeTorrent({ seed: 3, files, pieceLength: 32 * 1024, version: 2 });
+		const movie = t.files.find((f) => f.path === "b/movie.mkv")!;
+		const tree = t.trees.get(Buffer.from(movie.piecesRoot!).toString("hex"))!;
+		const req = Buffer.alloc(48);
+		Buffer.from(movie.piecesRoot!).copy(req);
+		req.writeUInt32BE(tree.pieceLayer, 32);
+		req.writeUInt32BE(4, 36);
+		req.writeUInt32BE(4, 40);
+		req.writeUInt32BE(10, 44);
+		const answer = hashAnswer(t, req, "serve")!;
+		// 4 hashes, then uncles from the subtree's level up to (not including) the root.
+		const hashes = (answer.length - 48) / 32;
+		expect(hashes).toBe(4 + (tree.layers.length - 1 - (tree.pieceLayer + 2)));
+		let node = createHash("sha256")
+			.update(Buffer.concat([createHash("sha256").update(answer.subarray(48, 112)).digest(), createHash("sha256").update(answer.subarray(112, 176)).digest()]))
+			.digest();
+		for (let i = 4, at = 1; i < hashes; i++, at >>= 1) {
+			const uncle = answer.subarray(48 + i * 32, 80 + i * 32);
+			node = createHash("sha256").update(at & 1 ? Buffer.concat([uncle, node]) : Buffer.concat([node, uncle])).digest();
+		}
+		expect(node.equals(Buffer.from(movie.piecesRoot!))).toBe(true);
+		expect(hashAnswer(t, req, "reject")).toBeUndefined();
+		req.writeUInt32BE(3, 36); // not a multiple of the length
+		expect(hashAnswer(t, req, "serve")).toBeUndefined();
+	});
+
+	it("hybrids pad v1 pieces with zeros and carry both hashes", () => {
+		const t = makeTorrent({ seed: 3, files, pieceLength: 32 * 1024, version: "hybrid" });
+		expect(t.files.filter((f) => f.pad).map((f) => f.length)).toEqual([32 * 1024 - 1_000, 32 * 1024 * 3 - 70_000]);
+		expect(t.pieceSize(0)).toBe(32 * 1024);
+		expect(t.data.subarray(1_000, 32 * 1024).every((b) => b === 0)).toBe(true);
+		expect(createHash("sha1").update(t.info).digest().equals(Buffer.from(t.infoHash))).toBe(true);
+		expect(t.infoHashV2).toHaveLength(32);
+		expect(t.magnet).toContain("urn:btih:");
+		expect(t.magnet).toContain("urn:btmh:1220");
+	});
+});

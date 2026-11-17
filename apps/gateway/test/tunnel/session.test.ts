@@ -9,6 +9,7 @@ import {
 	type OpenFrame,
 	type PeerAddress,
 } from "@magnet-stream/tunnel-protocol";
+import { parseSessionEnd, SessionCloseCode } from "@magnet-stream/tunnel-protocol";
 import { TunnelSession, handshake, type LogFields, type SocketLike } from "../../src/tunnel/session";
 
 const INFO_HASH = Uint8Array.from({ length: 20 }, (_, i) => i + 1);
@@ -80,7 +81,16 @@ class Remote {
 	}
 }
 
-function setup(behaviours: Behaviour[] | ((i: number) => Behaviour), options: { allowPrivate?: boolean; handshakeTimeoutMs?: number; connectTimeoutMs?: number } = {}) {
+interface SetupOptions {
+	allowPrivate?: boolean;
+	handshakeTimeoutMs?: number;
+	connectTimeoutMs?: number;
+	idleTimeoutMs?: number;
+	failedConnectHoldMs?: number;
+	now?: () => number;
+}
+
+function setup(behaviours: Behaviour[] | ((i: number) => Behaviour), options: SetupOptions = {}) {
 	const sent: Frame[][] = [];
 	const logs: { event: string; fields: LogFields }[] = [];
 	const remotes: Remote[] = [];
@@ -99,6 +109,9 @@ function setup(behaviours: Behaviour[] | ((i: number) => Behaviour), options: { 
 			allowPrivate: options.allowPrivate ?? true,
 			handshakeTimeoutMs: options.handshakeTimeoutMs ?? 300,
 			connectTimeoutMs: options.connectTimeoutMs ?? 300,
+			failedConnectHoldMs: options.failedConnectHoldMs ?? 0,
+			...(options.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: options.idleTimeoutMs }),
+			...(options.now === undefined ? {} : { now: options.now }),
 			connect: (address) => {
 				connected.push(address);
 				const i = remotes.length;
@@ -277,5 +290,81 @@ describe("tunnel session", () => {
 		const allowed = new Set(["opened", "failed", "data", "close", "ping"]);
 		expect(t.frames().every((f) => allowed.has(f.type))).toBe(true);
 		expect(FrameType.ACCEPT).toBe(6);
+	});
+});
+
+describe("session lifetime", () => {
+	function clock() {
+		let t = 1_000_000;
+		return { now: () => t, advance: (ms: number) => (t += ms) };
+	}
+
+	it("closes a connection idle for 90 s with reason idle, and keeps busy ones", async () => {
+		const c = clock();
+		const t = setup(() => ({ kind: "peer" }), { now: c.now });
+		t.send(open(1), open(2));
+		await until(() => t.frames().filter((f) => f.type === "opened").length === 2);
+		c.advance(60_000);
+		t.send({ type: "data", conn: 2, payload: Uint8Array.of(0, 0, 0, 0) }); // keep-alive on conn 2
+		c.advance(29_999);
+		t.session.sweep();
+		expect(t.frames().some((f) => f.type === "close")).toBe(false);
+		c.advance(1);
+		t.session.sweep();
+		expect(t.frames().filter((f) => f.type === "close")).toEqual([{ type: "close", conn: 1, reason: CloseReason.IDLE }]);
+		await until(() => t.remotes[0].closed);
+		expect(t.remotes[1].closed).toBe(false);
+		// Bytes from the remote count as traffic too.
+		c.advance(60_000);
+		t.remotes[1].push(Uint8Array.of(0, 0, 0, 0));
+		await until(() => t.frames().filter((f) => f.type === "data").length >= 1);
+		t.send({ type: "ping", conn: 0, payload: new Uint8Array(0) });
+		c.advance(60_000);
+		t.session.sweep();
+		expect(t.remotes[1].closed).toBe(false);
+		expect(t.session.stats.idleClosed).toBe(1);
+	});
+
+	it("closes the WebSocket when the client sends nothing (not even ping) for the idle timeout", () => {
+		const c = clock();
+		const t = setup([], { now: c.now });
+		c.advance(80_000);
+		t.send({ type: "ping", conn: 0, payload: new Uint8Array(0) });
+		c.advance(89_999);
+		t.session.sweep();
+		expect(t.wsClosed).toEqual([]);
+		c.advance(1);
+		t.session.sweep();
+		expect(t.wsClosed).toEqual([{ code: SessionCloseCode.IDLE, reason: "idle in=1 up=0 down=0" }]);
+		expect(t.session.isEnded).toBe(true);
+	});
+
+	it("shutdown closes every connection with the reason, then the WebSocket with the counters", async () => {
+		const t = setup(() => ({ kind: "peer" }));
+		t.send(open(1), open(2));
+		await until(() => t.frames().filter((f) => f.type === "opened").length === 2);
+		t.send({ type: "data", conn: 1, payload: Uint8Array.of(1, 2, 3) });
+		t.session.shutdown("session_timeout", SessionCloseCode.SESSION_TIMEOUT, CloseReason.SESSION_TIMEOUT);
+		expect(t.sent.at(-1)).toEqual([
+			{ type: "close", conn: 1, reason: CloseReason.SESSION_TIMEOUT },
+			{ type: "close", conn: 2, reason: CloseReason.SESSION_TIMEOUT },
+		]);
+		expect(t.wsClosed).toHaveLength(1);
+		expect(t.wsClosed[0].code).toBe(SessionCloseCode.SESSION_TIMEOUT);
+		expect(parseSessionEnd(t.wsClosed[0].reason)).toEqual({ reason: "session_timeout", counters: { messagesIn: 2, bytesUp: 3, bytesDown: 0 } });
+		await until(() => t.remotes.every((r) => r.closed));
+		await until(() => t.session.activeSlots === 0);
+		expect(t.logs.find((l) => l.event === "tunnel.session_end")?.fields).toMatchObject({ reason: "session_timeout", messagesIn: 2, bytesUp: 3 });
+	});
+
+	it("keeps the slot of a timed-out connect taken for the hold time", async () => {
+		const t = setup([{ kind: "hang" }, { kind: "silent" }], { connectTimeoutMs: 50, handshakeTimeoutMs: 50, failedConnectHoldMs: 400 });
+		t.send(open(1), open(2));
+		await until(() => t.frames().filter((f) => f.type === "failed").length === 2);
+		// conn 2 connected (then timed out on the handshake): its slot comes back at once.
+		await until(() => t.session.activeSlots === 1);
+		await tick(150);
+		expect(t.session.activeSlots).toBe(1);
+		await until(() => t.session.activeSlots === 0, 1000);
 	});
 });

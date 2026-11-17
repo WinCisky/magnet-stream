@@ -31,7 +31,7 @@ pub async fn announce(
         .port()
         .ok_or_else(|| TrackerError::InvalidUrl("missing port".into()))?;
 
-    let remote = resolve_public(host, port).await?;
+    let remote = resolve_public(host, port, params.allow_private).await?;
 
     let bind_addr = match remote {
         SocketAddr::V4(_) => "0.0.0.0:0",
@@ -52,12 +52,18 @@ pub async fn announce(
     do_announce(&socket, connection_id, params, per_attempt).await
 }
 
-async fn resolve_public(host: &str, port: u16) -> Result<SocketAddr, TrackerError> {
+async fn resolve_public(
+    host: &str,
+    port: u16,
+    allow_private: bool,
+) -> Result<SocketAddr, TrackerError> {
+    // `Url::host_str` keeps IPv6 literals bracketed; lookup_host wants them bare.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|e| TrackerError::Dns(e.to_string()))?;
     addrs
-        .find(|a| netguard::is_public(a.ip()))
+        .find(|a| allow_private || netguard::is_public(a.ip()))
         .ok_or(TrackerError::NoPublicAddress)
 }
 

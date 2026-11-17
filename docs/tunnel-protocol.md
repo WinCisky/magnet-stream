@@ -24,6 +24,17 @@ per vector).
 - Route on the Cloudflare gateway: `GET /v1/tunnel` with
   `Upgrade: websocket`. Requests whose `Origin` is not in `ALLOWED_ORIGINS`
   get **403 before the upgrade**.
+- **Several WebSockets per session.** `GET /v1/tunnel?session=<id>`, with
+  `<id>` 32 lowercase hex digits (128 random bits chosen by the client),
+  routes every WebSocket of a session to the same Durable Object; without
+  `session` each WebSocket gets its own object. Each WebSocket carries its
+  own 6 connections; a session holds at most 3 WebSockets (default,
+  `TUNNEL_SOCKETS_PER_SESSION`): the next upgrade gets **429**
+  `session_full`. A malformed `session` gets **400** `bad_session`.
+- **Per-IP upgrade limit.** At most 30 upgrades per minute per client IP
+  (default, `TUNNEL_UPGRADES_PER_MINUTE`), checked before any Durable
+  Object exists: over it, **429** `rate_limited` with `Retry-After: 60`.
+  The IP is only the limiter's key; it is never logged.
 - The Durable Object stores nothing (docs/architecture.md §Storage and
   database): all session state lives in memory and dies with the socket.
 
@@ -123,8 +134,10 @@ peer-wire stream that follows them.
 | 1    | `REMOTE_CLOSED`  | the remote peer closed the TCP connection |
 | 2    | `REMOTE_ERROR`   | the TCP connection failed (reset, write error) |
 | 3    | `PROTOCOL_ERROR` | the other side broke the per-connection rules (e.g. `data` before `opened`) |
-| 4    | `SESSION_ENDING` | the gateway is ending the session (limits, shutdown) |
+| 4    | `SESSION_ENDING` | the gateway is ending the session (WebSocket idle, shutdown, WebSocket closed) |
 | 5    | `INTERNAL_ERROR` | anything else |
+| 6    | `IDLE`           | no byte either way on this connection for the idle timeout (90 s) |
+| 7    | `SESSION_TIMEOUT`| the session reached its maximum length (2 h) |
 
 Receivers treat unknown codes as `INTERNAL_ERROR` (forward compatibility);
 the decoder accepts any byte value.
@@ -157,9 +170,9 @@ made precise here:
   gateway closes the TCP socket on receipt.
 - **ping** (browser → gateway, as in the architecture) keeps the session
   alive and, on the Durable Object, renews the CPU allowance; it needs no
-  reply. The codec also decodes a gateway → client `ping` (reserved; the
-  client ignores it). (Cadence and idle
-  timeouts: M2-01.)
+  reply and is not logged. The codec also decodes a gateway → client
+  `ping` (reserved; the client ignores it). Cadence: see *Session
+  lifetime*.
 - **Address policy (gateway).** `open` to a private, reserved, loopback,
   link-local, CGNAT, multicast or documentation address (IPv4, IPv6 and
   IPv4-mapped/embedded IPv6), or to a port below 1024, gets `failed`
@@ -169,6 +182,49 @@ made precise here:
   a text message, a gateway-only frame (`opened`, `failed`, `accept`) sent
   by the client — close the WebSocket with code 1002 and every TCP
   connection of the session.
+
+## Session lifetime
+
+| rule | default | variable (Cloudflare gateway) |
+|---|---|---|
+| a connection with no byte relayed in either direction is closed with `close` IDLE | 90 s | `TUNNEL_IDLE_TIMEOUT_MS` |
+| a WebSocket on which the client sent no message is closed (code 4000) | 90 s | `TUNNEL_IDLE_TIMEOUT_MS` |
+| the session (all its WebSockets) ends, counted from its first WebSocket: `close` SESSION_TIMEOUT for every connection, then the WebSocket close (code 4001); later upgrades to it get **410** | 2 h | `TUNNEL_SESSION_TIMEOUT_S` |
+| a connect that timed out keeps its slot taken until 20 s after it started, because the platform keeps it pending that long and queues new connects behind it (docs/spike-report.md, OQ-03) | 20 s | `TUNNEL_FAILED_CONNECT_HOLD_MS` |
+
+Client duties that follow:
+
+- **`ping` cadence: 30 s.** The client sends a `ping` whenever it has sent
+  no other message on a WebSocket for 30 s (`PING_INTERVAL_MS`): three per
+  idle timeout, so one late message does not end the session. While
+  downloading, the batched upstream (one message every 300–500 ms) already
+  keeps the WebSocket alive and no ping is sent; the spike measured that
+  incoming messages at that rate keep renewing the Durable Object's CPU
+  allowance. An idle session costs 2 messages per minute, 0.1 billed
+  requests.
+- **Connection keep-alive.** A peer that keeps us choked often sends
+  nothing for minutes; to keep such a connection the client sends a
+  peer-wire keep-alive (4 zero bytes) on it within the idle timeout.
+
+WebSocket close codes (`SessionCloseCode`):
+
+| code | name | when |
+|---|---|---|
+| 1000 | `NORMAL` | the client closed it (the gateway's answer) |
+| 1002 | `PROTOCOL_ERROR` | a frame did not decode, or a gateway-only frame came from the client |
+| 1003 | `UNSUPPORTED_DATA` | a text message |
+| 4000 | `IDLE` | no client message for the idle timeout |
+| 4001 | `SESSION_TIMEOUT` | the session reached its maximum length |
+| 4002 | `SHUTDOWN` | the gateway is shutting down |
+
+**Counters in the close reason.** When the gateway closes a WebSocket, the
+close reason is `"<reason> in=<n> up=<n> down=<n>"` (`formatSessionEnd`
+/ `parseSessionEnd`): `in` = WebSocket messages received from the client
+(what a Durable Object bills, 20:1), `up` / `down` = bytes forwarded to /
+from the peers. Always within the 123-byte limit of a close reason. When
+the client closes, the runtime may not relay the gateway's answer, so the
+client relies on its own counts; the gateway logs the counters of every
+session (`tunnel.session_end`, counters and reason codes only).
 
 ## Decoder limits
 

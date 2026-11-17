@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // npm run fake-peer -- --port 6881 --size 8MiB --seed 1 [--piece-length 256KiB]
-//   [--host 127.0.0.1] [--behaviour key=value ...]
+//   [--host 127.0.0.1] [--v2 | --hybrid] [--behaviour key=value ...]
 // Prints the magnet and info-hash, then serves until interrupted.
 
 import { parseArgs } from "node:util";
@@ -15,12 +15,14 @@ const { values } = parseArgs({
 		seed: { type: "string", default: "1" },
 		"piece-length": { type: "string", default: "256KiB" },
 		behaviour: { type: "string", multiple: true, default: [] },
+		v2: { type: "boolean", default: false },
+		hybrid: { type: "boolean", default: false },
 		help: { type: "boolean", short: "h", default: false },
 	},
 });
 
 if (values.help) {
-	console.log(`usage: fake-peer [--port N] [--host IP] [--size 8MiB] [--seed N] [--piece-length 256KiB]
+	console.log(`usage: fake-peer [--port N] [--host IP] [--size 8MiB] [--seed N] [--piece-length 256KiB] [--v2 | --hybrid]
                  [--behaviour unchokeDelayMs=500] [--behaviour corrupt=true] [--behaviour have=0,2,4] ...`);
 	process.exit(0);
 }
@@ -38,11 +40,12 @@ for (const kv of values.behaviour) {
 		raw === "true" ? true : raw === "false" ? false : /^\d+$/.test(raw) ? Number(raw) : raw.includes(",") || key === "have" ? raw.split(",").map(Number) : raw;
 }
 
-const torrent = makeTorrent({ seed, size: parseSize(values.size), pieceLength: parseSize(values["piece-length"]) });
+const version = values.v2 ? 2 : values.hybrid ? "hybrid" : 1;
+const torrent = makeTorrent({ seed, size: parseSize(values.size), pieceLength: parseSize(values["piece-length"]), version });
 const peer = await startFakePeer({ torrent, host: values.host, port, ...(behaviour as PeerBehaviour) });
 console.log(
 	JSON.stringify(
-		{ addr: peer.addr, infoHash: torrent.infoHashHex, magnet: peer.magnet, size: torrent.totalLength, pieceLength: torrent.pieceLength, pieces: torrent.pieceCount },
+		{ addr: peer.addr, version: torrent.version, infoHash: torrent.infoHashHex, magnet: peer.magnet, size: torrent.totalLength, pieceLength: torrent.pieceLength, pieces: torrent.pieceCount },
 		null,
 		2,
 	),

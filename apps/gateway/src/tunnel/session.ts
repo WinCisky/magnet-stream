@@ -9,15 +9,24 @@
 //     the same info-hash;
 //   - at most 6 connections per WebSocket (a slot frees once its socket closed);
 //   - only public addresses on ports >= 1024 (address-policy.ts);
-//   - a malformed frame closes the whole session.
+//   - a malformed frame closes the whole session;
+//   - a connection with no traffic either way for the idle timeout (90 s)
+//     is closed (`close` IDLE), and so is a WebSocket on which the client
+//     sent nothing for that long (the client pings every 30 s when quiet);
+//   - the host ends the session at its maximum length (`shutdown`).
+// Timers are driven by the host calling `sweep()` (once a second in the
+// Durable Object), against an injectable clock, so tests need no real time.
 // Nothing is stored; logs carry no client IP, peer address or info-hash.
 
 import {
 	CloseReason,
+	DEFAULT_IDLE_TIMEOUT_MS,
 	FailReason,
 	MAX_CONNECTIONS_PER_SOCKET,
+	SessionCloseCode,
 	decodeMessage,
 	encodeFrames,
+	formatSessionEnd,
 	type Frame,
 	type OpenFrame,
 	type PeerAddress,
@@ -56,6 +65,12 @@ export interface SessionOptions {
 	connectTimeoutMs?: number;
 	handshakeTimeoutMs?: number;
 	maxConnections?: number;
+	/** Close a connection, or the WebSocket, after this long without traffic (default 90 s). */
+	idleTimeoutMs?: number;
+	/** A connect that timed out keeps its slot until this long after it started (default 20 s, OQ-03). */
+	failedConnectHoldMs?: number;
+	/** Clock for the idle checks (default Date.now). */
+	now?: () => number;
 	/** Structured log sink. Never receives addresses, info-hashes or client IPs. */
 	log?: (event: string, fields: LogFields) => void;
 }
@@ -66,9 +81,13 @@ interface Conn {
 	id: number;
 	state: State;
 	socket?: SocketLike;
+	/** The TCP connect completed. */
+	connected?: boolean;
 	reader?: ReadableStreamDefaultReader<Uint8Array>;
 	writer?: WritableStreamDefaultWriter<Uint8Array>;
 	writes: Promise<void>;
+	/** Last byte relayed either way (or the `opened`), for the idle timeout. */
+	lastActivity: number;
 }
 
 /** A read of `state` that TypeScript won't narrow away across awaits. */
@@ -90,11 +109,14 @@ const CLOSE_NAMES: Record<number, string> = Object.fromEntries(Object.entries(Cl
 export class TunnelSession {
 	private readonly io: SessionIo;
 	private readonly opts: Required<Omit<SessionOptions, "log">> & Pick<SessionOptions, "log">;
+	private lastMessageIn: number;
+	/** Why the session ended, once it has. */
+	endReason: string | null = null;
 	private readonly conns = new Map<number, Conn>();
 	/** Sockets not yet closed, including connections already ended on the wire. */
 	private slots = 0;
 	private ended = false;
-	private readonly started = Date.now();
+	private readonly started: number;
 	readonly stats = {
 		messagesIn: 0,
 		messagesOut: 0,
@@ -104,6 +126,7 @@ export class TunnelSession {
 		opens: 0,
 		opened: 0,
 		failed: 0,
+		idleClosed: 0,
 	};
 
 	constructor(io: SessionIo, options: SessionOptions) {
@@ -113,8 +136,60 @@ export class TunnelSession {
 			connectTimeoutMs: 5_000,
 			handshakeTimeoutMs: 10_000,
 			maxConnections: MAX_CONNECTIONS_PER_SOCKET,
+			idleTimeoutMs: DEFAULT_IDLE_TIMEOUT_MS,
+			failedConnectHoldMs: 20_000,
+			now: Date.now,
 			...options,
 		};
+		this.started = this.opts.now();
+		this.lastMessageIn = this.started;
+	}
+
+	get isEnded(): boolean {
+		return this.ended;
+	}
+
+	/** The WebSocket close reason for `reason`, with this session's counters. */
+	closeReason(reason: string): string {
+		return formatSessionEnd({
+			reason,
+			counters: { messagesIn: this.stats.messagesIn, bytesUp: this.stats.bytesUp, bytesDown: this.stats.bytesDown },
+		});
+	}
+
+	/**
+	 * Idle checks, called periodically by the host: connections with no
+	 * traffic either way, and a WebSocket the client has not used, for the
+	 * idle timeout.
+	 */
+	sweep(): void {
+		if (this.ended) return;
+		const now = this.opts.now();
+		if (now - this.lastMessageIn >= this.opts.idleTimeoutMs) {
+			this.shutdown("idle", SessionCloseCode.IDLE, CloseReason.SESSION_ENDING);
+			return;
+		}
+		for (const c of [...this.conns.values()]) {
+			if (c.state === "open" && now - c.lastActivity >= this.opts.idleTimeoutMs) {
+				this.stats.idleClosed++;
+				this.end(c, CloseReason.IDLE, true);
+			}
+		}
+	}
+
+	/**
+	 * End the session from the gateway side: a `close` with `connReason` for
+	 * every connection, then the WebSocket close with the counters.
+	 */
+	shutdown(reason: string, code: number = SessionCloseCode.SHUTDOWN, connReason: number = CloseReason.SESSION_ENDING): void {
+		if (this.ended) return;
+		const frames: Frame[] = [...this.conns.values()].map((c) => ({ type: "close", conn: c.id, reason: connReason }));
+		if (frames.length > 0) this.emit(frames);
+		this.endReason = reason;
+		try {
+			this.io.close(code, this.closeReason(reason));
+		} catch {}
+		this.onClose();
 	}
 
 	/** Connections currently holding a slot (opening, open, or closing). */
@@ -126,13 +201,14 @@ export class TunnelSession {
 	onMessage(data: ArrayBuffer | ArrayBufferView | string): void {
 		if (this.ended) return;
 		this.stats.messagesIn++;
-		if (typeof data === "string") return this.abort(1003, "binary frames only");
+		this.lastMessageIn = this.opts.now();
+		if (typeof data === "string") return this.abort(SessionCloseCode.UNSUPPORTED_DATA, "unsupported_data");
 		// (instanceof ArrayBuffer is unreliable across realms: test for views instead.)
 		const bytes = ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data);
 		const decoded = decodeMessage(bytes);
 		if (!decoded.ok) {
 			this.log("tunnel.protocol_error", { code: decoded.error.code });
-			return this.abort(1002, `protocol error: ${decoded.error.code}`);
+			return this.abort(SessionCloseCode.PROTOCOL_ERROR, "protocol_error");
 		}
 		for (const frame of decoded.frames) {
 			if (this.ended) return;
@@ -144,8 +220,9 @@ export class TunnelSession {
 	onClose(): void {
 		if (this.ended) return;
 		this.ended = true;
+		this.endReason ??= "normal";
 		for (const c of [...this.conns.values()]) this.end(c, CloseReason.SESSION_ENDING, false);
-		this.log("tunnel.session_end", { ms: Date.now() - this.started, ...this.stats });
+		this.log("tunnel.session_end", { reason: this.endReason, ms: this.opts.now() - this.started, ...this.stats });
 	}
 
 	private onFrame(frame: Frame): void {
@@ -173,7 +250,7 @@ export class TunnelSession {
 			default:
 				// opened / failed / accept only flow gateway → client.
 				this.log("tunnel.protocol_error", { code: `unexpected_${frame.type}` });
-				return this.abort(1002, `protocol error: unexpected ${frame.type}`);
+				return this.abort(SessionCloseCode.PROTOCOL_ERROR, "protocol_error");
 		}
 	}
 
@@ -183,7 +260,7 @@ export class TunnelSession {
 		if (this.slots >= this.opts.maxConnections) return this.fail(frame.conn, FailReason.TOO_MANY_CONNECTIONS);
 		if (checkAddress(frame.address, this.opts.allowPrivate) !== "ok") return this.fail(frame.conn, FailReason.FORBIDDEN_ADDRESS);
 
-		const c: Conn = { id: frame.conn, state: "opening", writes: Promise.resolve() };
+		const c: Conn = { id: frame.conn, state: "opening", writes: Promise.resolve(), lastActivity: this.opts.now() };
 		this.conns.set(c.id, c);
 		this.slots++;
 		const started = Date.now();
@@ -191,6 +268,7 @@ export class TunnelSession {
 			(rest) => {
 				if (c.state === "closed") return; // the client gave up meanwhile
 				c.state = "open";
+				c.lastActivity = this.opts.now();
 				this.stats.opened++;
 				this.log("tunnel.opened", { ms: Date.now() - started });
 				// The remote's peer-wire bytes that came with its handshake ride along.
@@ -207,7 +285,10 @@ export class TunnelSession {
 				if (c.state === "closed") return;
 				c.state = "closed";
 				this.conns.delete(c.id);
-				this.release(c);
+				// A connect still pending on the platform keeps blocking new
+				// ones for ~20 s (OQ-03): keep its slot taken that long.
+				const hold = reason === FailReason.TIMEOUT && !c.connected ? started + this.opts.failedConnectHoldMs - Date.now() : 0;
+				this.release(c, hold);
 				this.fail(c.id, reason, Date.now() - started);
 			},
 		);
@@ -222,6 +303,10 @@ export class TunnelSession {
 			throw new OpenFailure(FailReason.REFUSED);
 		}
 		c.socket = socket;
+		void socket.opened.then(
+			() => (c.connected = true),
+			() => {},
+		);
 		socket.closed.catch(() => {});
 		await within(
 			socket.opened.then(
@@ -267,6 +352,7 @@ export class TunnelSession {
 				if (done) break;
 				if (value.length === 0) continue;
 				this.stats.bytesDown += value.length;
+				c.lastActivity = this.opts.now();
 				this.emit([{ type: "data", conn: c.id, payload: value }]);
 			}
 			this.end(c, CloseReason.REMOTE_CLOSED, true);
@@ -278,6 +364,7 @@ export class TunnelSession {
 	/** Client → remote, writes kept in order. */
 	private write(c: Conn, payload: Uint8Array): void {
 		this.stats.bytesUp += payload.length;
+		c.lastActivity = this.opts.now();
 		const writer = c.writer!;
 		c.writes = c.writes
 			.then(() => writer.write(payload))
@@ -296,13 +383,14 @@ export class TunnelSession {
 		this.release(c);
 	}
 
-	/** Close the socket; give the slot back once it has closed. */
-	private release(c: Conn): void {
+	/** Close the socket; give the slot back once it has closed (and no sooner than `holdMs`). */
+	private release(c: Conn, holdMs = 0): void {
 		const socket = c.socket;
 		if (!socket) {
 			this.slots--;
 			return;
 		}
+		const hold = holdMs > 0 ? new Promise<void>((r) => setTimeout(r, holdMs)) : Promise.resolve();
 		void c.reader?.cancel().catch(() => {});
 		let closed: Promise<unknown>;
 		try {
@@ -312,6 +400,7 @@ export class TunnelSession {
 		}
 		void within(Promise.all([closed, socket.closed.catch(() => {})]), CLOSE_WAIT_MS)
 			.catch(() => {})
+			.then(() => hold)
 			.then(() => {
 				this.slots--;
 			});
@@ -335,8 +424,9 @@ export class TunnelSession {
 	}
 
 	private abort(code: number, reason: string): void {
+		this.endReason = reason;
 		try {
-			this.io.close(code, reason);
+			this.io.close(code, this.closeReason(reason));
 		} catch {}
 		this.onClose();
 	}

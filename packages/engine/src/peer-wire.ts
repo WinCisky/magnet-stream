@@ -1,6 +1,9 @@
-// BitTorrent peer-wire messages after the handshake (BEP 3, plus the BEP 6
-// fast-extension messages): an encoder and an incremental, validating
-// parser. Messages may be split anywhere across chunks.
+// BitTorrent peer-wire messages after the handshake (BEP 3, plus BEP 6
+// fast-extension, BEP 10 extended and BEP 52 hash messages): an encoder and
+// an incremental, validating parser. Messages may be split anywhere across
+// chunks. Before the metadata is known (magnet start) the parser has no
+// geometry: piece indices and bitfields are then checked later, by the
+// connection, once it is set.
 
 export const MSG = {
 	CHOKE: 0,
@@ -19,11 +22,16 @@ export const MSG = {
 	REJECT: 0x10,
 	ALLOWED_FAST: 0x11,
 	EXTENDED: 20,
+	HASH_REQUEST: 21,
+	HASHES: 22,
+	HASH_REJECT: 23,
 } as const;
 
 /** Handshake reserved bits. */
 export const RESERVED_FAST = { byte: 7, mask: 0x04 } as const;
 export const RESERVED_EXTENSION = { byte: 5, mask: 0x10 } as const;
+/** BEP 52: the peer supports v2 hash messages. */
+export const RESERVED_V2 = { byte: 7, mask: 0x10 } as const;
 
 /** Largest block we ever request, and so the largest `piece` payload we accept. */
 export const MAX_BLOCK = 16 * 1024;
@@ -53,16 +61,46 @@ export type WireMessage =
 	| { type: "have_none" }
 	| { type: "reject"; piece: number; begin: number; length: number }
 	| { type: "extended"; id: number; payload: Uint8Array }
+	/** BEP 52 `hash request` / `hash reject`: the 48-byte request. */
+	| { type: "hash_request" | "hash_reject"; request: HashRequest }
+	/** BEP 52 `hashes`: the request it answers and 32-byte hashes (requested ones, then proof). */
+	| { type: "hashes"; request: HashRequest; hashes: Uint8Array }
 	| { type: "other"; id: number };
+
+export interface HashRequest {
+	piecesRoot: Uint8Array;
+	/** Tree layer of the requested hashes (0 = 16 KiB blocks). */
+	baseLayer: number;
+	/** First hash, in that layer. */
+	index: number;
+	/** Number of hashes (a power of two). */
+	length: number;
+	/** Uncle hashes asked for above the requested subtree. */
+	proofLayers: number;
+}
 
 export interface Geometry {
 	pieceCount: number;
 	pieceLength: number;
 	totalLength: number;
+	/** Wire size of a piece when it is not uniform (v2: shorter last piece of each file). */
+	pieceSize?: (piece: number) => number;
 }
 
 export function pieceSizeOf(g: Geometry, piece: number): number {
+	if (g.pieceSize) return g.pieceSize(piece);
 	return piece < g.pieceCount - 1 ? g.pieceLength : g.totalLength - g.pieceLength * (g.pieceCount - 1);
+}
+
+export function encodeHashRequest(id: typeof MSG.HASH_REQUEST | typeof MSG.HASH_REJECT, r: HashRequest): Uint8Array {
+	const payload = new Uint8Array(48);
+	payload.set(r.piecesRoot, 0);
+	const view = new DataView(payload.buffer);
+	view.setUint32(32, r.baseLayer);
+	view.setUint32(36, r.index);
+	view.setUint32(40, r.length);
+	view.setUint32(44, r.proofLayers);
+	return encodeMessage(id, payload);
 }
 
 // ---------------------------------------------------------------- encoding
@@ -90,6 +128,13 @@ export function encodeRequest(id: typeof MSG.REQUEST | typeof MSG.CANCEL, piece:
 	return out;
 }
 
+/** A bitfield must have exactly ceil(n/8) bytes and no spare bits set. */
+export function checkBitfield(bits: Uint8Array, pieceCount: number): void {
+	if (bits.length !== Math.ceil(pieceCount / 8)) throw new WireProtocolError(`bitfield with a ${bits.length}-byte payload`);
+	const spare = bits.length * 8 - pieceCount;
+	if (spare > 0 && (bits[bits.length - 1] & ((1 << spare) - 1)) !== 0) throw new WireProtocolError("bitfield has spare bits set");
+}
+
 // ---------------------------------------------------------------- parsing
 
 /**
@@ -101,9 +146,14 @@ export class WireParser {
 	private buf = new Uint8Array(64 * 1024);
 	private start = 0;
 	private end = 0;
-	private readonly geometry: Geometry;
+	private geometry: Geometry | undefined;
 
-	constructor(geometry: Geometry) {
+	constructor(geometry?: Geometry) {
+		this.geometry = geometry;
+	}
+
+	/** The metadata arrived: check piece indices from now on. */
+	setGeometry(geometry: Geometry): void {
 		this.geometry = geometry;
 	}
 
@@ -129,7 +179,7 @@ export class WireParser {
 			if (len !== n) throw new WireProtocolError(`${name} with a ${len}-byte payload`);
 		};
 		const index = (piece: number, name: string) => {
-			if (piece >= g.pieceCount) throw new WireProtocolError(`${name} for piece ${piece} of ${g.pieceCount}`);
+			if (g && piece >= g.pieceCount) throw new WireProtocolError(`${name} for piece ${piece} of ${g.pieceCount}`);
 			return piece;
 		};
 		switch (id) {
@@ -155,10 +205,8 @@ export class WireParser {
 				exact(4, "have");
 				return { type: "have", piece: index(this.u32(at), "have") };
 			case MSG.BITFIELD: {
-				exact(Math.ceil(g.pieceCount / 8), "bitfield");
 				const bits = this.buf.slice(at, at + len);
-				const spare = bits.length * 8 - g.pieceCount;
-				if (spare > 0 && (bits[bits.length - 1] & ((1 << spare) - 1)) !== 0) throw new WireProtocolError("bitfield has spare bits set");
+				if (g) checkBitfield(bits, g.pieceCount);
 				return { type: "bitfield", bits };
 			}
 			case MSG.REQUEST:
@@ -174,16 +222,34 @@ export class WireParser {
 				const piece = index(this.u32(at), "piece");
 				const begin = this.u32(at + 4);
 				const size = len - 8;
-				if (size === 0 || begin + size > pieceSizeOf(g, piece)) throw new WireProtocolError(`block ${piece}:${begin}+${size} outside the piece`);
+				if (size === 0 || (g && begin + size > pieceSizeOf(g, piece))) throw new WireProtocolError(`block ${piece}:${begin}+${size} outside the piece`);
 				return { type: "piece", piece, begin, data: this.buf.subarray(at + 8, at + len) };
 			}
 			case MSG.EXTENDED:
 				if (len < 1) throw new WireProtocolError("empty extended message");
 				return { type: "extended", id: this.buf[at], payload: this.buf.slice(at + 1, at + len) };
+			case MSG.HASH_REQUEST:
+			case MSG.HASH_REJECT:
+				exact(48, "hash request");
+				return { type: id === MSG.HASH_REQUEST ? "hash_request" : "hash_reject", request: this.hashRequest(at) };
+			case MSG.HASHES: {
+				if (len < 48 + 32 || (len - 48) % 32 !== 0) throw new WireProtocolError(`hashes with a ${len}-byte payload`);
+				return { type: "hashes", request: this.hashRequest(at), hashes: this.buf.slice(at + 48, at + len) };
+			}
 			default:
 				// port, suggest, allowed-fast and unknown ids: nothing we act on.
 				return { type: "other", id };
 		}
+	}
+
+	private hashRequest(at: number): HashRequest {
+		return {
+			piecesRoot: this.buf.slice(at, at + 32),
+			baseLayer: this.u32(at + 32),
+			index: this.u32(at + 36),
+			length: this.u32(at + 40),
+			proofLayers: this.u32(at + 44),
+		};
 	}
 
 	private append(chunk: Uint8Array): void {

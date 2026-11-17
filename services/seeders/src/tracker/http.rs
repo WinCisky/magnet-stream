@@ -3,6 +3,7 @@
 
 use super::{AnnounceParams, TrackerError};
 use crate::bencode::{self, Value};
+use crate::netguard;
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -13,6 +14,18 @@ pub async fn announce(
     params: &AnnounceParams,
     per_call_timeout: Duration,
 ) -> Result<Vec<SocketAddr>, TrackerError> {
+    // The client's DNS resolver applies the SSRF guard to host names, but an
+    // IP literal never goes through a resolver: check it here.
+    let literal = match url.host() {
+        Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
+        _ => None,
+    };
+    if let Some(ip) = literal {
+        if !params.allow_private && !netguard::is_public(ip) {
+            return Err(TrackerError::NoPublicAddress);
+        }
+    }
     let info_hash_enc = percent_encode(&params.info_hash, NON_ALPHANUMERIC).to_string();
     let peer_id_enc = percent_encode(&params.peer_id, NON_ALPHANUMERIC).to_string();
     let sep = if url.query().is_some() { '&' } else { '?' };

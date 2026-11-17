@@ -44,12 +44,29 @@ pub struct LookupResult {
 
 pub struct Lookup {
     http_client: reqwest::Client,
-    dht: Arc<DhtClient>,
+    /// None: trackers only (tests, or a node without a DHT socket).
+    dht: Option<Arc<DhtClient>>,
+    /// Let tracker URLs reach loopback/private addresses (tests only).
+    allow_private_trackers: bool,
 }
 
 impl Lookup {
     pub fn new(http_client: reqwest::Client, dht: Arc<DhtClient>) -> Self {
-        Self { http_client, dht }
+        Self {
+            http_client,
+            dht: Some(dht),
+            allow_private_trackers: false,
+        }
+    }
+
+    /// A lookup without DHT whose trackers may be on loopback.
+    #[cfg(test)]
+    pub fn trackers_only_for_tests(http_client: reqwest::Client) -> Self {
+        Self {
+            http_client,
+            dht: None,
+            allow_private_trackers: true,
+        }
     }
 
     pub async fn run(
@@ -59,6 +76,20 @@ impl Lookup {
         cfg: &Config,
     ) -> LookupResult {
         self.run_streaming(info_hash, magnet_trackers, cfg, None)
+            .await
+    }
+
+    /// Like `run_streaming` with every source given `deadline` instead of
+    /// `cfg.deadline` (the streamed `/peers` keeps sources ~30 s).
+    pub async fn run_streaming_for(
+        &self,
+        info_hash: [u8; 20],
+        magnet_trackers: Vec<String>,
+        cfg: &Config,
+        deadline: Duration,
+        found_tx: Option<UnboundedSender<Vec<SocketAddr>>>,
+    ) -> LookupResult {
+        self.lookup(info_hash, magnet_trackers, cfg, deadline, found_tx)
             .await
     }
 
@@ -72,14 +103,26 @@ impl Lookup {
         cfg: &Config,
         found_tx: Option<UnboundedSender<Vec<SocketAddr>>>,
     ) -> LookupResult {
+        self.lookup(info_hash, magnet_trackers, cfg, cfg.deadline, found_tx)
+            .await
+    }
+
+    async fn lookup(
+        &self,
+        info_hash: [u8; 20],
+        magnet_trackers: Vec<String>,
+        cfg: &Config,
+        deadline: Duration,
+        found_tx: Option<UnboundedSender<Vec<SocketAddr>>>,
+    ) -> LookupResult {
         let trackers = merge_trackers(magnet_trackers, &cfg.default_trackers, cfg.max_trackers);
-        let params = AnnounceParams::new(info_hash);
+        let mut params = AnnounceParams::new(info_hash);
+        params.allow_private = self.allow_private_trackers;
 
         let mut join_set = JoinSet::new();
         for url in trackers {
             let http_client = self.http_client.clone();
             let params = params.clone();
-            let deadline = cfg.deadline;
             join_set.spawn(async move {
                 match tokio::time::timeout(
                     deadline,
@@ -95,10 +138,13 @@ impl Lookup {
         }
 
         let dht = self.dht.clone();
-        let dht_deadline = cfg.deadline;
         let dht_tx = found_tx.clone();
-        let dht_handle =
-            tokio::spawn(async move { dht.get_peers(info_hash, dht_deadline, dht_tx).await });
+        let dht_handle = tokio::spawn(async move {
+            match dht {
+                Some(dht) => dht.get_peers(info_hash, deadline, dht_tx).await,
+                None => Vec::new(),
+            }
+        });
 
         let mut all_peers: HashSet<SocketAddr> = HashSet::new();
         let mut tracker_outcomes = Vec::new();

@@ -47,7 +47,7 @@ function parseIn(chunks: number): WireMessage[] {
 }
 
 describe("WireParser", () => {
-	it("gives the same messages whatever the chunk boundaries", () => {
+	it("gives the same messages whatever the chunk boundaries", async () => {
 		const whole = parseIn(1);
 		expect(whole.map((m) => m.type)).toEqual(["bitfield", "keepalive", "have", "unchoke", "piece", "reject", "extended", "choke"]);
 		for (let chunks = 2; chunks <= stream.length; chunks++) expect(parseIn(chunks)).toEqual(whole);
@@ -72,7 +72,7 @@ describe("WireParser", () => {
 		});
 	}
 
-	it("encodes requests", () => {
+	it("encodes requests", async () => {
 		expect([...encodeRequest(MSG.REQUEST, 1, 16384, 16384)]).toEqual([0, 0, 0, 13, 6, ...u32(1), ...u32(16384), ...u32(16384)]);
 	});
 });
@@ -100,10 +100,11 @@ class MemoryTransport extends BufferedTransport {
 }
 
 describe("PeerConnection", () => {
-	it("tracks pieces and choke state, delivers only requested blocks", () => {
+	it("tracks pieces and choke state, delivers only requested blocks", async () => {
 		const t = new MemoryTransport();
 		const blocks: string[] = [];
-		const conn = new PeerConnection(t, { ...geometry, keepAliveMs: 0, events: { block: (p, b, d) => blocks.push(`${p}:${b}:${d.length}`) } });
+		const conn = new PeerConnection(t, { geometry, keepAliveMs: 0, events: { block: (p, b, d) => blocks.push(`${p}:${b}:${d.length}`) } });
+		await Promise.resolve();
 		expect(t.sent[0]).toEqual(encodeMessage(MSG.HAVE_NONE));
 		t.push(encodeMessage(MSG.BITFIELD, Uint8Array.of(0b1010_0000, 0)));
 		expect([conn.has(0), conn.has(1), conn.has(2)]).toEqual([true, false, true]);
@@ -120,27 +121,30 @@ describe("PeerConnection", () => {
 		expect(blocks).toHaveLength(2);
 	});
 
-	it("ignores the peer's requests: it never uploads", () => {
+	it("ignores the peer's requests: it never uploads", async () => {
 		const t = new MemoryTransport();
-		new PeerConnection(t, { ...geometry, keepAliveMs: 0 });
+		new PeerConnection(t, { geometry, keepAliveMs: 0 });
+		await Promise.resolve();
 		t.push(encodeMessage(MSG.INTERESTED));
 		t.push(encodeRequest(MSG.REQUEST, 0, 0, 16384));
 		expect(t.sent).toEqual([encodeMessage(MSG.HAVE_NONE)]);
 	});
 
-	it("closes on a protocol violation", () => {
+	it("closes on a protocol violation", async () => {
 		const t = new MemoryTransport();
 		let error: Error | undefined;
-		const conn = new PeerConnection(t, { ...geometry, keepAliveMs: 0, events: { close: (e) => (error = e) } });
+		const conn = new PeerConnection(t, { geometry, keepAliveMs: 0, events: { close: (e) => (error = e) } });
+		await Promise.resolve();
 		t.push(encodeMessage(MSG.HAVE, Uint8Array.of(...u32(99))));
 		expect(conn.closed).toBe(true);
 		expect(error).toBeInstanceOf(WireProtocolError);
 		expect(t.closed).toBe(true);
 	});
 
-	it("without fast, a choke drops pending requests", () => {
+	it("without fast, a choke drops pending requests", async () => {
 		const t = new MemoryTransport(false);
-		const conn = new PeerConnection(t, { ...geometry, keepAliveMs: 0 });
+		const conn = new PeerConnection(t, { geometry, keepAliveMs: 0 });
+		await Promise.resolve();
 		expect(t.sent).toEqual([]); // no have-none without fast on both sides
 		t.push(encodeMessage(MSG.UNCHOKE));
 		conn.request([[0, 0, 16384]]);
@@ -148,12 +152,13 @@ describe("PeerConnection", () => {
 		expect(conn.outstandingRequests).toBe(0);
 	});
 
-	it("delivers bytes that arrived before it attached", () => {
+	it("delivers bytes that arrived before it attached", async () => {
 		const t = new MemoryTransport();
 		t.push(encodeMessage(MSG.HAVE_ALL));
 		t.end();
 		let closed = false;
-		const conn = new PeerConnection(t, { ...geometry, keepAliveMs: 0, events: { close: () => (closed = true) } });
+		const conn = new PeerConnection(t, { geometry, keepAliveMs: 0, events: { close: () => (closed = true) } });
+		await Promise.resolve();
 		expect(conn.has(9)).toBe(true);
 		expect(closed).toBe(true);
 	});

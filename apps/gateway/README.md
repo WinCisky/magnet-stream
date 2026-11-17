@@ -23,6 +23,15 @@ request stays roughly constant however many megabytes flow.
 > | `ALLOW_PRIVATE_PEERS` | `1`: tunnels may reach private/loopback peers. `wrangler dev` only (`.dev.vars` / `--var`), honoured only for loopback request URLs; never in `wrangler.jsonc` |
 > | `TUNNEL_CONNECT_TIMEOUT_MS`, `TUNNEL_HANDSHAKE_TIMEOUT_MS` | default 5000 / 10000 |
 > | `TUNNEL_MAX_CONNECTIONS` | default 6 (the protocol rule); raise only on a Phase 0 spike deployment |
+> | `TUNNEL_IDLE_TIMEOUT_MS` | default 90000: idle connections (`close` IDLE) and silent WebSockets are closed |
+> | `TUNNEL_SESSION_TIMEOUT_S` | default 7200: maximum session length (`close` SESSION_TIMEOUT, WebSocket code 4001) |
+> | `TUNNEL_SOCKETS_PER_SESSION` | default 3 WebSockets per `?session=` object, 6 connections each |
+> | `TUNNEL_FAILED_CONNECT_HOLD_MS` | default 20000: a timed-out connect keeps its slot this long (OQ-03) |
+> | `TUNNEL_UPGRADES_PER_MINUTE` | default 30 upgrades per minute per client IP, then 429 (Rate Limiting binding `UPGRADE_LIMITER`) |
+>
+> Values are validated: an unset variable takes its default, a malformed or
+> out-of-range one makes the gateway refuse tunnels with 500
+> `gateway_misconfigured` (and log the variable's name).
 >
 > Tests: `npm test` (unit), `npm run test:integration` (wrangler dev + fake
 > peers), `npm run e2e` (legacy `/v1/blocks`, random `TOKEN_SECRET`).

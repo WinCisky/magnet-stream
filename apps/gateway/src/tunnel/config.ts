@@ -1,7 +1,12 @@
-// Request-level policy of the tunnel route: Origin allow-list and the
-// local-only ALLOW_PRIVATE_PEERS switch.
+// Request-level policy of the tunnel route: Origin allow-list, the
+// local-only ALLOW_PRIVATE_PEERS switch, and the validated limits.
 
-import { MAX_CONNECTIONS_PER_SOCKET } from "@magnet-stream/tunnel-protocol";
+import {
+	DEFAULT_IDLE_TIMEOUT_MS,
+	DEFAULT_SESSION_TIMEOUT_S,
+	DEFAULT_SOCKETS_PER_SESSION,
+	MAX_CONNECTIONS_PER_SOCKET,
+} from "@magnet-stream/tunnel-protocol";
 
 export interface TunnelEnv {
 	/** Comma-separated origins allowed to open tunnels (and read CORS responses). */
@@ -18,31 +23,90 @@ export interface TunnelEnv {
 	/** Wait for the remote's handshake, ms (default 10000, 100..60000). */
 	TUNNEL_HANDSHAKE_TIMEOUT_MS?: string;
 	/**
-	 * Connections per WebSocket (default 6, the protocol rule). Only for the
-	 * Phase 0 spike (docs/spike-report.md), to observe what the platform
-	 * does past 6 (OQ-03); 1..16.
+	 * Connections per WebSocket (default 6, the protocol rule). Raise only on
+	 * a spike deployment (docs/spike-report.md, OQ-03); 1..16.
 	 */
 	TUNNEL_MAX_CONNECTIONS?: string;
+	/** A connection, or a WebSocket, with no traffic for this long is closed, ms (default 90000, 1000..600000). */
+	TUNNEL_IDLE_TIMEOUT_MS?: string;
+	/** Maximum session length, seconds (default 7200, 5..86400). */
+	TUNNEL_SESSION_TIMEOUT_S?: string;
+	/** WebSockets per session object (default 3, 1..8). */
+	TUNNEL_SOCKETS_PER_SESSION?: string;
+	/**
+	 * How long the slot of a connect that timed out stays taken, counted from
+	 * the connect, ms (default 20000, 0..60000). The platform keeps such a
+	 * connect pending for ~20 s and queues new ones behind it (OQ-03).
+	 */
+	TUNNEL_FAILED_CONNECT_HOLD_MS?: string;
+	/** WebSocket upgrades per minute per client IP (default 30, 1..600). */
+	TUNNEL_UPGRADES_PER_MINUTE?: string;
 }
 
 export interface TunnelLimits {
 	connectTimeoutMs: number;
 	handshakeTimeoutMs: number;
 	maxConnections: number;
+	idleTimeoutMs: number;
+	failedConnectHoldMs: number;
 }
 
-export function tunnelLimits(env: TunnelEnv): TunnelLimits {
-	const max = env.TUNNEL_MAX_CONNECTIONS;
-	return {
-		connectTimeoutMs: boundedMs(env.TUNNEL_CONNECT_TIMEOUT_MS, 5_000),
-		handshakeTimeoutMs: boundedMs(env.TUNNEL_HANDSHAKE_TIMEOUT_MS, 10_000),
-		maxConnections: max !== undefined && /^\d{1,2}$/.test(max) ? Math.min(16, Math.max(1, Number(max))) : MAX_CONNECTIONS_PER_SOCKET,
+export interface TunnelConfig extends TunnelLimits {
+	sessionTimeoutMs: number;
+	socketsPerSession: number;
+	upgradesPerMinute: number;
+}
+
+interface Rule {
+	key: keyof TunnelEnv;
+	min: number;
+	max: number;
+	fallback: number;
+}
+
+const RULES: Record<keyof Omit<TunnelConfig, "sessionTimeoutMs"> | "sessionTimeoutS", Rule> = {
+	connectTimeoutMs: { key: "TUNNEL_CONNECT_TIMEOUT_MS", min: 100, max: 60_000, fallback: 5_000 },
+	handshakeTimeoutMs: { key: "TUNNEL_HANDSHAKE_TIMEOUT_MS", min: 100, max: 60_000, fallback: 10_000 },
+	maxConnections: { key: "TUNNEL_MAX_CONNECTIONS", min: 1, max: 16, fallback: MAX_CONNECTIONS_PER_SOCKET },
+	idleTimeoutMs: { key: "TUNNEL_IDLE_TIMEOUT_MS", min: 1_000, max: 600_000, fallback: DEFAULT_IDLE_TIMEOUT_MS },
+	failedConnectHoldMs: { key: "TUNNEL_FAILED_CONNECT_HOLD_MS", min: 0, max: 60_000, fallback: 20_000 },
+	sessionTimeoutS: { key: "TUNNEL_SESSION_TIMEOUT_S", min: 5, max: 86_400, fallback: DEFAULT_SESSION_TIMEOUT_S },
+	socketsPerSession: { key: "TUNNEL_SOCKETS_PER_SESSION", min: 1, max: 8, fallback: DEFAULT_SOCKETS_PER_SESSION },
+	upgradesPerMinute: { key: "TUNNEL_UPGRADES_PER_MINUTE", min: 1, max: 600, fallback: 30 },
+};
+
+export type ConfigResult = { ok: true; config: TunnelConfig } | { ok: false; invalid: (keyof TunnelEnv)[] };
+
+/**
+ * Read and validate the tunnel limits. Unset (or empty) variables take their
+ * default; a value that is not a plain integer within its range makes the
+ * whole configuration invalid (the gateway then refuses every tunnel rather
+ * than run with limits nobody asked for).
+ */
+export function parseTunnelConfig(env: TunnelEnv): ConfigResult {
+	const invalid: (keyof TunnelEnv)[] = [];
+	const read = (rule: Rule): number => {
+		const raw = env[rule.key];
+		if (raw === undefined || raw.trim() === "") return rule.fallback;
+		const text = raw.trim();
+		const n = /^\d{1,9}$/.test(text) ? Number(text) : NaN;
+		if (!(n >= rule.min && n <= rule.max)) {
+			invalid.push(rule.key);
+			return rule.fallback;
+		}
+		return n;
 	};
-}
-
-function boundedMs(raw: string | undefined, fallback: number): number {
-	if (raw === undefined || !/^\d{1,6}$/.test(raw)) return fallback;
-	return Math.min(60_000, Math.max(100, Number(raw)));
+	const config: TunnelConfig = {
+		connectTimeoutMs: read(RULES.connectTimeoutMs),
+		handshakeTimeoutMs: read(RULES.handshakeTimeoutMs),
+		maxConnections: read(RULES.maxConnections),
+		idleTimeoutMs: read(RULES.idleTimeoutMs),
+		failedConnectHoldMs: read(RULES.failedConnectHoldMs),
+		sessionTimeoutMs: read(RULES.sessionTimeoutS) * 1000,
+		socketsPerSession: read(RULES.socketsPerSession),
+		upgradesPerMinute: read(RULES.upgradesPerMinute),
+	};
+	return invalid.length > 0 ? { ok: false, invalid } : { ok: true, config };
 }
 
 export function allowedOrigins(env: TunnelEnv): string[] {
@@ -55,8 +119,8 @@ export function allowedOrigins(env: TunnelEnv): string[] {
 /**
  * Whether a request's Origin may use the tunnel. Requests without an Origin
  * are not from a web page (browsers always send it on WebSocket upgrades):
- * they are allowed, like the PoC's other routes, since Origin only guards
- * against other sites driving a visitor's browser.
+ * they are allowed, since Origin only guards against other sites driving a
+ * visitor's browser; the per-IP upgrade limit applies to them too.
  */
 export function originAllowed(origin: string | null, env: TunnelEnv): boolean {
 	if (origin === null) return true;
@@ -74,4 +138,10 @@ const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
  */
 export function allowPrivatePeers(env: TunnelEnv, url: URL): boolean {
 	return env.ALLOW_PRIVATE_PEERS === "1" && LOOPBACK_HOSTS.has(url.hostname);
+}
+
+/** `?session=` names a session object shared by up to `socketsPerSession` WebSockets: 32 lowercase hex (128 random bits). */
+export function parseSessionName(raw: string | null): string | null | undefined {
+	if (raw === null) return null;
+	return /^[0-9a-f]{32}$/.test(raw) ? raw : undefined;
 }

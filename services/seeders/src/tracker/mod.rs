@@ -34,6 +34,9 @@ pub struct AnnounceParams {
     pub port: u16,
     pub key: u32,
     pub numwant: i32,
+    /// Let tracker URLs reach loopback/private addresses. Tests only: the
+    /// SSRF guard (netguard) is on in every real configuration.
+    pub allow_private: bool,
 }
 
 impl AnnounceParams {
@@ -47,6 +50,7 @@ impl AnnounceParams {
             port: 6881,
             key: rand::random(),
             numwant: 200,
+            allow_private: false,
         }
     }
 }
