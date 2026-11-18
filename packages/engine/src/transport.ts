@@ -24,6 +24,8 @@ export interface Transport {
 	readonly closed: boolean;
 	/** Queue bytes to the peer. */
 	send(bytes: Uint8Array): void;
+	/** Skip upstream batching (a cancel after a seek). Optional: direct transports have nothing to skip. */
+	sendUrgent?(bytes: Uint8Array): void;
 	/** Close the stream (idempotent). */
 	close(): void;
 	/** Start receiving. Bytes that arrived earlier are delivered first. */

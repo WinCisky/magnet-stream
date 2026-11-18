@@ -20,7 +20,8 @@
     "verify": "npm run verify:ts && npm run verify:rust",
     "fake-peer": "node tools/fake-peer/src/cli.ts",
     "spike": "node tools/spike/src/cli.ts",
-    "e2e": "npm run e2e -w tools/e2e && npm run test:integration -w apps/gateway && npm run e2e -w apps/gateway"
+    "e2e": "npm run e2e -w tools/e2e && npm run test:integration -w apps/gateway && npm run e2e -w apps/gateway && npm run e2e:browser -w tools/e2e",
+    "stack": "npm run stack -w tools/e2e"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.0",

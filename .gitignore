@@ -25,3 +25,6 @@ npm-debug.log*
 *.log
 .DS_Store
 .idea/
+
+# measurement output of the e2e runs (kept as CI artifacts)
+tools/e2e/results/

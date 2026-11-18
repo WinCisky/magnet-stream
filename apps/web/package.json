@@ -10,6 +10,7 @@
     "dev": "astro dev",
     "prebuild": "node scripts/fetch-codecs.mjs",
     "build": "astro build",
+    "check:dist": "node scripts/check-dist.mjs",
     "preview": "astro preview",
     "astro": "astro",
     "test": "vitest run",

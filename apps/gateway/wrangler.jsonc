@@ -3,9 +3,6 @@
 	"name": "magnet-stream-gateway",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-09-01",
-	// request.signal fires when the browser disconnects: that's how an idle
-	// pipe learns to close the peer socket (it only notices on its next write).
-	"compatibility_flags": ["enable_request_signal"],
 	"workers_dev": true,
 	// No custom route: the gateway is served at the address Cloudflare
 	// generates, https://magnet-stream-gateway.<account-subdomain>.workers.dev
@@ -29,9 +26,10 @@
 	"ratelimits": [{ "name": "UPGRADE_LIMITER", "namespace_id": "1001", "simple": { "limit": 6000, "period": 60 } }],
 	// ALLOW_PRIVATE_PEERS must never be set here (a test enforces it): it is
 	// for `wrangler dev` only, via .dev.vars or --var.
+	// ALLOWED_ORIGINS here is for local development. The deploy workflow
+	// replaces it with the site's origin (`--var ALLOWED_ORIGINS:…`, from the
+	// `production` environment's SITE_URL; docs/operations.md).
 	"vars": {
-		"ALLOWED_ORIGINS": "https://wincisky.github.io,http://localhost:4321"
+		"ALLOWED_ORIGINS": "http://localhost:4321"
 	}
-	// Secret, set with `npx wrangler secret put TOKEN_SECRET` (local dev reads
-	// it from .dev.vars): must equal magnet-seeders' WORKER_TOKEN_SECRET.
 }

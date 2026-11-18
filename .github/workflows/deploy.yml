@@ -1,0 +1,102 @@
+# Deploy the tunnel gateway (Cloudflare Worker) and the site (Cloudflare
+# Pages) after CI passed on a push to main. The VPS (services/seeders) is
+# deployed by hand (docs/operations.md).
+#
+# Runs only for pushes to main of this repository whose CI run succeeded:
+# never for pull requests or forks. Credentials are secrets of the
+# `production` environment (restricted to main); everything else is a
+# non-secret variable of that environment. Third-party actions pinned to SHAs.
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One deploy at a time; a newer one waits instead of cancelling a deploy halfway.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  WRANGLER_SEND_METRICS: "false"
+
+jobs:
+  deploy:
+    name: deploy gateway and site
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Exactly the commit CI tested.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+
+      - name: Check the environment's variables
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          PAGES_PROJECT: ${{ vars.PAGES_PROJECT }}
+          PUBLIC_SEEDERS_URL: ${{ vars.PUBLIC_SEEDERS_URL }}
+          PUBLIC_WORKER_URL: ${{ vars.PUBLIC_WORKER_URL }}
+        run: |
+          fail=0
+          for name in SITE_URL PAGES_PROJECT PUBLIC_SEEDERS_URL PUBLIC_WORKER_URL; do
+            if [ -z "${!name}" ]; then echo "::error::environment variable $name is not set"; fail=1; fi
+          done
+          for name in SITE_URL PUBLIC_SEEDERS_URL PUBLIC_WORKER_URL; do
+            case "${!name}" in https://*) ;; *) echo "::error::$name must be an https:// URL"; fail=1 ;; esac
+          done
+          if ! printf '%s' "$PAGES_PROJECT" | grep -Eq '^[a-z0-9][a-z0-9-]{0,57}$'; then
+            echo "::error::PAGES_PROJECT is not a valid Pages project name"; fail=1
+          fi
+          exit "$fail"
+
+      - name: Build the site
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          PUBLIC_SEEDERS_URL: ${{ vars.PUBLIC_SEEDERS_URL }}
+          PUBLIC_WORKER_URL: ${{ vars.PUBLIC_WORKER_URL }}
+        run: |
+          npm run build -w apps/web
+          npm run check:dist -w apps/web
+
+      - name: Deploy the gateway (wrangler deploy)
+        working-directory: apps/gateway
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SITE_URL: ${{ vars.SITE_URL }}
+        run: |
+          # Tunnels are accepted only from the site's origin (scheme://host[:port]).
+          origin=$(node -e 'console.log(new URL(process.env.SITE_URL).origin)')
+          npx wrangler deploy --var "ALLOWED_ORIGINS:${origin}"
+
+      - name: Deploy the site (wrangler pages deploy)
+        working-directory: apps/gateway
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PAGES_PROJECT: ${{ vars.PAGES_PROJECT }}
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          npx wrangler pages deploy ../web/dist \
+            --project-name "$PAGES_PROJECT" \
+            --branch main \
+            --commit-hash "$COMMIT_SHA" \
+            --commit-dirty=false

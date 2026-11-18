@@ -1,0 +1,10 @@
+# Cloudflare Pages response headers (docs/operations.md).
+# Cross-origin isolation for the player's threads (SharedArrayBuffer):
+# with these the page is isolated on first load and public/coi-sw.js
+# stays unregistered (it is removed in M3-05).
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Resource-Policy: same-origin
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer

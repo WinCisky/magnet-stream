@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { onMount } from "svelte";
 	import { ModeWatcher } from "mode-watcher";
-	import { fetchMetadata, fetchSeeders, warmUpSwarm, type TorrentMetadata } from "$lib/magnet/api";
+	import type { Metainfo } from "@magnet-stream/engine/metainfo";
+	import { type TorrentMetadata } from "$lib/magnet/api";
+	import { PageSession } from "$lib/torrent/page-session";
 	import { isVideoFile } from "$lib/magnet/files";
 	import { diagnostics } from "$lib/diagnostics/recorder";
 	import MagnetInputStep from "./magnet-input-step.svelte";
@@ -20,6 +22,9 @@
 	let currentMagnet = $state<string | null>(null);
 
 	let abortController: AbortController | null = null;
+	// Raw state: passed to the view as props; the objects themselves are not made reactive.
+	let session = $state.raw<PageSession | null>(null);
+	let knownMeta = $state.raw<Metainfo | null>(null);
 	/** Home was opened from a video's search button (for diagnostics). */
 	let searchFromVideo = false;
 
@@ -69,16 +74,22 @@
 		step = "input";
 
 		try {
-			const meta = await timed(() => fetchMetadata(magnetUri, controller.signal), controller.signal, (ms, e) =>
-				diagnostics.metadataApi(ms, e),
+			session?.close();
+			const current = new PageSession();
+			session = current;
+			// A lookup that fails must not leave its worker and WebSockets behind.
+			const lookedUp = await timed(
+				() => current.lookup(magnetUri).catch((e: unknown) => {
+					current.close();
+					if (session === current) session = null;
+					throw e;
+				}),
+				controller.signal,
+				(ms, e) => diagnostics.metadataApi(ms, e)
 			);
-			// Let magnet-seeders probe the swarm and fetch the piece hashes
-			// while the user is still choosing a file.
-			warmUpSwarm(magnetUri, meta.info_hash);
-			verifyPhase = "seeders";
-			const count = await timed(() => fetchSeeders(meta.info_hash, controller.signal), controller.signal, (ms, e) =>
-				diagnostics.seedersCount(ms, e),
-			);
+			const meta = lookedUp.metadata;
+			knownMeta = lookedUp.meta;
+			const count = lookedUp.seeders;
 
 			const videos = meta.files
 				.map((file, index) => ({ file, index }))
@@ -86,6 +97,9 @@
 
 			if (videos.length === 0) {
 				diagnostics.count("no_video_in_magnet");
+				session?.close();
+				session = null;
+				knownMeta = null;
 				metadata = null;
 				currentMagnet = null;
 				seedersCount = null;
@@ -166,6 +180,9 @@
 
 		if (!magnet) {
 			abortController?.abort();
+			session?.close();
+			session = null;
+			knownMeta = null;
 			abortController = null;
 			verifying = false;
 			verifyPhase = null;
@@ -263,6 +280,8 @@
 			torrentName={metadata.name}
 			magnet={currentMagnet}
 			infoHash={metadata.info_hash}
+			session={session}
+			knownMeta={knownMeta}
 			seeders={seedersCount}
 			onSelect={handleSelect}
 			onHome={() => navigate(null)}

@@ -8,8 +8,6 @@ const MIN_REFRESH_GAP_MS = 30_000;
 /** magnet-seeders answers before it has probed everyone: ask again soon. */
 export const PARTIAL_POLL_MS = 1_500;
 const MAX_PARTIAL_POLLS = 20;
-/** Don't hand the worker a token this close to expiring. */
-const TOKEN_MARGIN_S = 30;
 /** Up to this many parallel connections to a peer that serves us fast. */
 const MAX_CONNS = 3;
 /** A win at this rate earns the peer another connection slot. */
@@ -25,8 +23,6 @@ export const MAX_TENTATIVE = 2;
 
 export interface Peer {
 	addr: string;
-	token: string;
-	tokenExp: number;
 	/** magnet-seeders reached it over TCP. */
 	probedOk: boolean;
 	/** Why magnet-seeders' probe failed ("probing": not done yet). */
@@ -80,7 +76,6 @@ export type FailureReason =
 	| "stalled"
 	| "choked_midway"
 	| "slow"
-	| "bad_token"
 	| string;
 
 export class Swarm {
@@ -114,7 +109,7 @@ export class Swarm {
 		clearTimeout(this.pollTimer);
 	}
 
-	/** Refresh now, unless we just did (tokens rejected, or out of peers). */
+	/** Refresh now, unless we just did (out of peers, or a refusal). */
 	refreshSoon(): void {
 		if (this.now() - this.lastRefresh >= MIN_REFRESH_GAP_MS) void this.refresh();
 	}
@@ -143,16 +138,12 @@ export class Swarm {
 	}
 
 	merge(snapshot: SwarmSnapshot): void {
-		const exp = snapshot.token_exp ?? 0;
 		for (const p of snapshot.peers) {
-			if (!p.t) continue;
 			const known = this.peers.get(p.addr);
-			const fresh = fromSnapshot(p, exp);
+			const fresh = fromSnapshot(p);
 			if (known) {
-				// Keep what we learned; take the new token and probe results.
+				// Keep what we learned; take the new probe results.
 				Object.assign(known, {
-					token: fresh.token,
-					tokenExp: fresh.tokenExp,
 					probedOk: fresh.probedOk,
 					probeErr: fresh.probeErr,
 					seed: fresh.seed || known.seed,
@@ -229,7 +220,6 @@ export class Swarm {
 		const tiers = new Map<Peer, number>();
 		for (const peer of this.peers.values()) {
 			if (exclude.has(peer.addr) || peer.banned || peer.tentative >= MAX_TENTATIVE) continue;
-			if (peer.tokenExp - TOKEN_MARGIN_S < now / 1000) continue;
 			if (peer.have && !this.hasPiece(peer, pieces[0])) continue;
 			const resting = peer.backoffUntil > now;
 			const unreachable = peer.lastFailure === "connect_failed" || peer.lastFailure === "connect_timeout";
@@ -261,12 +251,7 @@ export class Swarm {
 
 	/** Usable now and with a free connection slot (`extra`: over the limit). */
 	available(peer: Peer, now = this.now(), extra = 0): boolean {
-		return (
-			!peer.banned &&
-			peer.backoffUntil <= now &&
-			peer.tokenExp - TOKEN_MARGIN_S >= now / 1000 &&
-			peer.active < this.connLimit(peer, now) + extra
-		);
+		return !peer.banned && peer.backoffUntil <= now && peer.active < this.connLimit(peer, now) + extra;
 	}
 
 	/** Is any peer free to take a request right now? */
@@ -276,12 +261,12 @@ export class Swarm {
 		return false;
 	}
 
-	/** Peers not banned, resting or out of tokens (busy or not). */
+	/** Peers not banned or resting (busy or not). */
 	usableCount(): number {
 		const now = this.now();
 		let n = 0;
 		for (const peer of this.peers.values()) {
-			if (!peer.banned && peer.backoffUntil <= now && peer.tokenExp - TOKEN_MARGIN_S >= now / 1000) n++;
+			if (!peer.banned && peer.backoffUntil <= now) n++;
 		}
 		return n;
 	}
@@ -329,7 +314,7 @@ export class Swarm {
 	holderFreeSoon(piece: number, withinMs = 60_000, quickOnly = false): boolean {
 		const now = this.now();
 		for (const peer of this.peers.values()) {
-			if (peer.banned || peer.tokenExp - TOKEN_MARGIN_S < now / 1000 || !this.hasPiece(peer, piece)) continue;
+			if (peer.banned || !this.hasPiece(peer, piece)) continue;
 			if (quickOnly && !isQuickUnchoker(peer)) continue;
 			if (peer.active > 0 || peer.backoffUntil - now < withinMs) return true;
 		}
@@ -340,7 +325,7 @@ export class Swarm {
 	otherHolder(piece: number, peer: Peer): boolean {
 		const now = this.now();
 		for (const other of this.peers.values()) {
-			if (other === peer || other.banned || other.tokenExp - TOKEN_MARGIN_S < now / 1000) continue;
+			if (other === peer || other.banned) continue;
 			if (other.backoffUntil - now < 30_000 && this.hasPiece(other, piece)) return true;
 		}
 		return false;
@@ -348,9 +333,8 @@ export class Swarm {
 
 	/** Can anyone (idle or not) serve this piece? For "no known source". */
 	anyoneHas(piece: number): boolean {
-		const nowS = this.now() / 1000;
 		for (const peer of this.peers.values()) {
-			if (!peer.banned && peer.tokenExp - TOKEN_MARGIN_S >= nowS && this.hasPiece(peer, piece)) return true;
+			if (!peer.banned && this.hasPiece(peer, piece)) return true;
 		}
 		return false;
 	}
@@ -395,10 +379,6 @@ export class Swarm {
 			// to one connection for a while.
 			peer.maxConns = 1;
 			peer.singleConnUntil = this.now() + SINGLE_CONN_MS;
-			return;
-		}
-		if (reason === "bad_token") {
-			this.refreshSoon();
 			return;
 		}
 		if (reason === "infohash_mismatch" || reason === "bad_handshake") {
@@ -497,11 +477,9 @@ export function score(peer: Peer, now = Date.now()): number {
 	return s + Math.random() * 0.25;
 }
 
-function fromSnapshot(p: SwarmPeer, tokenExp: number): Peer {
+function fromSnapshot(p: SwarmPeer): Peer {
 	return {
 		addr: p.addr,
-		token: p.t ?? "",
-		tokenExp,
 		probedOk: p.ok,
 		probeErr: p.ok ? null : (p.err ?? "unknown"),
 		seed: p.ok && p.seed,

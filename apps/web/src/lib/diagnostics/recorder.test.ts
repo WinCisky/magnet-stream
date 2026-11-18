@@ -36,6 +36,7 @@ function snapshot(over: Partial<EngineSnapshot>): EngineSnapshot {
 		peers: { known: 50, reachable: 12, seeds: 10, active: 3, connections: 4, usable: 12, backedOff: 1, banned: 0 },
 		storage: "cache",
 		swarmError: null,
+		tunnel: null,
 		...over,
 	};
 }

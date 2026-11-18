@@ -1,6 +1,4 @@
 # Copy to .dev.vars for `wrangler dev`. Placeholders only: never commit real values.
-# Shared with services/seeders' WORKER_TOKEN_SECRET (legacy /v1/blocks).
-TOKEN_SECRET=change-me
 # Local tests only: let tunnels reach peers on 127.0.0.1 / private networks.
 # Honoured only for requests to a loopback host; never set it in wrangler.jsonc.
 ALLOW_PRIVATE_PEERS=1

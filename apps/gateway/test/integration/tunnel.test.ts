@@ -160,6 +160,12 @@ describe("tunnel through wrangler dev", () => {
 		expect(await upgrade(dev.url, { origin: "http://localhost:4321", "sec-websocket-protocol": SUBPROTOCOL })).toBe(101);
 	});
 
+	it("removed block and info routes answer 404", async () => {
+		for (const path of ["/v1/" + "blocks", "/v1/" + "info"]) {
+			expect((await fetch(`${dev.url}${path}`)).status).toBe(404);
+		}
+	});
+
 	it("requires the subprotocol and an upgrade", async () => {
 		expect(await upgrade(dev.url, {})).toBe(400);
 		expect((await fetch(`${dev.url}/v1/tunnel`)).status).toBe(426);

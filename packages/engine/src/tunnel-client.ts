@@ -5,7 +5,9 @@
 import {
 	CLIENT_CONN_MAX,
 	CLIENT_CONN_MIN,
+	CLOSE_SLOT_GRACE_MS,
 	CloseReason,
+	FAILED_CONNECT_HOLD_MS,
 	FailReason,
 	MAX_CONNECTIONS_PER_SOCKET,
 	SUBPROTOCOL,
@@ -16,6 +18,7 @@ import {
 	type PeerAddress,
 } from "@magnet-stream/tunnel-protocol";
 import { BufferedTransport, type HandshakeInfo } from "./transport.ts";
+import { UpstreamBatcher } from "./upstream.ts";
 
 /** The part of the WebSocket API the client uses (browser, worker or Node). */
 export interface WebSocketLike {
@@ -48,6 +51,17 @@ export interface TunnelStats {
 	framesReceived: number;
 	bytesSent: number;
 	bytesReceived: number;
+}
+
+export interface TunnelClientOptions {
+	maxConnections?: number;
+	/**
+	 * Coalesce outbound frames into one message per interval (default off,
+	 * so existing callers stay synchronous). The connection manager uses 400.
+	 */
+	batchMs?: number;
+	/** Clock for the held slots (tests). */
+	now?: () => number;
 }
 
 /** An `open` that produced `failed` (or no answer). */
@@ -89,6 +103,7 @@ interface Pending {
 	reject(e: Error): void;
 	timer: ReturnType<typeof setTimeout>;
 	reserved: Uint8Array;
+	startedAt: number;
 }
 
 export class TunnelClient {
@@ -96,8 +111,16 @@ export class TunnelClient {
 	private readonly ws: WebSocketLike;
 	private readonly pending = new Map<number, Pending>();
 	private readonly transports = new Map<number, TunnelTransport>();
+	/**
+	 * Slots the gateway still counts as taken although no connection uses
+	 * them: a connect that timed out (until FAILED_CONNECT_HOLD_MS after it
+	 * started) and a socket that is closing (CLOSE_SLOT_GRACE_MS). Expiry times.
+	 */
+	private held: number[] = [];
+	private readonly now: () => number;
 	private nextConn = CLIENT_CONN_MIN;
 	private ended: Error | undefined;
+	private readonly batcher: UpstreamBatcher | undefined;
 	/** Called once when the session ends. */
 	onClose: ((error?: Error) => void) | undefined;
 
@@ -105,9 +128,13 @@ export class TunnelClient {
 	readonly maxConnections: number;
 
 	/** Wrap an already open WebSocket. */
-	constructor(ws: WebSocketLike, options: { maxConnections?: number } = {}) {
+	constructor(ws: WebSocketLike, options: TunnelClientOptions = {}) {
 		this.ws = ws;
+		this.now = options.now ?? Date.now;
 		this.maxConnections = options.maxConnections ?? MAX_CONNECTIONS_PER_SOCKET;
+		if (options.batchMs !== undefined && options.batchMs > 0) {
+			this.batcher = new UpstreamBatcher({ intervalMs: options.batchMs, send: (frames) => this.writeNow(frames) });
+		}
 		ws.binaryType = "arraybuffer";
 		ws.addEventListener("message", (e) => this.onMessage(e.data));
 		ws.addEventListener("close", (e) => this.end(new Error(`tunnel WebSocket closed (${e.code ?? "?"})`)));
@@ -115,7 +142,7 @@ export class TunnelClient {
 	}
 
 	/** Open a WebSocket to `url` (…/v1/tunnel) and wait until it is ready. */
-	static connect(url: string, options: { factory?: WebSocketFactory; timeoutMs?: number; maxConnections?: number } = {}): Promise<TunnelClient> {
+	static connect(url: string, options: { factory?: WebSocketFactory; timeoutMs?: number } & TunnelClientOptions = {}): Promise<TunnelClient> {
 		const factory: WebSocketFactory = options.factory ?? ((u, p) => new WebSocket(u, p) as unknown as WebSocketLike);
 		const ws = factory(url, SUBPROTOCOL);
 		return new Promise((resolve, reject) => {
@@ -130,7 +157,7 @@ export class TunnelClient {
 					reject(new Error(`gateway does not speak ${SUBPROTOCOL}`));
 					return;
 				}
-				resolve(new TunnelClient(ws, { maxConnections: options.maxConnections }));
+				resolve(new TunnelClient(ws, options));
 			});
 			ws.addEventListener("error", () => {
 				clearTimeout(timer);
@@ -143,9 +170,19 @@ export class TunnelClient {
 		return this.ended !== undefined;
 	}
 
-	/** Connections opening or open. */
+	/** Slots taken at the gateway: connections opening or open, and slots it still holds. */
 	get connections(): number {
-		return this.pending.size + this.transports.size;
+		return this.pending.size + this.transports.size + this.heldSlots();
+	}
+
+	/** Slots held after a failed connect or a close (see `held`). */
+	heldSlots(now = this.now()): number {
+		if (this.held.length > 0) this.held = this.held.filter((until) => until > now);
+		return this.held.length;
+	}
+
+	private hold(until: number): void {
+		this.held.push(until);
 	}
 
 	/** Ask the gateway to connect to a peer; resolves once its handshake was checked. */
@@ -158,11 +195,13 @@ export class TunnelClient {
 		const reserved = request.reserved ?? DEFAULT_RESERVED;
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
-				if (!this.pending.delete(conn)) return;
+				const p = this.pending.get(conn);
+				if (!p || !this.pending.delete(conn)) return;
+				this.hold(p.startedAt + FAILED_CONNECT_HOLD_MS + CLOSE_SLOT_GRACE_MS);
 				this.send([{ type: "close", conn, reason: CloseReason.NORMAL }]);
 				reject(new TunnelOpenError(FailReason.TIMEOUT, "no answer from the gateway"));
 			}, request.timeoutMs ?? 20_000);
-			this.pending.set(conn, { resolve, reject, timer, reserved });
+			this.pending.set(conn, { resolve, reject, timer, reserved, startedAt: this.now() });
 			this.send([{ type: "open", conn, infoHash: request.infoHash, reserved, peerId: request.peerId, address }]);
 		});
 	}
@@ -175,9 +214,21 @@ export class TunnelClient {
 		this.end();
 	}
 
-	/** @internal */
-	send(frames: Frame[]): void {
+	/** @internal Queue frames. `urgent` flushes the batch immediately. */
+	send(frames: Frame[], urgent = false): void {
 		if (this.ended || this.ws.readyState !== WS_OPEN) return;
+		if (this.batcher) this.batcher.enqueue(frames, urgent);
+		else this.writeNow(frames);
+	}
+
+	/** A ping if this socket has been quiet for `interval` (no-op while a batch is waiting). */
+	pingIfIdle(now: number, interval: number): boolean {
+		if (this.ended) return false;
+		return this.batcher?.pingIfIdle(now, interval) ?? false;
+	}
+
+	private writeNow(frames: Frame[]): void {
+		if (this.ended || this.ws.readyState !== WS_OPEN || frames.length === 0) return;
 		const message = encodeFrames(frames);
 		this.stats.messagesSent++;
 		this.stats.framesSent += frames.length;
@@ -185,10 +236,10 @@ export class TunnelClient {
 		this.ws.send(message);
 	}
 
-	/** @internal A transport closed locally. */
+	/** @internal A transport closed locally. The close is urgent: the slot must free before the next dial. */
 	release(conn: number, notifyGateway: boolean): void {
-		this.transports.delete(conn);
-		if (notifyGateway) this.send([{ type: "close", conn, reason: CloseReason.NORMAL }]);
+		if (this.transports.delete(conn)) this.hold(this.now() + CLOSE_SLOT_GRACE_MS);
+		if (notifyGateway) this.send([{ type: "close", conn, reason: CloseReason.NORMAL }], true);
 	}
 
 	private allocateConn(): number | undefined {
@@ -236,6 +287,14 @@ export class TunnelClient {
 				if (!p) return;
 				this.pending.delete(frame.conn);
 				clearTimeout(p.timer);
+				// Mirror the gateway: a connect that timed out keeps its slot (OQ-03),
+				// counted from when the gateway started it (a little after we sent
+				// the open: hence the grace); any other failure frees the slot once
+				// the gateway's socket has closed. A refusal for lack of slots means
+				// we counted wrong, so back off briefly.
+				if (frame.reason === FailReason.TIMEOUT) this.hold(p.startedAt + FAILED_CONNECT_HOLD_MS + CLOSE_SLOT_GRACE_MS);
+				else if (frame.reason === FailReason.TOO_MANY_CONNECTIONS) this.hold(this.now() + 2 * CLOSE_SLOT_GRACE_MS);
+				else this.hold(this.now() + CLOSE_SLOT_GRACE_MS);
 				p.reject(new TunnelOpenError(frame.reason));
 				return;
 			}
@@ -245,7 +304,7 @@ export class TunnelClient {
 				return;
 			case "close": {
 				const t = this.transports.get(frame.conn);
-				this.transports.delete(frame.conn);
+				if (this.transports.delete(frame.conn)) this.hold(this.now() + CLOSE_SLOT_GRACE_MS);
 				t?.remoteClosed(frame.reason);
 				// A close for a pending open: the gateway gave up on it.
 				const p = this.pending.get(frame.conn);
@@ -272,6 +331,7 @@ export class TunnelClient {
 	private end(error?: Error): void {
 		if (this.ended) return;
 		this.ended = error ?? new Error("tunnel closed");
+		this.batcher?.cancel();
 		for (const p of this.pending.values()) {
 			clearTimeout(p.timer);
 			p.reject(new TunnelOpenError(0, "tunnel session ended"));
@@ -299,12 +359,20 @@ export class TunnelTransport extends BufferedTransport {
 	}
 
 	send(bytes: Uint8Array): void {
+		this.write(bytes, false);
+	}
+
+	sendUrgent(bytes: Uint8Array): void {
+		this.write(bytes, true);
+	}
+
+	private write(bytes: Uint8Array, urgent: boolean): void {
 		if (this.closed) return;
 		const frames: Frame[] = [];
 		for (let at = 0; at < bytes.length; at += MAX_DATA_FRAME) {
 			frames.push({ type: "data", conn: this.conn, payload: bytes.subarray(at, at + MAX_DATA_FRAME) });
 		}
-		if (frames.length > 0) this.client.send(frames);
+		if (frames.length > 0) this.client.send(frames, urgent);
 	}
 
 	close(): void {

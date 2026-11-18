@@ -117,6 +117,8 @@ export class PeerConnection {
 	private haveAll = false;
 	private readonly outstanding = new Map<string, number>();
 	private keepAliveTimer: ReturnType<typeof setInterval> | undefined;
+	/** When we last wrote to the peer (Date.now()). */
+	lastSentAt = Date.now();
 
 	constructor(transport: Transport, options: PeerConnectionOptions = {}) {
 		this.transport = transport;
@@ -249,7 +251,8 @@ export class PeerConnection {
 		const length = this.outstanding.get(key);
 		if (length === undefined) return;
 		this.outstanding.delete(key);
-		this.write(encodeRequest(MSG.CANCEL, piece, begin, length));
+		// A cancel after a seek must not wait for the upstream batch timer.
+		this.write(encodeRequest(MSG.CANCEL, piece, begin, length), true);
 	}
 
 	/** Send an extension message the peer accepts; false if it doesn't. */
@@ -270,8 +273,16 @@ export class PeerConnection {
 		this.transport.close();
 	}
 
-	private write(bytes: Uint8Array): void {
-		if (!this.closed && !this.transport.closed) this.transport.send(bytes);
+	/** Send a keep-alive now (a caller that schedules them itself passes keepAliveMs: 0). */
+	sendKeepAlive(): void {
+		this.write(keepAlive());
+	}
+
+	private write(bytes: Uint8Array, urgent = false): void {
+		if (this.closed || this.transport.closed) return;
+		this.lastSentAt = Date.now();
+		if (urgent && this.transport.sendUrgent) this.transport.sendUrgent(bytes);
+		else this.transport.send(bytes);
 	}
 
 	private fail(error: WireProtocolError): void {

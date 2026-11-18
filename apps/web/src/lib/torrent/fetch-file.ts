@@ -2,7 +2,9 @@
 // from the video's recovery: its own engine, pieces kept in memory only, so
 // nothing is saved or listed among the saved videos.
 
+import type { Metainfo } from "@magnet-stream/engine/metainfo";
 import { RecoveryEngine } from "./engine";
+import type { PageSession } from "./page-session";
 import { MemoryPieceStore } from "./store";
 
 const MAX_BYTES = 10 * 1024 * 1024;
@@ -12,11 +14,15 @@ export async function recoverFile({
 	infoHash,
 	magnet,
 	file,
+	session,
+	meta,
 	signal,
 }: {
 	infoHash: string;
 	magnet: string;
 	file: { path: string; offset: number; size: number };
+	session: PageSession;
+	meta: Metainfo;
 	signal?: AbortSignal;
 }): Promise<Uint8Array> {
 	signal?.throwIfAborted();
@@ -32,6 +38,8 @@ export async function recoverFile({
 		infoHash,
 		magnet,
 		file,
+		session,
+		knownMeta: meta,
 		store: new MemoryPieceStore(),
 		onSnapshot: (s) => {
 			if (s.phase === "complete") done();

@@ -24,6 +24,15 @@ export const DEFAULT_SESSION_TIMEOUT_S = 7_200;
 /** WebSockets per session (one Durable Object); each carries its own 6 connections. */
 export const DEFAULT_SOCKETS_PER_SESSION = 3;
 /**
+ * A connect that timed out keeps its slot taken until this long after it
+ * started: the platform keeps it pending that long and queues new connects
+ * behind it (docs/spike-report.md, OQ-03). Gateways hold the slot; clients
+ * count it as taken too, or their next `open` gets TOO_MANY_CONNECTIONS.
+ */
+export const FAILED_CONNECT_HOLD_MS = 20_000;
+/** A slot frees only once the gateway's socket has closed: clients wait this long after a close. */
+export const CLOSE_SLOT_GRACE_MS = 1_000;
+/**
  * The client sends `ping` when it has sent nothing else for this long, so a
  * quiet but live session never hits the gateway's idle timeout (90 s).
  * Three per idle timeout: one lost or late message does not end the session.

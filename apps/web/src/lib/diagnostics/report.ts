@@ -3,6 +3,7 @@
 // fine show at a glance. Loaded only when the user exports.
 
 import type { Environment } from "./env";
+import { measurementRow, phaseMetrics } from "./phase";
 import type { Milestone, PlaybackRecord, RecoveryRecord, Timed, VisitRecord } from "./records";
 import { MS_BOUNDS, RATE_BOUNDS, add, hist, merge, mergeCounts, quantile, type Counts, type Hist } from "./stats";
 
@@ -66,7 +67,7 @@ export function buildReport(input: ReportInput) {
 	const recoveries = visits.flatMap((v) => v.recoveries);
 	const health: Record<string, PartHealth> = {
 		metadataApi: requests(
-			"Torrent lookup (magnet → file list, magnet-seeders /files)",
+			"Torrent lookup (magnet → file list: /peers, tunnel, BEP 9)",
 			mergeTimed(visits.map((v) => v.metadataApi)),
 			THRESHOLDS.metadataApi,
 		),
@@ -115,6 +116,10 @@ export function buildReport(input: ReportInput) {
 			browsers: [...new Set(visits.map((v) => `${v.env.browser} on ${v.env.os}`))],
 			builds: [...new Set(visits.map((v) => v.build))],
 		},
+		/** The three numbers each phase is measured on (docs/measurements.md). */
+		phaseMetrics: phaseMetrics(recoveries),
+		/** Rows for the real-world table of docs/measurements.md, newest last. */
+		measurementRows: recoveries.filter((r) => r.outcome !== "running").map((r) => measurementRow(r, input.build)),
 		weakSpots: parts
 			.filter(([, p]) => p.status === "poor" || p.status === "fair")
 			.map(([part, p]) => ({ part, title: p.title, status: p.status, summary: p.summary })),

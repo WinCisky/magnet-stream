@@ -50,6 +50,8 @@ export interface PeerBehaviour {
 	unchoke?: boolean;
 	/** Delay before the unchoke (default 0). */
 	unchokeDelayMs?: number;
+	/** Minimum gap between served blocks, so a download lasts long enough to interrupt. */
+	blockGapMs?: number;
 	/** Choke (and reject, with fast) once this many blocks were served. */
 	chokeAfterBlocks?: number;
 	/** Hang up right after the handshake. */
@@ -190,6 +192,7 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 		let remoteExt: Map<string, BDecoded> | undefined;
 		let served = 0;
 		let metadataServed = 0;
+		let nextBlockAt = 0;
 
 		const send = (data: Uint8Array) => {
 			if (!socket.destroyed && socket.writable) socket.write(data);
@@ -314,8 +317,16 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 			const header = Buffer.alloc(8);
 			header.writeUInt32BE(piece, 0);
 			header.writeUInt32BE(begin, 4);
-			send(frame(MSG.PIECE, concat([header, block])));
-			if (b.closeAfterBlocks !== undefined && served >= b.closeAfterBlocks) socket.end();
+			const pieceFrame = frame(MSG.PIECE, concat([header, block]));
+			const gap = b.blockGapMs ?? 0;
+			const wait = gap > 0 ? Math.max(0, nextBlockAt - Date.now()) : 0;
+			if (gap > 0) nextBlockAt = Date.now() + wait + gap;
+			const deliver = () => {
+				send(pieceFrame);
+				if (b.closeAfterBlocks !== undefined && served >= b.closeAfterBlocks) socket.end();
+			};
+			if (wait > 0) later(wait, deliver);
+			else deliver();
 		};
 
 		socket.on("data", (chunk: Buffer) => {

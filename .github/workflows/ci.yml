@@ -1,5 +1,6 @@
-# Lint, typecheck, tests (TS + Rust), web build, dependency audit and secret
-# scan on every push and pull request. Read-only token, no repository
+# Lint, typecheck, tests (TS + Rust), web build, gateway bundle, workflow
+# lint, dependency audit and secret scan on every push and pull request.
+# A green run on main triggers deploy.yml. Read-only token, no repository
 # secrets; third-party actions pinned to commit SHAs.
 name: CI
 
@@ -37,8 +38,33 @@ jobs:
       - run: npm ci
       - name: npm run verify (lint, typecheck, TS tests, cargo fmt/clippy/test)
         run: npm run verify
-      - name: Build apps/web
-        run: npm run build -w apps/web
+      - name: Build apps/web (Cloudflare Pages layout)
+        run: |
+          npm run build -w apps/web
+          npm run check:dist -w apps/web
+      - name: Bundle the gateway (wrangler deploy --dry-run)
+        working-directory: apps/gateway
+        run: npx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/gateway-bundle"
+
+  workflows:
+    name: workflow lint (actionlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint (checksum-verified release binary)
+        run: |
+          curl -sSfL -o actionlint.tgz "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tgz" | sha256sum -c -
+          tar -xzf actionlint.tgz actionlint
+          rm actionlint.tgz
+      - name: Lint .github/workflows
+        run: ./actionlint -color
 
   e2e:
     name: e2e (fake peer -> wrangler dev -> engine)
@@ -53,7 +79,21 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - name: Chromium for the browser session e2e (Playwright's build)
+        run: npx playwright-core install --with-deps chromium
       - run: npm run e2e
+        env:
+          # The browser e2e enforces the billed-request budget: never skip it here.
+          REQUIRE_BROWSER_E2E: "1"
+      # The synthetic phase numbers of this run (docs/measurements.md).
+      - name: Keep the measurements
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: measurements
+          path: tools/e2e/results/
+          if-no-files-found: ignore
+          retention-days: 90
 
   dependencies:
     name: dependency audit (npm high+, cargo)

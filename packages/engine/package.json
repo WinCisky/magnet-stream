@@ -3,7 +3,7 @@
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
-	"description": "Browser BitTorrent engine: tunnel client, peer-wire, verified downloads",
+	"description": "Browser BitTorrent engine: tunnel client, peer-wire, metadata, peer exchange, verified downloads",
 	"exports": {
 		".": "./src/index.ts",
 		"./metainfo": "./src/metainfo.ts",
@@ -20,6 +20,7 @@
 	},
 	"devDependencies": {
 		"@magnet-stream/fake-peer": "0.1.0",
+		"@magnet-stream/harness": "0.1.0",
 		"@types/node": "^24.19.2",
 		"typescript": "^6.0.3",
 		"vitest": "^5.0.2"

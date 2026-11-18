@@ -960,7 +960,7 @@ export class Scheduler {
 		const elapsed = Date.now() - (batch.firstDataAt || batch.startedAt);
 		if (end.kind === "error" || end.kind === "refused") {
 			// Worker or network trouble (a Cloudflare limit, say), or a request
-			// the worker won't take (expired tokens, a 429): not the peers'
+			// the worker won't take (a 429, say): not the peers'
 			// fault. Back off globally so we don't hammer it: a refusal answers
 			// in milliseconds, and relaunching at once would be a request storm
 			// eating the worker's daily quota. Requests in flight together tend
@@ -1001,7 +1001,7 @@ export class Scheduler {
 				this.learn(end.others);
 				break;
 			case "refused":
-				if (end.status === 403) swarm.refreshSoon(); // tokens expired
+				if (end.status === 403) swarm.refreshSoon();
 				break;
 		}
 		queueMicrotask(() => this.tick());

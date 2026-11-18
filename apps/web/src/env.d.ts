@@ -7,3 +7,9 @@ interface ImportMetaEnv {
 
 /** When this build was made (set in astro.config.mjs); diagnostics report it. */
 declare const __MW_BUILD__: string | undefined;
+
+/** Vite bundles the session worker into a blob so COEP does not block the script. */
+declare module "*?worker&inline" {
+	const worker: new () => Worker;
+	export default worker;
+}

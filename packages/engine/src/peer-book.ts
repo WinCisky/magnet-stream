@@ -10,6 +10,7 @@
 // flooding pex messages cannot grow it without limit.
 
 import { checkAddress, formatAddress, parseAddress, type PeerAddress } from "@magnet-stream/tunnel-protocol";
+import type { PexMessage } from "./extension.ts";
 
 export type PeerOrigin = "discovery" | "pex" | "magnet" | "manual";
 
@@ -41,8 +42,11 @@ export interface PeerEntry {
 }
 
 export interface PeerSink {
-	/** New addresses from a source; returns how many were accepted. */
-	(addresses: readonly (string | PeerAddress)[], origin: PeerOrigin): number;
+	/**
+	 * New addresses from a source; returns how many were new.
+	 * `flags`, when present, are the BEP 11 `added.f` bytes (same order).
+	 */
+	(addresses: readonly (string | PeerAddress)[], origin: PeerOrigin, flags?: readonly number[]): number;
 }
 
 /** A provider of addresses (discovery stream, magnet hints...). */
@@ -72,6 +76,8 @@ const BACKOFF: Record<string, number> = {
 	choked: 30_000,
 	slow: 60_000,
 	idle: 30_000,
+	/** Our socket was full: the peer is fine, try again shortly. */
+	busy: 500,
 };
 const DEFAULT_BACKOFF = 60_000;
 const MAX_BACKOFF = 30 * 60_000;
@@ -99,7 +105,7 @@ export class PeerBook {
 	}
 
 	/** The sink sources feed. */
-	readonly sink: PeerSink = (addresses, origin) => this.addMany(addresses, origin);
+	readonly sink: PeerSink = (addresses, origin, flags) => this.addMany(addresses, origin, flags);
 
 	addMany(addresses: readonly (string | PeerAddress)[], origin: PeerOrigin, flags?: readonly number[]): number {
 		let added = 0;
@@ -164,6 +170,18 @@ export class PeerBook {
 	}
 
 	/**
+	 * The address to put in an `open`, re-checked against the gateway's
+	 * rules. Undefined when it would be refused (unknown, banned, private,
+	 * reserved, or port < 1024): a caller must not dial that.
+	 */
+	addressForOpen(key: string): PeerAddress | undefined {
+		const p = this.peers.get(key);
+		if (!p || p.banned) return undefined;
+		if (checkAddress(p.address, this.opts.allowPrivate) !== "ok") return undefined;
+		return { family: p.address.family, ip: p.address.ip.slice(), port: p.address.port };
+	}
+
+	/**
 	 * Up to `n` peers to dial now, best first: those that delivered, then
 	 * those that connected before, then pex seeds and reachable hints, then
 	 * untried ones (oldest first), then failed ones whose back-off is over.
@@ -173,6 +191,7 @@ export class PeerBook {
 		const ready: PeerEntry[] = [];
 		for (const p of this.peers.values()) {
 			if (p.banned || p.state === "connecting" || p.state === "connected" || p.retryAt > now) continue;
+			if (checkAddress(p.address, this.opts.allowPrivate) !== "ok") continue;
 			if (exclude?.(p)) continue;
 			ready.push(p);
 		}
@@ -184,6 +203,17 @@ export class PeerBook {
 		let n = 0;
 		for (const p of this.peers.values()) if (p.state === "new" && p.failures === 0 && !p.banned) n++;
 		return n;
+	}
+
+	/**
+	 * The dial never happened (the tunnel had no free slot): no fault of the
+	 * peer. It goes back to the candidates as it was.
+	 */
+	markNotDialled(key: string): void {
+		const p = this.peers.get(key);
+		if (!p || p.state !== "connecting") return;
+		p.state = p.connectedBefore || p.failures > 0 ? "failed" : "new";
+		p.retryAt = this.opts.now();
 	}
 
 	markConnecting(key: string): void {
@@ -277,4 +307,31 @@ export function addPex(book: PeerBook, added: readonly { family: 4 | 6; ip: Uint
 		"pex",
 		added.map((a) => a.flags),
 	);
+}
+
+/**
+ * `ut_pex` as a PeerSource (docs/architecture.md › Peer sources). The
+ * session forwards each connection's `pex` event to `ingest`; the source
+ * does not own the connection. Stopped, it drops further messages.
+ */
+export class PexSource implements PeerSource {
+	private sink: PeerSink | undefined;
+
+	start(sink: PeerSink): void {
+		this.sink = sink;
+	}
+
+	stop(): void {
+		this.sink = undefined;
+	}
+
+	/** How many of `message.added` were new. Dropped addresses are ignored. */
+	ingest(message: PexMessage): number {
+		if (!this.sink || message.added.length === 0) return 0;
+		return this.sink(
+			message.added.map((a) => ({ family: a.family, ip: a.ip, port: a.port })),
+			"pex",
+			message.added.map((a) => a.flags),
+		);
+	}
 }

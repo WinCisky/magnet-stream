@@ -6,6 +6,8 @@
 	"description": "Hermetic end-to-end test: fake peer -> wrangler dev gateway -> engine",
 	"scripts": {
 		"e2e": "node src/tunnel-download.ts",
+		"e2e:browser": "node src/browser-session.ts",
+		"stack": "node src/stack.ts",
 		"typecheck": "tsc -p tsconfig.json"
 	},
 	"dependencies": {
@@ -15,6 +17,7 @@
 	},
 	"devDependencies": {
 		"@types/node": "^24.19.2",
+		"playwright-core": "^1.58.2",
 		"typescript": "^6.0.3"
 	}
 }

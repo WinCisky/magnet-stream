@@ -2,14 +2,17 @@
 import '../styles/global.css';
 import { createInitialModeExpression } from 'mode-watcher';
 import MagnetFlow from '../lib/components/magnet-flow.svelte';
+
+/** BASE_URL with exactly one trailing slash ("/" at the root of the site). */
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
 ---
 
 <html lang="en">
 	<head>
 		<meta charset="utf-8" />
 		<!-- The ICO first, with its size: otherwise Chrome picks it over the SVG. -->
-		<link rel="icon" href={`${import.meta.env.BASE_URL}/favicon.ico`} sizes="32x32" />
-		<link rel="icon" type="image/svg+xml" href={`${import.meta.env.BASE_URL}/favicon.svg`} />
+		<link rel="icon" href={`${base}favicon.ico`} sizes="32x32" />
+		<link rel="icon" type="image/svg+xml" href={`${base}favicon.svg`} />
 		<meta name="viewport" content="width=device-width" />
 		<meta name="generator" content={Astro.generator} />
 		<title>Magnet Watcher</title>
@@ -19,7 +22,7 @@ import MagnetFlow from '../lib/components/magnet-flow.svelte';
 			worker controls the page, responses carry COOP/COEP; the first visit
 			reloads once to get there (never twice in a session).
 		-->
-		<script is:inline define:vars={{ worker: `${import.meta.env.BASE_URL}/coi-sw.js` }}>
+		<script is:inline define:vars={{ worker: `${base}coi-sw.js` }}>
 			(() => {
 				const key = "mw-coi-reload";
 				try {

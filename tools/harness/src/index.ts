@@ -130,3 +130,5 @@ export async function startWranglerDev(opts: WranglerDevOptions = {}): Promise<W
 	await stop();
 	throw new Error(`wrangler dev did not come up:\n${log}`);
 }
+
+export { startPeersStub, type PeersStub } from "./peers-stub.ts";

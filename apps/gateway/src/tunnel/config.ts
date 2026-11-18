@@ -5,6 +5,7 @@ import {
 	DEFAULT_IDLE_TIMEOUT_MS,
 	DEFAULT_SESSION_TIMEOUT_S,
 	DEFAULT_SOCKETS_PER_SESSION,
+	FAILED_CONNECT_HOLD_MS,
 	MAX_CONNECTIONS_PER_SOCKET,
 } from "@magnet-stream/tunnel-protocol";
 
@@ -69,7 +70,7 @@ const RULES: Record<keyof Omit<TunnelConfig, "sessionTimeoutMs"> | "sessionTimeo
 	handshakeTimeoutMs: { key: "TUNNEL_HANDSHAKE_TIMEOUT_MS", min: 100, max: 60_000, fallback: 10_000 },
 	maxConnections: { key: "TUNNEL_MAX_CONNECTIONS", min: 1, max: 16, fallback: MAX_CONNECTIONS_PER_SOCKET },
 	idleTimeoutMs: { key: "TUNNEL_IDLE_TIMEOUT_MS", min: 1_000, max: 600_000, fallback: DEFAULT_IDLE_TIMEOUT_MS },
-	failedConnectHoldMs: { key: "TUNNEL_FAILED_CONNECT_HOLD_MS", min: 0, max: 60_000, fallback: 20_000 },
+	failedConnectHoldMs: { key: "TUNNEL_FAILED_CONNECT_HOLD_MS", min: 0, max: 60_000, fallback: FAILED_CONNECT_HOLD_MS },
 	sessionTimeoutS: { key: "TUNNEL_SESSION_TIMEOUT_S", min: 5, max: 86_400, fallback: DEFAULT_SESSION_TIMEOUT_S },
 	socketsPerSession: { key: "TUNNEL_SOCKETS_PER_SESSION", min: 1, max: 8, fallback: DEFAULT_SOCKETS_PER_SESSION },
 	upgradesPerMinute: { key: "TUNNEL_UPGRADES_PER_MINUTE", min: 1, max: 600, fallback: 30 },

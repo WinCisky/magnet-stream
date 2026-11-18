@@ -14,15 +14,15 @@ document the task cites.
 | path | what | origin |
 |---|---|---|
 | `apps/web` | Astro + Svelte site (player, UI, legacy recovery engine) | PoC magnet-watcher |
-| `apps/gateway` | Cloudflare Worker: tunnel Durable Object (`/v1/tunnel`) + legacy `/v1/blocks` | PoC magnet-worker |
+| `apps/gateway` | Cloudflare Worker: tunnel Durable Object (`/v1/tunnel`) | PoC magnet-worker |
 | `services/seeders` | Rust VPS service: peer discovery (trackers + DHT), metadata | PoC magnet-seeders |
 | `packages/tunnel-protocol` | frame codec of the browser ↔ gateway tunnel (no runtime deps) | new (M1-04) |
-| `packages/engine` | browser BitTorrent engine: tunnel client, peer-wire, verified download | new (M1-06) |
+| `packages/engine` | browser BitTorrent engine: tunnel client, connection manager, peer-wire, metadata, peer exchange, verified download | new (M1-06) |
 | `tools/fake-peer` | deterministic test torrents + scriptable BitTorrent peer | new (M1-03) |
 | `tools/harness` | test helpers: free ports, swarms, `wrangler dev` | new (M1-03) |
 | `tools/e2e` | hermetic end-to-end download through the gateway | new (M1-07) |
 | `tools/spike` | Phase 0 measurement CLI | new (M1-07) |
-| `docs/` | architecture, tunnel protocol, spike report | |
+| `docs/` | architecture, tunnel protocol, discovery API, spike report, measurements, operations (deploy) | |
 
 npm workspaces (`apps/*`, `packages/*`, `tools/*`) and a Cargo workspace
 (`services/seeders`) share the root. Lockfiles (`package-lock.json`,
@@ -49,10 +49,16 @@ npm run dev -w apps/web            # astro dev
 Astro dev server: prefer background mode (`astro dev --background`, then
 `astro dev stop|status|logs`). Astro docs: https://docs.astro.build.
 
-CI (`.github/workflows/ci.yml`): verify + web build, e2e, dependency audit
+CI (`.github/workflows/ci.yml`): verify + web build (`check:dist`) + gateway
+dry-run bundle, actionlint, e2e (the browser session enforces 40 billed
+requests/GB and uploads `tools/e2e/results/` as the `measurements`
+artifact; `docs/measurements.md`), dependency audit
 (`node scripts/audit-npm.mjs`: high/critical npm advisories fail unless
 accepted, with reason and expiry, in `audit-allowlist.json`; `cargo audit`),
-gitleaks (working tree and history).
+gitleaks (working tree and history). Deploy (`.github/workflows/deploy.yml`,
+setup in `docs/operations.md`): after a green CI on a push to `main`,
+`wrangler deploy` of the gateway and `wrangler pages deploy` of the site
+(served from `/` on Cloudflare Pages); the VPS is deployed by hand.
 
 ## Global rules (from the plan's `global_rules`)
 

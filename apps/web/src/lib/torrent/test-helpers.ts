@@ -62,6 +62,7 @@ export async function fakeTorrent(pieceLength: number, totalLength: number): Pro
 		data,
 		meta: {
 			infoHash: "ab".repeat(20),
+			version: "v1",
 			name: "fake.mp4",
 			pieceLength,
 			totalLength,

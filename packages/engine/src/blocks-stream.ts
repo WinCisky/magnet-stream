@@ -1,5 +1,5 @@
-// Parser for the legacy gateway's /v1/blocks stream (moved here from
-// magnet-watcher's src/lib/torrent/wire.ts; removed with /v1/blocks in M2-08):
+// Parser for the old block-stream preamble the scheduler tests still
+// synthesise. The gateway no longer speaks that stream.
 //   [u32 n][n-byte JSON preamble][peer handshake (68 bytes)][peer-wire messages...]
 // Chunks can split anything anywhere; the parser buffers as needed.
 

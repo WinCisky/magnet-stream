@@ -35,17 +35,16 @@ async function setup(
 		info_hash: meta.infoHash,
 		announced_at: 0,
 		probed_at: 0,
-		token_exp: 4_000_000_000,
 		counts: { known: 10, probed: 10, reachable: 10, seeds: 10, unchoked: 10 },
 		peers: Object.entries(peers).map(([addr, behaviour]) => {
 			const have = haves[addr];
 			// Everyone but Transmission unchokes the probe at once (trickling
 			// peers look great to it, so they win races).
 			const unchoke_ms = behaviour === "transmission" ? undefined : 0;
-			if (!have) return { addr, ok: true, seed: true, fast: true, t: "t", unchoke_ms };
+			if (!have) return { addr, ok: true, seed: true, fast: true, unchoke_ms };
 			const bits = new Uint8Array(Math.ceil(meta.pieceCount / 8));
 			for (const p of have) bits[p >> 3] |= 0x80 >> (p & 7);
-			return { addr, ok: true, seed: false, have: btoa(String.fromCharCode(...bits)), fast: true, t: "t", unchoke_ms };
+			return { addr, ok: true, seed: false, have: btoa(String.fromCharCode(...bits)), fast: true, unchoke_ms };
 		}),
 	};
 	const swarm = new Swarm(async () => snap, () => {});
@@ -164,7 +163,7 @@ async function until(cond: () => boolean, ms = 10_000) {
 
 describe("Scheduler", { timeout: 30_000 }, () => {
 	it("recovers every piece intact, in order on a small file", async () => {
-		const { meta, data, scheduler, store, verifiedOrder } = await setup({ "1.1.1.1:1": "fast", "2.2.2.2:2": "fast", "3.3.3.3:3": "fast" });
+		const { meta, data, scheduler, store, verifiedOrder, plans } = await setup({ "1.1.1.1:1": "fast", "2.2.2.2:2": "fast", "3.3.3.3:3": "fast" });
 		scheduler.start();
 		await until(() => scheduler.complete);
 		scheduler.stop();
@@ -176,10 +175,14 @@ describe("Scheduler", { timeout: 30_000 }, () => {
 			// A plain loop: vitest's deep equality is very slow on big typed arrays.
 			expect(stored?.length === expected.length && stored.every((b, i) => b === expected[i]), `piece ${p}`).toBe(true);
 		}
-		// The whole 2 MiB file is "head": plain sequential order, give or
-		// take the batches running in parallel.
-		expect(verifiedOrder.indexOf(0)).toBeLessThan(4);
-		for (let i = 1; i < verifiedOrder.length; i++) expect(verifiedOrder[i]).toBeGreaterThan(verifiedOrder[i - 1] - 8);
+		// The whole 2 MiB file is "head": requested in plain sequential order,
+		// give or take the batches running in parallel. (Checked on the
+		// requests: verification order also depends on when each SHA-1 digest
+		// completes, which WebCrypto does not keep in order under load.)
+		const requested: number[] = [];
+		for (const plan of plans) for (const [piece] of plan.blocks) if (!requested.includes(piece)) requested.push(piece);
+		expect(requested.indexOf(0)).toBeLessThan(4);
+		for (let i = 1; i < requested.length; i++) expect(requested[i]).toBeGreaterThan(requested[i - 1] - 8);
 	});
 
 	it("fetches a piece again when storage lost it, even after finishing", async () => {
@@ -230,9 +233,8 @@ describe("Scheduler", { timeout: 30_000 }, () => {
 			info_hash: meta.infoHash,
 			announced_at: 0,
 			probed_at: 0,
-			token_exp: 4_000_000_000,
 			counts: { known: 2, probed: 2, reachable: 2, seeds: 2, unchoked: 2 },
-			peers: [{ addr: "1.1.1.1:1", ok: true, seed: true, fast: true, t: "t", unchoke_ms: 0 }],
+			peers: [{ addr: "1.1.1.1:1", ok: true, seed: true, fast: true, unchoke_ms: 0 }],
 		});
 		await until(() => scheduler.complete);
 		scheduler.stop();
@@ -267,9 +269,8 @@ describe("Scheduler", { timeout: 30_000 }, () => {
 			info_hash: meta.infoHash,
 			announced_at: 0,
 			probed_at: 0,
-			token_exp: 4_000_000_000,
 			counts: { known: 2, probed: 2, reachable: 1, seeds: 1, unchoked: 1 },
-			peers: [{ addr: "9.9.9.9:9", ok: false, err: "connect_timeout", seed: false, fast: false, t: "t" }],
+			peers: [{ addr: "9.9.9.9:9", ok: false, err: "connect_timeout", seed: false, fast: false }],
 		});
 		const tried = new Set<string>();
 		const original = swarm.candidates.bind(swarm);

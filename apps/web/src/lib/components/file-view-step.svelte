@@ -8,7 +8,9 @@
 	import { Button } from "$lib/components/ui/button/index.js";
 	import { formatBytes } from "$lib/magnet/files";
 	import type { TorrentFile } from "$lib/magnet/api";
+	import type { Metainfo } from "@magnet-stream/engine/metainfo";
 	import { RecoveryEngine, type EngineSnapshot } from "$lib/torrent/engine";
+	import type { PageSession } from "$lib/torrent/page-session";
 	import { recoverFile } from "$lib/torrent/fetch-file";
 	import { recoveredRanges } from "$lib/torrent/ranges";
 	import { subtitleFilesFor } from "$lib/magnet/subtitles";
@@ -33,6 +35,8 @@
 		torrentName,
 		magnet,
 		infoHash,
+		session = null,
+		knownMeta = null,
 		seeders,
 		onSelect,
 		onHome,
@@ -47,6 +51,8 @@
 		torrentName: string;
 		magnet: string;
 		infoHash: string;
+		session?: PageSession | null;
+		knownMeta?: Metainfo | null;
 		seeders: number;
 		onSelect: (index: number) => void;
 		onHome: () => void;
@@ -124,7 +130,10 @@
 			name: s.file.path.split("/").at(-1) ?? s.file.path,
 			label: s.label,
 			language: s.language,
-			load: (signal) => recoverFile({ infoHash, magnet, file: s.file, signal }),
+			load: (signal) => {
+				if (!session || !knownMeta) return Promise.reject(new Error("No torrent session"));
+				return recoverFile({ infoHash, magnet, file: s.file, session, meta: knownMeta, signal });
+			},
 		}));
 	}
 
@@ -134,6 +143,8 @@
 			infoHash,
 			magnet,
 			file: { index: fileIndex, path: file.path, offset: file.offset, size: file.size },
+			session: session ?? undefined,
+			knownMeta: knownMeta ?? undefined,
 			onSnapshot: (s) => {
 				snapshot = s;
 				playhead = engine.stream.lastRead;

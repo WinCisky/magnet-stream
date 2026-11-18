@@ -31,7 +31,7 @@ export interface VisitRecord {
 	env: Environment;
 	/** What the user did: "magnet_submitted", "file_picked"… */
 	flow: Counts;
-	/** magnet-seeders' /files: magnet link → file list (the key predates it). */
+	/** Magnet link → file list (now the session worker: /peers + BEP 9; the key predates it). */
 	metadataApi: Timed;
 	/** magnet-seeders' /peers: the seeder count checked before choosing. */
 	seedersCount: Timed;
@@ -130,6 +130,16 @@ export interface RecoveryRecord {
 	peers: { known: number; reachable: number; usable: number; active: number; backedOff: number; banned: number };
 	/** The player (absent in records from before it existed). */
 	playback?: PlaybackRecord;
+	/**
+	 * Ms the magnet → file list lookup took before this video was opened
+	 * (absent in older records; null if the video was not opened from a lookup).
+	 */
+	lookupMs?: number | null;
+	/**
+	 * Tunnel billing counters charged to this recovery, and the most peers
+	 * the session knew and saw deliver (absent in older records).
+	 */
+	tunnel?: { upgrades: number; messages: number; known: number; delivered: number };
 }
 
 export interface PlaybackRecord {

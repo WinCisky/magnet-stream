@@ -12,6 +12,7 @@ import type { BatchReport } from "$lib/torrent/scheduler";
 import type { PlayerEvent } from "$lib/player/player";
 import { allVisits, clearVisits, countVisits, pruneVisits, putVisit } from "./db";
 import { detectEnvironment } from "./env";
+import { measurementRow, phaseMetrics, type PhaseMetrics } from "./phase";
 import {
 	newId,
 	newPlayback,
@@ -49,6 +50,8 @@ export class Diagnostics {
 	private identity: { installId: string; salt: string } | null = null;
 	/** Recoveries still open: closing the page ends them. */
 	private readonly live = new Set<RecoveryRecorder>();
+	/** The last successful lookup's time, for the next recovery (time from paste to first piece). */
+	private lastLookupMs: number | null = null;
 
 	/** Start recording this visit. Safe to call more than once. */
 	start(): void {
@@ -73,6 +76,7 @@ export class Diagnostics {
 
 	/** One magnet → file list lookup (error null: it worked). */
 	metadataApi(ms: number, error: string | null): void {
+		this.lastLookupMs = error === null ? Math.round(ms) : null;
 		if (!this.visit) return;
 		note(this.visit.metadataApi, ms, error);
 		this.touch();
@@ -105,6 +109,9 @@ export class Diagnostics {
 	/** Diagnostics for one video's recovery: pass it to the engine as its observer. */
 	recovery(init: { infoHash: string; path: string; fileSize: number; videos: number }): RecoveryRecorder {
 		const record = newRecovery({ fileSize: coarse(init.fileSize), videos: init.videos, ext: extensionOf(init.path) });
+		// The lookup counts once: a second video opened later starts from its own click.
+		record.lookupMs = this.lastLookupMs;
+		this.lastLookupMs = null;
 		if (this.visit) {
 			if (this.visit.recoveries.length < MAX_RECOVERIES_PER_VISIT) this.visit.recoveries.push(record);
 			else this.visit.droppedRecoveries++;
@@ -161,6 +168,21 @@ export class Diagnostics {
 			now: Date.now(),
 		});
 		return JSON.stringify(report, null, 1);
+	}
+
+	/**
+	 * The three phase numbers over everything recorded, and the measurement
+	 * row of the latest finished video (for docs/measurements.md).
+	 */
+	async phase(): Promise<{ metrics: PhaseMetrics; lastRow: string | null }> {
+		await this.flush();
+		let visits = await allVisits().catch(() => [] as VisitRecord[]);
+		const current = this.visit;
+		if (current && this.active) visits = [...visits.filter((v) => v.id !== current.id), current];
+		const recoveries = visits.sort((a, b) => a.startedAt - b.startedAt).flatMap((v) => v.recoveries);
+		const finished = recoveries.filter((r) => r.outcome !== "running" || r.milestones.complete !== null);
+		const last = finished.at(-1) ?? recoveries.at(-1);
+		return { metrics: phaseMetrics(recoveries), lastRow: last ? measurementRow(last, BUILD) : null };
 	}
 
 	async clear(): Promise<void> {
@@ -341,6 +363,13 @@ export class RecoveryRecorder implements EngineObserver {
 		}
 
 		r.transfer.bytes = s.bytesReceived;
+		if (s.tunnel) {
+			const t = (r.tunnel ??= { upgrades: 0, messages: 0, known: 0, delivered: 0 });
+			t.upgrades = Math.max(t.upgrades, s.tunnel.upgrades);
+			t.messages = Math.max(t.messages, s.tunnel.messages);
+			t.known = Math.max(t.known, s.tunnel.known);
+			t.delivered = Math.max(t.delivered, s.tunnel.delivered);
+		}
 		r.integrity.hashFailures = s.hashFailures;
 		r.integrity.banned = Math.max(r.integrity.banned, s.peers.banned);
 		r.storage.kind = s.storage;

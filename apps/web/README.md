@@ -30,24 +30,12 @@ is in, the front goes back to the file's start to fill the gaps.
 ## How chunk recovery works
 
 - **[magnet-seeders](https://github.com/WinCisky/magnet-seeders)** (VPS)
-  provides:
-  - `/files`: the magnet's files (name, size, offset), read from its info
-    dict, largest first. A file's place in this list is its index in
-    `?file=` links and saved videos.
-  - `/swarm`: the peers, probed over TCP (reachable, seed or bitfield,
-    unchoke speed), each with a signed token. It answers as soon as the
-    first peers unchoke a probe (`complete: false`); the page polls every
-    1.5 s until the whole swarm is probed, then every 5 minutes. The page
-    asks for it alongside the info dict, not after.
-  - `/metadata`: the torrent's info dict. Its SHA-1 must equal the
-    info-hash, and it holds every piece's hash.
-- **[magnet-worker](https://github.com/WinCisky/magnet-worker)** (Cloudflare
-  Worker) does what the browser can't: it opens TCP connections to peers. The
-  page asks it for blocks from a lead peer plus up to a dozen fallbacks (most
-  of a swarm is usually unreachable). The worker tries them 6 connections at
-  a time, gives the lead a head start, and streams back whatever the first
-  to unchoke sends, unverified. With an older worker (no `/v1/info`), the
-  page names 1–3 peers instead.
+  streams peers on `/peers` (one request per lookup). The page learns the
+  file list and piece hashes from those peers, over the tunnel.
+- **The gateway** (Cloudflare Worker) does what the browser can't: it holds
+  TCP connections to peers open. The page opens one to three WebSockets and
+  speaks peer-wire itself; the worker only relays bytes after the handshake
+  gate.
 - The engine in `src/lib/torrent/` schedules the requests, assembles the
   pieces, and checks each piece's SHA-1. How it schedules:
   - At the start and after a seek, at most 6 requests run until 4 MiB are
@@ -114,10 +102,12 @@ bottom marks where playback last read.
   support, DivX/Xvid, and AC3/EAC3/DTS audio. Nothing is re-encoded.
 - **Cross-origin isolation.** libmedia needs SharedArrayBuffer to run on
   real threads. Without it, its workers can't pass subtitles to the page,
-  and wasm decoding is single-threaded. GitHub Pages can't send the
-  COOP/COEP headers that enable it, so `public/coi-sw.js`, a service worker
-  registered in `src/pages/index.astro`, adds them to the site's own
-  responses.
+  and wasm decoding is single-threaded. The site is served by Cloudflare
+  Pages, which sends the COOP/COEP headers from `public/_headers`; the dev
+  server sends them from `astro.config.mjs`. `public/coi-sw.js`, a service
+  worker registered in `src/pages/index.astro`, is the fallback from the
+  GitHub Pages days: it registers only when the page is not already
+  isolated, and is removed in M3-05.
   - The first visit reloads once so the worker can take over.
   - Requests to other origins pass through untouched; they must allow
     CORS, as magnet-seeders and the worker do. Anything
@@ -218,8 +208,3 @@ Nothing is ever sent anywhere. The code is in `src/lib/diagnostics/`.
 | `npm run build` | Build to `./dist/` |
 | `npm test` | Unit tests (vitest) |
 | `npx astro check` | Type-check |
-
-`src/lib/torrent/live.test.ts` benchmarks the real engine against running
-services and real peers: time to the first 1/4/16 MiB, throughput per 10 s,
-and four seeks per torrent, over the legal video and Linux ISO swarms in
-`live-torrents.json`. It's skipped unless `MW_LIVE=1`; see the file's header.

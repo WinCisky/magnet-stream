@@ -95,9 +95,10 @@ describe("TunnelClient", () => {
 		expect(err).toBeInstanceOf(TunnelOpenError);
 		expect(err.reason).toBe(FailReason.NOT_BITTORRENT);
 		expect(err.message).toContain("not_bittorrent");
-		// The id is free again.
+		// The id is free again; the gateway's slot frees once its socket closed (counted as held for a moment).
 		void tunnel.open({ address: "1.2.3.4:6881", infoHash, peerId }).catch(() => {});
-		expect(tunnel.connections).toBe(1);
+		expect(tunnel.connections).toBe(2);
+		expect(tunnel.heldSlots()).toBe(1);
 	});
 
 	it("never opens more than 6 connections", async () => {
@@ -145,5 +146,45 @@ describe("TunnelClient", () => {
 		void tunnel.open({ address: "1.2.3.4:6881", infoHash, peerId });
 		ws.deliver(opened(1), { type: "data", conn: 1, payload: Uint8Array.of(1) });
 		expect(tunnel.stats).toMatchObject({ messagesSent: 1, framesSent: 1, messagesReceived: 1, framesReceived: 2 });
+	});
+
+	it("counts slots the gateway still holds: a timed-out connect for 20 s from its start, a closed one briefly", async () => {
+		let now = 1_000;
+		const ws = new FakeWebSocket();
+		const pending = TunnelClient.connect("ws://gateway/v1/tunnel", { factory: () => ws, now: () => now });
+		ws.open();
+		const tunnel = await pending;
+		const a = tunnel.open({ address: "1.2.3.4:6881", infoHash, peerId });
+		const b = tunnel.open({ address: "1.2.3.5:6881", infoHash, peerId });
+		now = 6_000;
+		ws.deliver({ type: "failed", conn: 1, reason: FailReason.TIMEOUT }, opened(2));
+		await expect(a).rejects.toBeInstanceOf(TunnelOpenError);
+		const tb = await b;
+		// conn 1 is held until 1_000 + 20_000 + 1_000 (grace); conn 2 is open.
+		expect(tunnel.connections).toBe(2);
+		tb.close();
+		expect(tunnel.connections).toBe(2); // closing: held for a moment
+		now = 7_500;
+		expect(tunnel.connections).toBe(1);
+		now = 21_999;
+		expect(tunnel.connections).toBe(1);
+		now = 22_000;
+		expect(tunnel.connections).toBe(0);
+	});
+
+	it("never offers more slots than the gateway has while timed-out connects are held", async () => {
+		let now = 0;
+		const ws = new FakeWebSocket();
+		const pending = TunnelClient.connect("ws://gateway/v1/tunnel", { factory: () => ws, now: () => now });
+		ws.open();
+		const tunnel = await pending;
+		const opens = [1, 2, 3, 4, 5, 6].map((i) => tunnel.open({ address: `1.2.3.${i}:6881`, infoHash, peerId }).catch((e: unknown) => e));
+		now = 5_000;
+		ws.deliver(...[1, 2, 3, 4, 5, 6].map((conn): Frame => ({ type: "failed", conn, reason: FailReason.TIMEOUT })));
+		await Promise.all(opens);
+		await expect(tunnel.open({ address: "1.2.3.7:6881", infoHash, peerId })).rejects.toMatchObject({ reason: FailReason.TOO_MANY_CONNECTIONS });
+		now = 21_000;
+		void tunnel.open({ address: "1.2.3.7:6881", infoHash, peerId }).catch(() => {});
+		expect(tunnel.connections).toBe(1);
 	});
 });

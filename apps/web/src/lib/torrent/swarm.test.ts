@@ -2,20 +2,19 @@ import { describe, expect, it, vi } from "vitest";
 import type { SwarmSnapshot } from "$lib/magnet/api";
 import { PARTIAL_POLL_MS, Swarm, isProven, isQuickUnchoker } from "./swarm";
 
-function snapshot(peers: SwarmSnapshot["peers"], tokenExp = 2_000_000_000): SwarmSnapshot {
+function snapshot(peers: SwarmSnapshot["peers"]): SwarmSnapshot {
 	return {
 		info_hash: "ab".repeat(20),
 		announced_at: 0,
 		probed_at: 0,
-		token_exp: tokenExp,
 		counts: { known: 50, probed: peers.length, reachable: peers.length, seeds: 1, unchoked: 1 },
 		peers,
 	};
 }
 
-const seed = { addr: "1.1.1.1:1", ok: true, seed: true, fast: true, t: "tok-a", unchoke_ms: 10, rtt_ms: 30 };
-const partial = { addr: "2.2.2.2:2", ok: true, seed: false, have: btoa("\xa0"), fast: true, t: "tok-b" };
-const unknown = { addr: "3.3.3.3:3", ok: false, seed: false, err: "connect_timeout", fast: false, t: "tok-c" };
+const seed = { addr: "1.1.1.1:1", ok: true, seed: true, fast: true, unchoke_ms: 10, rtt_ms: 30 };
+const partial = { addr: "2.2.2.2:2", ok: true, seed: false, have: btoa("\xa0"), fast: true };
+const unknown = { addr: "3.3.3.3:3", ok: false, seed: false, err: "connect_timeout", fast: false };
 
 describe("Swarm", () => {
 	it("knows who has which piece, and only offers unknown peers as a last resort", async () => {
@@ -28,14 +27,12 @@ describe("Swarm", () => {
 		expect(Array.from(swarm.availability(0, 3))).toEqual([2, 1, 2, 1]);
 	});
 
-	it("keeps what it learned across refreshes but takes new tokens", async () => {
-		let n = 0;
-		const swarm = new Swarm(async () => snapshot([{ ...seed, t: `tok-${++n}` }]), () => {});
+	it("keeps what it learned across refreshes", async () => {
+		const swarm = new Swarm(async () => snapshot([seed]), () => {});
 		await swarm.refresh();
 		const peer = swarm.peers.get(seed.addr)!;
 		swarm.won(peer, 1_000_000, 1_000);
 		await swarm.refresh();
-		expect(peer.token).toBe("tok-2");
 		expect(peer.wins).toBe(1);
 		expect(peer.rate).toBe(1_000_000);
 	});
@@ -75,16 +72,9 @@ describe("Swarm", () => {
 		expect(swarm.candidates([0])).toHaveLength(0);
 	});
 
-	it("never offers peers whose token is about to expire", async () => {
-		const now = 1_000_000_000_000;
-		const swarm = new Swarm(async () => snapshot([seed], now / 1000 + 10), () => {}, () => now);
-		await swarm.refresh();
-		expect(swarm.candidates([0])).toHaveLength(0);
-		expect(swarm.hasIdlePeer()).toBe(false);
-	});
 	it("gives fast peers more connections and learns who unchokes slowly", async () => {
 		let now = 1_000_000;
-		const slowUnchoker = { addr: "4.4.4.4:4", ok: true, seed: true, fast: true, t: "tok-d" };
+		const slowUnchoker = { addr: "4.4.4.4:4", ok: true, seed: true, fast: true };
 		const swarm = new Swarm(async () => snapshot([seed, slowUnchoker]), () => {}, () => now);
 		await swarm.refresh();
 		const a = swarm.peers.get(seed.addr)!;
@@ -146,9 +136,9 @@ describe("Swarm", () => {
 	it("lists fallbacks idle first, the unreachable last, and never learns from `untried`", async () => {
 		let now = 1_000_000;
 		const peers = ["1.1.1.1:1", "2.2.2.2:2", "3.3.3.3:3", "4.4.4.4:4", "5.5.5.5:5"].map((addr) => ({ ...seed, addr }));
-		const stranger = { addr: "6.6.6.6:6", ok: false, err: "connect_timeout", seed: false, fast: false, t: "tok-f" };
-		const pending = { addr: "7.7.7.7:7", ok: false, err: "probing", seed: false, fast: false, t: "tok-g" };
-		const hungUp = { addr: "8.8.8.8:8", ok: false, err: "closed", seed: false, fast: false, t: "tok-h" };
+		const stranger = { addr: "6.6.6.6:6", ok: false, err: "connect_timeout", seed: false, fast: false };
+		const pending = { addr: "7.7.7.7:7", ok: false, err: "probing", seed: false, fast: false };
+		const hungUp = { addr: "8.8.8.8:8", ok: false, err: "closed", seed: false, fast: false };
 		const swarm = new Swarm(async () => snapshot([...peers, partial, stranger, hungUp, pending]), () => {}, () => now);
 		await swarm.refresh();
 		const [a, b, c, d, e] = peers.map((p) => swarm.peers.get(p.addr)!);
