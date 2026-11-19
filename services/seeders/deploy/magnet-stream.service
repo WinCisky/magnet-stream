@@ -1,0 +1,50 @@
+# systemd unit for the monorepo's discovery service, installed as
+# "magnet-stream" so it can run next to the PoC's "magnet-seeders" unit on
+# the same VPS (different unit, binary, config, port and DHT port). Same
+# binary as services/seeders (crate magnet-seeders), copied under the new
+# name.
+
+[Unit]
+Description=magnet-stream discovery API (streamed /peers)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/magnet-stream/magnet-stream
+EnvironmentFile=/etc/magnet-stream/magnet-stream.env
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+# No persistent state, no manual user to manage: systemd creates an
+# ephemeral, unprivileged user/group for this unit at start.
+DynamicUser=yes
+
+# Sandboxing. If the unit fails to start and you can't tell why, comment
+# these out one at a time (SystemCallFilter and MemoryDenyWriteExecute
+# first) to find the culprit, then `systemctl daemon-reload && systemctl
+# restart magnet-stream`.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

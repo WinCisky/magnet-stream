@@ -71,13 +71,16 @@ and rotate it before then. Note the **Account ID** (dashboard sidebar).
   | `PAGES_PROJECT` | `magnet-stream` | `wrangler pages deploy --project-name` |
   | `SITE_URL` | `https://magnet-stream.pages.dev` | Astro `site`; its origin becomes the gateway's `ALLOWED_ORIGINS` |
   | `PUBLIC_WORKER_URL` | `https://magnet-stream-gateway.<subdomain>.workers.dev` | the gateway the site opens tunnels to |
-  | `PUBLIC_SEEDERS_URL` | `https://magnet-seeders.example.org` | the VPS discovery API (`GET /peers`) |
+  | `PUBLIC_SEEDERS_URL` | `https://magnet-stream.example.org` | the VPS discovery API (`GET /peers`) |
 
 ### 4. VPS origin
 
 The VPS only answers browsers from allowed origins (CORS, decision OQ-09):
 add the site's origin (the `SITE_URL` origin) to `ALLOWED_ORIGINS` in
-`/etc/magnet-seeders/magnet-seeders.env` and restart the service.
+`/etc/magnet-stream/magnet-stream.env` and restart the service
+(`sudo systemctl restart magnet-stream`). The VPS install is named
+*magnet-stream* so it can run next to the PoC's magnet-seeders (files in
+`services/seeders/deploy/magnet-stream.*` and `nginx-magnet-stream.conf`).
 
 ## Configuration the deploy sets
 
