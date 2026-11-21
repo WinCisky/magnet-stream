@@ -8,12 +8,24 @@
 //   - the library (library-core.ts, in the page's library worker) lists,
 //     reads and deletes it, refusing while the engine worker holds it open.
 // Nothing leaves the browser: the page has no network access besides itself.
+//
+// Quota: Chromium sizes an origin's quota from the machine (RAM for an
+// off-the-record context, disk for a profile), and a small CI runner gets
+// less than the 1.25 GiB the sparse file counts for (QuotaExceededError).
+// The test origin's quota is set explicitly over CDP instead, so the result
+// doesn't depend on the host. The file is sparse: it takes neither that
+// memory nor that disk. The profile is a temporary one on disk, as a user's.
 
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { build } from "esbuild";
 import { chromium } from "playwright-core";
 import { freePort } from "@magnet-stream/harness";
+
+/** The test origin's storage quota (OPFS_E2E_QUOTA_MIB overrides it, to check the quota failure). */
+const QUOTA = Number(process.env.OPFS_E2E_QUOTA_MIB ?? 2048) * 2 ** 20;
 
 const ROOT = new URL("../../../", import.meta.url).pathname;
 const chromiumPath = [process.env.CHROMIUM_PATH, "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome", bundled()].find(
@@ -134,11 +146,13 @@ async function main(): Promise<void> {
 		}
 	});
 	await new Promise<void>((r) => server.listen(port, "127.0.0.1", r));
-	const browser = await chromium.launch({ executablePath: chromiumPath, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+	const profile = mkdtempSync(join(tmpdir(), "opfs-e2e-"));
+	const context = await chromium.launchPersistentContext(profile, { executablePath: chromiumPath, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 	try {
-		const context = await browser.newContext();
 		const tab = await context.newPage();
 		const url = `http://localhost:${port}/`;
+		const cdp = await context.newCDPSession(tab);
+		await cdp.send("Storage.overrideQuotaForOrigin", { origin: `http://localhost:${port}`, quotaSize: QUOTA });
 		await tab.goto(url);
 		await tab.waitForFunction(() => (globalThis as unknown as { ready?: boolean }).ready === true);
 		const run = async (name: string) => {
@@ -153,8 +167,9 @@ async function main(): Promise<void> {
 		await run("reopen");
 		console.log(`OPFS store: random writes and reads on a ${(written.size! / 2 ** 30).toFixed(2)} GiB sparse file, block reads, reload, partial and full delete — ok`);
 	} finally {
-		await browser.close();
+		await context.close();
 		server.close();
+		rmSync(profile, { recursive: true, force: true });
 	}
 }
 
