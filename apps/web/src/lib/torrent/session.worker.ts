@@ -292,12 +292,18 @@ async function start(magnetUri: string, gatewayUrl: string, seedersUrl: string, 
 				});
 			},
 		}).then(
+			// The end of the stream is posted at once: the report leaves out sessions whose
+			// stream is still open, and the user may leave before the next periodic post.
 			(result) => {
 				scout.rejected += result.rejected;
-				if (manager === session) scout.state = "done";
+				if (manager !== session) return;
+				scout.state = "done";
+				postStats();
 			},
 			() => {
-				if (manager === session && !signal.aborted) scout.state = "failed";
+				if (manager !== session || signal.aborted) return;
+				scout.state = "failed";
+				postStats();
 			},
 		);
 	};
