@@ -9,6 +9,8 @@ export interface SlotView {
 	choked: boolean;
 	/** Unchoked, but slower than the peers that are actually serving. */
 	slow: boolean;
+	/** It has none of the pieces we still want (known once its bitfield had time to arrive). */
+	useless?: boolean;
 	downloaded: number;
 	score: number;
 	openedAt: number;
@@ -17,14 +19,18 @@ export interface SlotView {
 /**
  * The connection to close so a better candidate can be dialled, or
  * undefined when every connection is delivering (or none is old enough to
- * replace). A choked connection is replaceable only after `chokeAfterMs`:
- * an optimistic unchoke is worth waiting for when nothing better is urgent,
- * but a waiting candidate is better than a peer that has not unchoked.
+ * replace). A connection with none of the wanted pieces goes first, at
+ * once: it cannot serve us whatever it does. A choked connection is
+ * replaceable only after `chokeAfterMs`: an optimistic unchoke is worth
+ * waiting for when nothing better is urgent, but a waiting candidate is
+ * better than a peer that has not unchoked.
  */
 export function replacementVictim(slots: readonly SlotView[], now: number, chokeAfterMs: number): SlotView | undefined {
-	const replaceable = slots.filter((s) => !s.delivering && (s.slow || (s.choked && now - s.openedAt >= chokeAfterMs)));
+	const replaceable = slots.filter((s) => !s.delivering && (s.useless === true || s.slow || (s.choked && now - s.openedAt >= chokeAfterMs)));
 	if (replaceable.length === 0) return undefined;
-	return replaceable.sort((a, b) => a.downloaded - b.downloaded || a.score - b.score || a.openedAt - b.openedAt)[0];
+	return replaceable.sort(
+		(a, b) => Number(b.useless === true) - Number(a.useless === true) || a.downloaded - b.downloaded || a.score - b.score || a.openedAt - b.openedAt,
+	)[0];
 }
 
 export interface RateSample {

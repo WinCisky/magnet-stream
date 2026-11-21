@@ -151,7 +151,7 @@
 
 	{#if !libraryAvailable()}
 		<p class="text-muted-foreground text-sm">
-			This browser doesn't let the page save anything (no Cache Storage, e.g. in a private window).
+			This browser doesn't let the page save anything (no origin private file system).
 		</p>
 	{:else if !library}
 		<div class="text-muted-foreground flex items-center gap-2 text-sm">

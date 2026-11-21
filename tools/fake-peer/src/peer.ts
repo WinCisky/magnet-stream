@@ -82,6 +82,38 @@ export interface PeerBehaviour {
 	pex?: readonly string[];
 	/** 20-byte peer id (default `-FP0001-` + random). */
 	peerId?: Uint8Array;
+	/**
+	 * Tit-for-tat leecher (M3-12): never unchoke on interest alone; unchoke a
+	 * connection once it uploaded `titForTatBytes` of good blocks to us. It
+	 * is interested in what the remote has and it lacks (`have`), and
+	 * requests it while unchoked.
+	 */
+	titForTat?: boolean;
+	/** Bytes a connection must upload to a tit-for-tat leecher before it unchokes it (default 16 KiB). */
+	titForTatBytes?: number;
+	/** Requests a tit-for-tat leecher keeps outstanding per connection (default 8). */
+	leechQueue?: number;
+	/** Stop reading right after answering the handshake (a peer that never reads: its TCP window fills). */
+	noRead?: boolean;
+}
+
+/** What a peer received from the other side (all connections). */
+export interface ReceivedStats {
+	bitfield: number;
+	have: number;
+	haveAll: number;
+	haveNone: number;
+	unchoke: number;
+	choke: number;
+	interested: number;
+	piece: number;
+	reject: number;
+	/** Payload bytes of `piece` messages received. */
+	bytes: number;
+	/** Blocks received that differ from the torrent's data. */
+	badBlocks: number;
+	/** ut_metadata pieces received (data). */
+	metadataPieces: number;
 }
 
 export interface PeerStats {
@@ -98,6 +130,16 @@ export interface PeerStats {
 	pexSent: number;
 	/** Messages received that this peer never expects from a leecher that doesn't upload (piece, unchoke...). */
 	unexpected: number[];
+	/** `cancel` messages received. */
+	cancels: number;
+	/** Delayed blocks (blockGapMs) not sent because they were cancelled first. */
+	cancelled: number;
+	/** Piece of every block sent, in order (the first 100,000). */
+	servedPieces: number[];
+	/** Messages received from the other side. */
+	received: ReceivedStats;
+	/** Tit-for-tat leecher: connections it unchoked because they uploaded to it. */
+	titForTatUnchokes: number;
 }
 
 export interface FakePeer {
@@ -163,7 +205,13 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 		hashRequests: 0,
 		pexSent: 0,
 		unexpected: [],
+		cancels: 0,
+		cancelled: 0,
+		servedPieces: [],
+		received: { bitfield: 0, have: 0, haveAll: 0, haveNone: 0, unchoke: 0, choke: 0, interested: 0, piece: 0, reject: 0, bytes: 0, badBlocks: 0, metadataPieces: 0 },
+		titForTatUnchokes: 0,
 	};
+	const received = stats.received;
 	const sockets = new Set<net.Socket>();
 
 	const server = net.createServer((socket) => {
@@ -192,7 +240,19 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 		let remoteExt: Map<string, BDecoded> | undefined;
 		let served = 0;
 		let metadataServed = 0;
-		let nextBlockAt = 0;
+		/** Paced blocks (blockGapMs) not sent yet, in request order. */
+		const queue: { key: string; deliver: () => void }[] = [];
+		let pumping = false;
+		// Tit-for-tat leecher: what the remote has, what we asked of it, what it gave us.
+		let remoteInterested = false;
+		let remoteAll = false;
+		let remoteBits: Uint8Array | undefined;
+		const remoteHaves = new Set<number>();
+		let remoteChoking = true;
+		let leechInterested = false;
+		const asked = new Set<string>();
+		const got = new Set<string>();
+		let uploadedToUs = 0;
 
 		const send = (data: Uint8Array) => {
 			if (!socket.destroyed && socket.writable) socket.write(data);
@@ -240,6 +300,7 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 				return;
 			}
 			sendSetup();
+			if (b.noRead) socket.pause();
 		};
 
 		const onExtended = (payload: Buffer) => {
@@ -256,6 +317,10 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 					send(extended(pexId, pexMessage(b.pex)));
 					stats.pexSent++;
 				}
+				return;
+			}
+			if (id === OUR_EXTENSIONS.ut_metadata && dict.get("msg_type") === 1) {
+				received.metadataPieces++;
 				return;
 			}
 			if (id === OUR_EXTENSIONS.ut_metadata) {
@@ -318,15 +383,94 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 			header.writeUInt32BE(piece, 0);
 			header.writeUInt32BE(begin, 4);
 			const pieceFrame = frame(MSG.PIECE, concat([header, block]));
-			const gap = b.blockGapMs ?? 0;
-			const wait = gap > 0 ? Math.max(0, nextBlockAt - Date.now()) : 0;
-			if (gap > 0) nextBlockAt = Date.now() + wait + gap;
 			const deliver = () => {
+				if (stats.servedPieces.length < 100_000) stats.servedPieces.push(piece);
 				send(pieceFrame);
 				if (b.closeAfterBlocks !== undefined && served >= b.closeAfterBlocks) socket.end();
 			};
-			if (wait > 0) later(wait, deliver);
-			else deliver();
+			// Paced: one block per gap, in request order; a cancelled block
+			// leaves the queue without using a slot.
+			if ((b.blockGapMs ?? 0) > 0) {
+				queue.push({ key: `${piece}:${begin}`, deliver });
+				if (!pumping) pump();
+			} else deliver();
+		};
+
+		const pump = () => {
+			const next = queue.shift();
+			pumping = next !== undefined;
+			if (!next) return;
+			next.deliver();
+			later(b.blockGapMs ?? 0, pump);
+		};
+
+		const remoteHas = (p: number) => remoteAll || remoteHaves.has(p) || (remoteBits !== undefined && (remoteBits[p >> 3] & (0x80 >> (p & 7))) !== 0);
+		const wanted = (p: number) => !holds(p) && remoteHas(p);
+
+		/** Tit-for-tat leecher: unchoke a connection that uploaded enough to us. */
+		const titForTat = () => {
+			if (!b.titForTat || unchoked || !remoteInterested || uploadedToUs < (b.titForTatBytes ?? 16 * 1024)) return;
+			unchoked = true;
+			stats.titForTatUnchokes++;
+			send(frame(MSG.UNCHOKE));
+		};
+
+		/** Tit-for-tat leecher: be interested in what the remote has and ask for it while unchoked. */
+		const leech = () => {
+			if (!b.titForTat || socket.destroyed) return;
+			let any = false;
+			for (let p = 0; p < torrent.pieceCount && !any; p++) any = wanted(p);
+			if (any !== leechInterested) {
+				leechInterested = any;
+				send(frame(any ? MSG.INTERESTED : MSG.NOT_INTERESTED));
+			}
+			if (remoteChoking || !any) return;
+			const limit = b.leechQueue ?? 8;
+			const parts: Buffer[] = [];
+			for (let p = 0; p < torrent.pieceCount && asked.size < limit; p++) {
+				if (!wanted(p)) continue;
+				const size = torrent.pieceSize(p);
+				for (let begin = 0; begin < size && asked.size < limit; begin += 16 * 1024) {
+					const key = `${p}:${begin}`;
+					if (asked.has(key) || got.has(key)) continue;
+					asked.add(key);
+					const req = Buffer.alloc(12);
+					req.writeUInt32BE(p, 0);
+					req.writeUInt32BE(begin, 4);
+					req.writeUInt32BE(Math.min(16 * 1024, size - begin), 8);
+					parts.push(frame(MSG.REQUEST, req));
+				}
+			}
+			if (parts.length > 0) send(Buffer.concat(parts));
+		};
+
+		const onPiece = (payload: Buffer) => {
+			received.piece++;
+			if (payload.length < 8) return;
+			const piece = payload.readUInt32BE(0);
+			const begin = payload.readUInt32BE(4);
+			const data = payload.subarray(8);
+			received.bytes += data.length;
+			const start = piece * torrent.pieceLength + begin;
+			const good = piece < torrent.pieceCount && Buffer.from(torrent.data.subarray(start, start + data.length)).equals(data);
+			if (!good) received.badBlocks++;
+			const key = `${piece}:${begin}`;
+			if (!asked.delete(key)) return;
+			if (!good) return;
+			got.add(key);
+			uploadedToUs += data.length;
+			titForTat();
+			leech();
+		};
+
+		const onCancel = (payload: Buffer) => {
+			if (payload.length !== 12) return;
+			stats.cancels++;
+			const key = `${payload.readUInt32BE(0)}:${payload.readUInt32BE(4)}`;
+			const at = queue.findIndex((q) => q.key === key);
+			if (at < 0) return;
+			queue.splice(at, 1);
+			stats.cancelled++;
 		};
 
 		socket.on("data", (chunk: Buffer) => {
@@ -358,7 +502,10 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 				if (messages++ < 2) stats.firstMessages.push(id);
 				switch (id) {
 					case MSG.INTERESTED:
-						if (b.unchoke && !unchoked) {
+						received.interested++;
+						remoteInterested = true;
+						if (b.titForTat) titForTat();
+						else if (b.unchoke && !unchoked) {
 							later(b.unchokeDelayMs, () => {
 								unchoked = true;
 								send(frame(MSG.UNCHOKE));
@@ -368,15 +515,55 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 					case MSG.REQUEST:
 						onRequest(payload);
 						break;
+					case MSG.CANCEL:
+						onCancel(payload);
+						break;
 					case MSG.EXTENDED:
 						onExtended(payload);
 						break;
 					case MSG.HASH_REQUEST:
 						onHashRequest(payload);
 						break;
+					case MSG.NOT_INTERESTED:
+						remoteInterested = false;
+						break;
 					case MSG.UNCHOKE:
+						stats.unexpected.push(id);
+						received.unchoke++;
+						remoteChoking = false;
+						leech();
+						break;
+					case MSG.CHOKE:
+						received.choke++;
+						remoteChoking = true;
+						if (!b.fast) asked.clear();
+						break;
 					case MSG.PIECE:
 						stats.unexpected.push(id);
+						onPiece(payload);
+						break;
+					case MSG.REJECT:
+						received.reject++;
+						if (payload.length === 12) asked.delete(`${payload.readUInt32BE(0)}:${payload.readUInt32BE(4)}`);
+						leech();
+						break;
+					case MSG.HAVE:
+						received.have++;
+						if (payload.length === 4) remoteHaves.add(payload.readUInt32BE(0));
+						leech();
+						break;
+					case MSG.BITFIELD:
+						received.bitfield++;
+						remoteBits = Buffer.from(payload);
+						leech();
+						break;
+					case MSG.HAVE_ALL:
+						received.haveAll++;
+						remoteAll = true;
+						leech();
+						break;
+					case MSG.HAVE_NONE:
+						received.haveNone++;
 						break;
 				}
 			}

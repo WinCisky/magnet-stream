@@ -6,9 +6,16 @@
 	"description": "Hermetic end-to-end test: fake peer -> wrangler dev gateway -> engine",
 	"scripts": {
 		"e2e": "node src/tunnel-download.ts",
+		"e2e:scout": "node src/scout-session.ts",
+		"e2e:corrupt": "node src/corrupt-session.ts",
 		"e2e:browser": "node src/browser-session.ts",
+		"e2e:lookup": "node src/lookup-session.ts",
 		"stack": "node src/stack.ts",
-		"typecheck": "tsc -p tsconfig.json"
+		"typecheck": "tsc -p tsconfig.json",
+		"e2e:opfs": "node src/opfs-store.ts",
+		"e2e:resume": "node src/resume-session.ts",
+		"e2e:stream": "node src/stream-session.ts",
+		"e2e:libmedia": "node src/libmedia-session.ts"
 	},
 	"dependencies": {
 		"@magnet-stream/engine": "0.1.0",
@@ -17,6 +24,7 @@
 	},
 	"devDependencies": {
 		"@types/node": "^24.19.2",
+		"esbuild": "^0.28.2",
 		"playwright-core": "^1.58.2",
 		"typescript": "^6.0.3"
 	}

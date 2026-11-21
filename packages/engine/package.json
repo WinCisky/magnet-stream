@@ -8,7 +8,8 @@
 		".": "./src/index.ts",
 		"./metainfo": "./src/metainfo.ts",
 		"./bencode": "./src/bencode.ts",
-		"./blocks-stream": "./src/blocks-stream.ts"
+		"./blocks-stream": "./src/blocks-stream.ts",
+		"./picker": "./src/picker.ts"
 	},
 	"scripts": {
 		"test": "vitest run",

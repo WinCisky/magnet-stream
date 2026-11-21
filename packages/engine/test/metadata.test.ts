@@ -35,8 +35,10 @@ const v1 = (t: FakeTorrent): ExpectedHashes => ({ v1: t.infoHashHex });
 describe("metadata from peers", () => {
 	it("fetches and verifies the info dict, piece by piece", async () => {
 		const f = new MetadataFetcher({ expected: v1(big) });
+		expect(f.pending).toBe(0);
 		const { peer, conn } = await connect(f, big);
 		const { meta, bytes } = await f.done;
+		expect(f.pending).toBe(0);
 		expect(Buffer.from(bytes).equals(Buffer.from(big.info))).toBe(true);
 		expect(meta.pieceCount).toBe(2048);
 		expect(peer.stats.metadataRequests).toBe(3);
@@ -76,6 +78,39 @@ describe("metadata from peers", () => {
 		const { meta } = await f.done;
 		expect(meta.version).toBe("v2");
 		expect(meta.files.map((x) => x.path)).toEqual(["a.mkv", "b.srt"]);
+		conn.close();
+	});
+
+	it("ends the search with a correct info dict from outside, and counts the source", async () => {
+		const f = new MetadataFetcher({ expected: v1(big) });
+		expect(await f.offerBytes(big.info)).toBe(true);
+		const { meta, bytes, source } = await f.done;
+		expect(source).toBe("external");
+		expect(meta.pieceCount).toBe(2048);
+		expect(Buffer.from(bytes).equals(Buffer.from(big.info))).toBe(true);
+		// Done: a peer offering it now is not asked.
+		const { peer, conn } = await connect(f, big);
+		await new Promise((r) => setTimeout(r, 100));
+		expect(peer.stats.metadataRequests).toBe(0);
+		expect(await f.offerBytes(big.info)).toBe(false);
+		conn.close();
+	});
+
+	it("refuses a wrong info dict from outside and keeps asking peers", async () => {
+		const other = makeTorrent({ seed: 24, size: 1_000_000, pieceLength: 32 * 1024 });
+		const f = new MetadataFetcher({ expected: v1(big) });
+		const tampered = big.info.slice();
+		tampered[tampered.length - 3] ^= 1;
+		expect(await f.offerBytes(other.info)).toBe(false);
+		expect(await f.offerBytes(tampered)).toBe(false);
+		expect(await f.offerBytes(new Uint8Array(0))).toBe(false);
+		expect(await f.offerBytes(Uint8Array.of(0x64, 0x65))).toBe(false);
+		expect(f.failures.external_mismatch).toBe(4);
+		expect(f.isDone).toBe(false);
+		const { conn } = await connect(f, big);
+		const { source, bytes } = await f.done;
+		expect(source).toBe("peer");
+		expect(Buffer.from(bytes).equals(Buffer.from(big.info))).toBe(true);
 		conn.close();
 	});
 });

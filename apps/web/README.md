@@ -70,6 +70,14 @@ Service URLs default to production. Override them at build/dev time:
 PUBLIC_SEEDERS_URL=http://127.0.0.1:8080 PUBLIC_WORKER_URL=http://127.0.0.1:8787 npm run dev
 ```
 
+The file-list lookup waits as long as something is left to try (the
+`/peers` stream still open, live or unknown addresses not dialled yet,
+dials in flight, peers being asked for the metadata), up to a hard cap:
+`PUBLIC_LOOKUP_CAP_SECONDS` (default 120). Meanwhile the page shows the
+peers found, tried and connected. A failed lookup keeps its session for two
+minutes: *Retry* reuses its open WebSockets and peer book
+(`src/lib/torrent/lookup-wait.ts`, `session.worker.ts`).
+
 To see every worker request in the browser console, run
 `localStorage.setItem("mw-debug", "1")` and reload.
 
@@ -94,6 +102,39 @@ bottom marks where playback last read.
   | Extras | several audio tracks; text subtitles (SRT, ASS/SSA, WebVTT, TTML), in the video or as files in the torrent |
 
   There are no decoders for TrueHD, MP2 audio, WMV or RealVideo.
+- **Native player and the streaming service worker.** `/stream-sw.js`
+  (`src/lib/stream/sw.ts`, bundled by `scripts/stream-sw.mjs`) serves
+  `/stream/<info-hash>/<file index>` with `Range` support: `206` with
+  `Content-Range`, `200` without a range, `416` past the end, `404` for an
+  invalid info-hash or index, or a file no page has open. It stores
+  nothing: it asks the page that has the file open (`src/lib/stream/bridge.ts`)
+  for the bytes, which reads them from the recovery like the libmedia
+  player does, so a read of missing data moves the recovery there and
+  waits. MP4 and WebM (`player/native.ts`) play in a plain `<video>` over
+  that URL when their codecs allow it, with SRT and WebVTT subtitle files
+  shown as WebVTT tracks. The codecs are read from the file's own index
+  first (`player/probe.ts`: the `moov` sample descriptions, the WebM
+  `Tracks`), and `player/codecs.ts` (`nativePlayable`) asks Chromium about
+  each one: HEVC without hardware support, AC3/EAC3, several audio tracks,
+  subtitle tracks inside the file, or an index that can't be read go to
+  libmedia. If Chromium can't decode the file after all, libmedia takes
+  over before anything played. The same URL with `?download=1` is the download link of a
+  recovered video (a click opens it in a hidden frame: Chromium sends links
+  with a `download` attribute past the service worker). Without the worker
+  in control (a hard reload), libmedia plays and the download reads the
+  pieces itself.
+- **Start and rebuffer thresholds** (`player/buffering.ts`). Play starts
+  once the player has read the container index and about 10 s of video
+  are verified where it starts (the spinner says "Waiting for data…"
+  meanwhile; a one-byte read there points the recovery at it). When
+  playback runs dry (the browser's `waiting`, or a libmedia read held up
+  for 400 ms), it resumes only with 5 s verified from there, not as each
+  piece arrives. Seconds become bytes at the video's average bitrate (its
+  size over its duration).
+- **Bitrate.** Once the container is read, that bitrate goes to the session
+  worker (`bitrate` message): the picker's playback window becomes 30 s of
+  it in bytes, and another WebSocket opens after 30 s under twice it (until
+  then 10 Mbit/s). The recovery details show the window.
 - **Decoding.** Built on [libmedia](https://github.com/zhaohappy/libmedia)
   (`@libmedia/avplayer`). It uses the GPU (WebCodecs) where it can, or
   Chrome's own player (MSE) when the codecs are ones Chrome plays.
@@ -104,17 +145,14 @@ bottom marks where playback last read.
   real threads. Without it, its workers can't pass subtitles to the page,
   and wasm decoding is single-threaded. The site is served by Cloudflare
   Pages, which sends the COOP/COEP headers from `public/_headers`; the dev
-  server sends them from `astro.config.mjs`. `public/coi-sw.js`, a service
-  worker registered in `src/pages/index.astro`, is the fallback from the
-  GitHub Pages days: it registers only when the page is not already
-  isolated, and is removed in M3-05.
-  - The first visit reloads once so the worker can take over.
-  - Requests to other origins pass through untouched; they must allow
-    CORS, as magnet-seeders and the worker do. Anything
+  server sends them from `astro.config.mjs`. No service worker is needed
+  for it: the page is isolated on its first load.
+  - Requests to other origins must allow CORS, as magnet-seeders and the
+    worker do. Anything
     new loaded from another origin (images, fonts) must allow CORS or send
     `Cross-Origin-Resource-Policy`.
-  - If isolation fails (a hard reload bypasses the worker), the Subtitles
-    menu says to reload. The diagnostics record `isolated` in the
+  - If isolation fails (headers missing), the Subtitles menu says to
+    reload. The diagnostics record `isolated` in the
     environment.
 - **Controls.** Seek bar with the downloaded parts shaded (bytes mapped
   linearly to time, so approximate), volume, full screen. Keys: space or

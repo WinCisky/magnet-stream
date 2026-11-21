@@ -1,5 +1,5 @@
 {
-  "plan_version": "1.3",
+  "plan_version": "1.4",
   "resolved_decisions": [
     {
       "id": "OQ-01",
@@ -36,9 +36,12 @@
     },
     {
       "id": "OQ-04",
-      "decision": "Per ora la pagina non fa upload verso i peer.",
+      "decision": "Rivista il 2026-11-19 (sostituisce \"Per ora la pagina non fa upload verso i peer\"). La pagina fa upload ai peer per essere unchoked come partner di scambio e non solo sullo slot ottimistico: solo pezzi verificati letti dallo store, choker tit-for-tat (ogni 10 s i 4 peer interessati che ci hanno dato di più negli ultimi 20 s + 1 slot ottimistico ruotato ogni 30 s che favorisce i nuovi; i seed mai unchoked), rate totale limitato (default 2 MiB/s), code per peer limitate, upload solo mentre un download è attivo, dati e `have` accodati ai messaggi upstream già previsti (da soli al massimo un flush ogni 2 s per socket), budget invariato di 40 richieste fatturate per GB scaricato. Attivo di default, disattivabile da un'impostazione in pagina. La pagina risponde anche alle richieste `ut_metadata` quando ha l'info dict verificato. Riferimento: docs/architecture.md §Chunk recovery › Reciprocation (upload). Il comportamento 'nessun upload' di M1-06 resta valido solo con l'impostazione disattivata.",
       "applied_to": [
         "M1-06",
+        "M3-03",
+        "M3-12",
+        "M4-06",
         "M5-03"
       ]
     },
@@ -137,6 +140,34 @@
         "M4-09",
         "M5-05"
       ]
+    },
+    {
+      "id": "OQ-21",
+      "decision": "Decisione del 2026-11-19, eccezione esplicita alla riga Discovery di docs/architecture.md §Target architecture nella versione precedente e a M5-01. Il VPS fa da scout nello stream `GET /peers`: sonda ogni indirizzo trovato (connect TCP 2,5 s, handshake, bitfield/extended handshake/unchoke), gli assegna un punteggio 0..1 che decade verso 0,2 con emivita ~30 min, scrive per primi gli indirizzi vivi migliori, recupera l'info dict (BEP 9) dai primi peer vivi e lo scrive nello stesso stream; `GET /metadata?ih=` resta come endpoint autonomo. Motivo (misure M2 e diagnostica del 2026-11-19): attraverso i tunnel Cloudflare un connect verso un host morto tiene lo slot ~20 s, quindi il browser prova pochi indirizzi al minuto; risultato: 3 ricerche su 4 'metadata timed out' e 2 peer che consegnano su 1.582 noti. Il codice di probing e metadati del PoC (`probe.rs`, `peerwire.rs`, `metadata.rs`) NON va eliminato; M5-01 rimuove solo `/swarm`, `/files`, `/peers?hash=` e i token. Il punteggio è solo un consiglio: il gate di handshake resta l'unica autorizzazione e il browser verifica sempre l'info dict.",
+      "applied_to": [
+        "M3-08",
+        "M3-09",
+        "M3-10",
+        "M3-11",
+        "M5-01",
+        "M5-04"
+      ]
+    },
+    {
+      "id": "OQ-22",
+      "decision": "Decisione del 2026-11-19. Sul VPS nessun database né storage persistente (scartata la proposta SQLite con coda di magnet e ranking): solo cache in memoria pesate in byte con budget fissi, perse al riavvio. Default configurabili: info dict 32 MiB (voci > 4 MiB servite ma non messe in cache), punteggi dei peer 16 MiB (max 1.000 indirizzi per info-hash, ~2 h senza uso), risultati di discovery 16 MiB (5 min); 256 sonde in volo in totale e 64 per stream; 4 fetch di metadati in volo da max 8 MiB. Niente coda di magnet: fetch on-demand con single-flight per info-hash. Riferimento: docs/architecture.md §Storage and database.",
+      "applied_to": [
+        "M3-08",
+        "M3-09",
+        "M5-04"
+      ]
+    },
+    {
+      "id": "OQ-23",
+      "decision": "Decisione del 2026-11-19. Le 6 connessioni per WebSocket sono un limite di Cloudflare e restano (al massimo 3 WebSocket per sessione). Si migliora la qualità dei candidati, non la larghezza: gli indirizzi visti vivi dallo scout possono occupare tutti i 6 slot; quelli mai provati restano al massimo 3 per socket (OQ-03); finché nessun peer consegna e ci sono più candidati che slot liberi, il secondo e il terzo WebSocket si aprono subito.",
+      "applied_to": [
+        "M3-10"
+      ]
     }
   ],
   "source_document": {
@@ -175,8 +206,8 @@
     },
     {
       "id": "M3",
-      "name": "M3 - Picker e buffer",
-      "goal": "Picker a deadline, verifica con attribuzione, OPFS, memoria di sessione, streaming via service worker"
+      "name": "M3 - Picker, buffer, scout e reciprocità",
+      "goal": "Picker a deadline, verifica con attribuzione, OPFS, memoria di sessione, streaming via service worker; scout e metadati sul VPS con cache in memoria, dial guidato dallo scout, upload tit-for-tat"
     },
     {
       "id": "M4",
@@ -247,16 +278,25 @@
       "milestone": "M3",
       "waves": [
         [
+          "M3-08",
           "M3-01",
           "M3-03"
         ],
         [
+          "M3-09",
           "M3-02",
           "M3-04",
           "M3-05"
         ],
         [
+          "M3-10",
           "M3-06"
+        ],
+        [
+          "M3-11"
+        ],
+        [
+          "M3-12"
         ],
         [
           "M3-07"
@@ -312,13 +352,13 @@
     "parent_id": null,
     "milestone": null,
     "title": "Streaming di magnet nel browser con tunnel persistenti",
-    "description": "Realizzare in un'unica monorepo l'architettura di docs/architecture.md: client BitTorrent completo nel browser, gateway di tunnel su Cloudflare Durable Object, discovery e gateway di fallback sul VPS, nessun database e nessuno storage lato server.",
+    "description": "Realizzare in un'unica monorepo l'architettura di docs/architecture.md: client BitTorrent completo nel browser (con upload tit-for-tat), gateway di tunnel su Cloudflare Durable Object, discovery con scout e metadati e gateway di fallback sul VPS, nessun database e nessuno storage persistente lato server (solo cache in memoria limitate sul VPS).",
     "depends_on": [],
     "out_of_scope": [
       "Database Postgres/Supabase",
+      "Storage persistente lato server, anche SQLite (OQ-22)",
       "Cache dei pezzi lato server",
       "Supporto a browser non Chromium",
-      "Upload verso i peer",
       "Turnstile",
       "Deploy automatico del VPS"
     ],
@@ -1241,7 +1281,7 @@
     {
       "id": "M3-01",
       "parent_id": "T0",
-      "milestone": "M3 - Picker e buffer",
+      "milestone": "M3 - Picker, buffer, scout e reciprocità",
       "executor": "agent",
       "title": "Picker dei blocchi a deadline",
       "description": "Sostituire la politica di richiesta con il picker di docs/architecture.md §Chunk recovery › Piece picking, assegnando per blocco da 16 KiB: (1) indice del contenitore (testa e coda del file), (2) finestra di riproduzione dei prossimi 20–30 s, in ordine, solo dai peer più veloci, con seconda richiesta a un altro peer per i blocchi in ritardo, (3) read-ahead sequenziale su tutti i peer unchoked con 2–4 s di richieste in coda ciascuno entro `reqq`, (4) pezzi scarsi (posseduti da uno o due peer) quando il buffer è in vantaggio, (5) back-fill. Un seek annulla con `cancel` le richieste fuori dalla nuova finestra senza chiudere connessioni. Partire dalla logica di `apps/web/src/lib/torrent/scheduler.ts` (urgent/readahead/hedge/steal) portandola in `packages/engine`. Finestre e soglie configurabili. Default: finestra di riproduzione 30 s, read-ahead 4 s di richieste per peer, pezzi scarsi solo con almeno 120 s di video verificato davanti alla posizione di riproduzione.",
@@ -1249,7 +1289,8 @@
         "M2-11"
       ],
       "parallel_with": [
-        "M3-03"
+        "M3-03",
+        "M3-08"
       ],
       "blocked_by_open_questions": [],
       "out_of_scope": [
@@ -1289,7 +1330,7 @@
     {
       "id": "M3-02",
       "parent_id": "T0",
-      "milestone": "M3 - Picker e buffer",
+      "milestone": "M3 - Picker, buffer, scout e reciprocità",
       "executor": "agent",
       "title": "Attribuzione dei blocchi ed esclusione dei peer che corrompono",
       "description": "Implementare docs/architecture.md §Chunk recovery › Verification: ogni blocco è attribuito al peer che l'ha inviato; un pezzo che fallisce lo SHA-1 viene scartato e ri-richiesto; un peer che causa due pezzi falliti è escluso per la sessione (connessione chiusa, indirizzo marcato nel PeerBook). Quando un pezzo v1 fallito ha blocchi da più peer, ri-scaricarlo da un solo peer per isolare il responsabile; per i torrent v2 l'attribuzione è diretta perché ogni blocco è verificabile singolarmente. La verifica gira fuori dal thread principale.",
@@ -1298,7 +1339,8 @@
       ],
       "parallel_with": [
         "M3-04",
-        "M3-05"
+        "M3-05",
+        "M3-09"
       ],
       "blocked_by_open_questions": [],
       "out_of_scope": [
@@ -1337,15 +1379,16 @@
     {
       "id": "M3-03",
       "parent_id": "T0",
-      "milestone": "M3 - Picker e buffer",
+      "milestone": "M3 - Picker, buffer, scout e reciprocità",
       "executor": "agent",
       "title": "Store dei pezzi su OPFS",
-      "description": "Sostituire lo store su Cache Storage (`apps/web/src/lib/torrent/store.ts`, `library.ts`) con un file OPFS sparso per torrent, scritto e letto tramite synchronous access handle nel worker dell'engine, con mappa dei pezzi verificati. API: scrittura di un pezzo verificato, lettura per intervallo di byte di un file del torrent, stato dei pezzi, eliminazione. Ciclo di vita (decisione del committente, che su questo punto SOSTITUISCE docs/architecture.md §Storage and database): si segue il PoC, ogni video aperto viene sempre salvato nel browser man mano che è recuperato, senza eliminazione automatica alla chiusura; i pezzi si eliminano solo su azione esplicita dell'utente (singolo video o tutti, come nella lista 'Saved' del PoC). Mantenere la regola del PoC per cui eliminando un video restano i pezzi di bordo ancora necessari a un altro video salvato dello stesso torrent (`library.ts`). Migrare o, se non praticabile, eliminare i cache `mw-pieces-*` del PoC al primo avvio, documentando la scelta. Gestire l'errore di quota.",
+      "description": "Sostituire lo store su Cache Storage (`apps/web/src/lib/torrent/store.ts`, `library.ts`) con un file OPFS sparso per torrent, scritto e letto tramite synchronous access handle nel worker dell'engine, con mappa dei pezzi verificati. API: scrittura di un pezzo verificato, lettura per intervallo di byte di un file del torrent, stato dei pezzi, eliminazione. Ciclo di vita (decisione del committente, che su questo punto SOSTITUISCE docs/architecture.md §Storage and database): si segue il PoC, ogni video aperto viene sempre salvato nel browser man mano che è recuperato, senza eliminazione automatica alla chiusura; i pezzi si eliminano solo su azione esplicita dell'utente (singolo video o tutti, come nella lista 'Saved' del PoC). Mantenere la regola del PoC per cui eliminando un video restano i pezzi di bordo ancora necessari a un altro video salvato dello stesso torrent (`library.ts`). Migrare o, se non praticabile, eliminare i cache `mw-pieces-*` del PoC al primo avvio, documentando la scelta. Gestire l'errore di quota. L'API di lettura deve servire anche l'upload ai peer di M3-12: lettura di un blocco (pezzo, offset, lunghezza) dal worker dell'engine, solo per pezzi verificati, e mappa dei pezzi verificati di tutto il torrent (anche da sessioni precedenti).",
       "depends_on": [
         "M2-11"
       ],
       "parallel_with": [
-        "M3-01"
+        "M3-01",
+        "M3-08"
       ],
       "blocked_by_open_questions": [],
       "out_of_scope": [
@@ -1356,6 +1399,7 @@
       "acceptance_criteria": [
         "Scritture e letture casuali corrette su file di test > 1 GiB sparso",
         "Una lettura che copre pezzi mancanti segnala quali mancano senza restituire byte non verificati",
+        "Il worker dell'engine legge un blocco da 16 KiB di un pezzo verificato senza passare dalla pagina; la lettura di un pezzo non verificato fallisce",
         "Ogni video aperto resta salvato dopo chiusura e reload senza alcuna azione dell'utente, anche se recuperato solo in parte",
         "L'eliminazione avviene solo su azione esplicita dell'utente (un video o tutti) e rimuove il file OPFS, salvo i pezzi di bordo condivisi con un altro video salvato",
         "Nessuna eliminazione automatica alla chiusura della sessione",
@@ -1382,7 +1426,7 @@
       ],
       "security": [
         "Nomi dei file OPFS derivati solo dall'info-hash validato (hex), mai dai nomi nel torrent",
-        "I dati restano nell'origine del sito; nessun upload",
+        "I dati restano nell'origine del sito: nessun invio a server; i pezzi escono solo come upload ai peer tramite l'engine (M3-12, OQ-04)",
         "L'utente può sempre eliminare tutti i dati salvati con un'azione unica",
         "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
       ]
@@ -1390,16 +1434,17 @@
     {
       "id": "M3-04",
       "parent_id": "T0",
-      "milestone": "M3 - Picker e buffer",
+      "milestone": "M3 - Picker, buffer, scout e reciprocità",
       "executor": "agent",
       "title": "Memoria di sessione in IndexedDB",
-      "description": "Persistere in IndexedDB, legati al file OPFS del torrent, metadati (info dict verificato), note sui peer (indirizzi che hanno consegnato o fallito) e posizione di riproduzione, come da docs/architecture.md §Storage and database (tabella) e §Chunk recovery › Connection management (\"Remember within the session\"). Al reload la sessione riparte senza rifare discovery e BEP 9 quando i dati sono presenti: redial diretto dei peer che avevano consegnato. I record seguono il ciclo di vita dei pezzi: salvati sempre, eliminati solo quando l'utente elimina il video. La lista 'Saved' mostra ogni video aperto, con stato parziale e percentuale come nel PoC; adattare (`saved-step.svelte`, `library.ts`).",
+      "description": "Persistere in IndexedDB, legati al file OPFS del torrent, metadati (info dict verificato), note sui peer (indirizzi che hanno consegnato o fallito) e posizione di riproduzione, come da docs/architecture.md §Storage and database (tabella) e §Chunk recovery › Connection management (\"Remember within the session\"). Al reload la sessione riparte senza rifare discovery e BEP 9 quando i dati sono presenti: redial diretto dei peer che avevano consegnato. I record seguono il ciclo di vita dei pezzi: salvati sempre, eliminati solo quando l'utente elimina il video. La lista 'Saved' mostra ogni video aperto, con stato parziale e percentuale come nel PoC; adattare (`saved-step.svelte`, `library.ts`). In più (docs/architecture.md §Chunk recovery › Connection management, revisione del 2026-11-19): l'info dict verificato si salva appena la ricerca del magnet lo ottiene, prima che un video sia aperto, in una cache limitata dei magnet solo cercati (default 50 voci o 32 MiB, la meno usata esce per prima; i record dei video salvati non contano nel limite e non escono); incollando di nuovo lo stesso magnet la lista dei file compare dalla cache senza attendere discovery né BEP 9 (la sessione e i dial partono comunque per il download). Le note sui peer includono anche il punteggio dello scout (M3-08) ricevuto, come priorità iniziale al reload.",
       "depends_on": [
         "M3-03"
       ],
       "parallel_with": [
         "M3-02",
-        "M3-05"
+        "M3-05",
+        "M3-09"
       ],
       "blocked_by_open_questions": [],
       "out_of_scope": [
@@ -1409,6 +1454,7 @@
       "acceptance_criteria": [
         "Ogni video aperto compare in 'Saved' dopo chiusura e riapertura, con percentuale recuperata",
         "Dopo un reload, i metadati non vengono riscaricati e il primo dial usa i peer memorizzati",
+        "Incollando di nuovo un magnet già cercato (senza averne aperto un video) la lista dei file compare dalla cache entro 1 s; la cache dei magnet solo cercati resta entro il suo limite",
         "I metadati letti da IndexedDB sono ri-verificati contro l'info-hash prima dell'uso",
         "Eliminando un video vengono eliminati anche i record associati",
         "La posizione di riproduzione viene ripristinata",
@@ -1438,7 +1484,7 @@
     {
       "id": "M3-05",
       "parent_id": "T0",
-      "milestone": "M3 - Picker e buffer",
+      "milestone": "M3 - Picker, buffer, scout e reciprocità",
       "executor": "agent",
       "title": "Service worker di streaming con richieste Range",
       "description": "Aggiungere un service worker che serve `/stream/<info-hash>/<file>` con supporto `Range` leggendo dallo store dei pezzi tramite l'interfaccia `read(offset, length)`: una lettura di dati mancanti sposta la finestra di riproduzione e attende i pezzi. MP4 e WebM decodificabili da Chromium vengono riprodotti in un `<video>` nativo; lo stesso URL fornisce il link di download (sostituendo `download-button.svelte`/`fetch-file.ts` dove opportuno). Il sito è servito da Cloudflare Pages (decisione registrata): le intestazioni COOP/COEP vanno inviate dal sito con `apps/web/public/_headers` e in sviluppo dalla configurazione del dev server; rimuovere il service worker di isolamento `apps/web/public/coi-sw.js` e la sua registrazione in `src/pages/index.astro`, così il service worker di streaming è l'unico nello scope. Riferimento: docs/architecture.md §Playback.",
@@ -1447,7 +1493,8 @@
       ],
       "parallel_with": [
         "M3-02",
-        "M3-04"
+        "M3-04",
+        "M3-09"
       ],
       "blocked_by_open_questions": [],
       "out_of_scope": [
@@ -1489,7 +1536,7 @@
     {
       "id": "M3-06",
       "parent_id": "T0",
-      "milestone": "M3 - Picker e buffer",
+      "milestone": "M3 - Picker, buffer, scout e reciprocità",
       "executor": "agent",
       "title": "Integrazione del player: letture come hint, soglie e bitrate",
       "description": "Completare docs/architecture.md §Playback: il player (`apps/web/src/lib/player/*`, `torrent/stream.ts`) legge solo tramite `read(offset, length)` e ogni lettura è un hint per il picker; scelta automatica tra `<video>` nativo (M3-05) e libmedia in base ai codec (`player/codecs.ts`); avvio quando indice del contenitore e circa 10 s di video sono verificati; rebuffer solo a finestra vuota e ripresa a 5 s; il bitrate medio, noto dopo il parsing del contenitore, imposta la dimensione in byte della finestra del picker e la soglia per aggiungere socket (rate sotto il doppio del bitrate per 30 s, default configurabile).",
@@ -1497,7 +1544,9 @@
         "M3-01",
         "M3-05"
       ],
-      "parallel_with": [],
+      "parallel_with": [
+        "M3-10"
+      ],
       "blocked_by_open_questions": [],
       "out_of_scope": [
         "Nuovi codec o formati",
@@ -1532,16 +1581,279 @@
       ]
     },
     {
+      "id": "M3-08",
+      "parent_id": "T0",
+      "milestone": "M3 - Picker, buffer, scout e reciprocità",
+      "executor": "agent",
+      "title": "VPS: scout nello stream `/peers` (sonde, punteggio, cache in memoria)",
+      "description": "In `services/seeders` implementare docs/architecture.md §Chunk recovery › Scouting on the VPS (decisioni OQ-21, OQ-22). Nuovo modulo `scout` che sonda ogni indirizzo trovato dal lookup di `GET /peers?ih=`: connect TCP (2,5 s, `PROBE_CONNECT_TIMEOUT_MS`), handshake BitTorrent con bit di estensione e fast, poi entro una breve finestra (`PROBE_TIMEOUT_MS`) lettura di bitfield / `have_all` / `have_none`, extended handshake (`ut_metadata`, `metadata_size`, `reqq`) ed eventuale unchoke dopo `interested` (`PROBE_UNCHOKE_WAIT_MS`); mai richieste di pezzi. Riusare e spostare nel nuovo modulo il codice di probing del PoC (`probe.rs`, `peerwire.rs`, parti di `swarm.rs`) in modo che `/swarm` continui a funzionare finché M5-01 non lo rimuove, ma senza che lo scout dipenda da `swarm.rs`. Pool di sonde globale (256, `PROBE_CONCURRENCY`) e per stream (64, `SCOUT_PER_STREAM`); una sola sonda per (info-hash, indirizzo) alla volta, condivisa tra stream concorrenti; al massimo `MAX_PROBE_PEERS` (1.000) indirizzi per info-hash ogni 10 min. Punteggio 0..1: ~0,5 per handshake completato, bonus per seed (o quota di pezzi), `ut_metadata`, unchoke della sonda e RTT basso; ~0 per connect rifiutato o scaduto; 0,2 per non sondato; decadimento verso 0,2 con emivita ~30 min (`SCOUT_HALF_LIFE_SECS`). Cache dei punteggi in memoria (moka pesata in byte, 16 MiB `SCOUT_CACHE_MB`, ~2 h senza uso `SCOUT_IDLE_SECS`, max 1.000 indirizzi per info-hash tenendo i più informativi), nessuna nuova sonda per un indirizzo sondato da meno di 10 min (`SCOUT_REPROBE_SECS`). Convertire anche la cache dei risultati di discovery da numero di voci a byte (16 MiB, `PEERS_CACHE_MB`). Formato dello stream, retrocompatibile (una riga per indirizzo, sempre con `peer`): vivi `{\"peer\",\"score\",\"alive\":true,\"seed\",\"have\",\"md\",\"unchoked\",\"rtt\"}`, morti `{\"peer\",\"score\",\"alive\":false}`, non sondati `{\"peer\",\"score\":0.2}`; ordine: prima gli indirizzi in cache ancora freschi per punteggio decrescente, poi man mano che le sonde finiscono; i non sondati alla scadenza (1 s prima della fine dello stream) o a budget esaurito; la riga `done` aggiunge i conteggi `alive`, `dead`, `unknown`. Una risposta servita dalla cache di discovery riemette i punteggi correnti. Aggiornare `docs/discovery-api.md` e le variabili in `docs/operations.md`.",
+      "depends_on": [
+        "M2-11"
+      ],
+      "parallel_with": [
+        "M3-01",
+        "M3-03"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Fetch dei metadati e riga `info` (M3-09)",
+        "Modifiche all'engine o alla pagina (M3-10, M3-11)",
+        "Rimozione di `/swarm`, `/files`, token (M5-01)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Con fake peer locali (seed vivo, parziale vivo, porta chiusa, host che non risponde, servizio non BitTorrent) le righe hanno i flag corretti e i vivi escono prima dei morti",
+        "Un client che legge solo il campo `peer` funziona come prima",
+        "Una seconda richiesta per lo stesso info-hash entro 10 min riceve subito gli indirizzi in ordine di punteggio senza nuove sonde verso gli stessi indirizzi",
+        "Le sonde in volo non superano mai il limite globale né quello per stream (test con molti stream concorrenti)",
+        "La memoria delle cache resta entro i budget configurati: test sul peso (weigher) e sull'evizione con molti info-hash e indirizzi",
+        "Il punteggio decade verso 0,2 secondo l'emivita (test con clock simulato)",
+        "Nessun indirizzo, info-hash o magnet nei log",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Punteggio e decadimento, peso delle voci, ordinamento dell'output, parsing dei messaggi letti dalla sonda con input malformati"
+        },
+        {
+          "type": "integration",
+          "covers": "Stream `/peers` contro tracker finto e fake peer di tipi diversi: flag, ordine, riga `done`, cache al secondo giro, limiti di concorrenza"
+        }
+      ],
+      "functional_test": [
+        "1. `cargo test --manifest-path services/seeders/Cargo.toml` → verde",
+        "2. Avviare seeders con `ALLOW_PRIVATE_PEERS=1` e due fake peer (`npm run fake-peer`) annunciati da un tracker locale; `curl -N '<seeders>/peers?ih=…'` → righe con `alive`, `score`, `seed`",
+        "3. Ripetere la richiesta → stesse righe subito, ordinate per punteggio"
+      ],
+      "security": [
+        "Le sonde vanno solo a indirizzi annunciati per quell'info-hash, pubblici (salvo `ALLOW_PRIVATE_PEERS` in sviluppo) e con porta ≥ 1024",
+        "Messaggi letti dai peer con limiti di lunghezza e di tempo; nessuna allocazione proporzionale a valori dichiarati dal peer",
+        "I limiti per IP di `/peers` (OQ-14) restano davanti a ogni lookup e sonda",
+        "Log senza indirizzi dei peer, IP dei client, info-hash o magnet",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M3-09",
+      "parent_id": "T0",
+      "milestone": "M3 - Picker, buffer, scout e reciprocità",
+      "executor": "agent",
+      "title": "VPS: metadati nello stream e `GET /metadata?ih=` con cache in memoria limitata",
+      "description": "In `services/seeders`, come da docs/architecture.md §Chunk recovery › Scouting on the VPS (punto Metadata) e §Storage and database (OQ-21, OQ-22): appena lo scout (M3-08) trova peer vivi che offrono `ut_metadata`, recuperare l'info dict riusando `metadata.rs` da fino a 3 peer in parallelo (vince la prima risposta verificata, scadenza 15 s `METADATA_DEADLINE_MS`, dimensione massima 8 MiB), verificandolo contro l'info-hash: SHA-1 per v1, SHA-256 troncato ai primi 20 byte per v2 (aggiungere il caso v2). Fetch on-demand con single-flight per info-hash (niente coda), al massimo 4 fetch in volo in totale (`METADATA_FETCHES`). Cache in memoria pesata in byte (default 32 MiB `METADATA_CACHE_MB`, oggi 256; voci oltre 4 MiB servite ma non messe in cache, `METADATA_CACHE_MAX_ENTRY_MB`). Lo stream `/peers` scrive una sola riga `{\"info\":\"<base64>\",\"size\":n}` appena l'info dict è disponibile (in testa se è già in cache); un fetch che finisce dopo la chiusura dello stream popola comunque la cache. `GET /metadata?ih=` viene ricollegato allo scout e alla nuova cache (non più allo snapshot di `/swarm`): byte grezzi, `Cache-Control: public, max-age=31536000, immutable`, 404 se nessun peer lo offre, 504 alla scadenza, soggetto agli stessi limiti per IP di `/peers`. `/files` può usare la stessa cache finché M5-01 non lo rimuove. Aggiornare `docs/discovery-api.md` e `docs/operations.md`.",
+      "depends_on": [
+        "M3-08"
+      ],
+      "parallel_with": [
+        "M3-02",
+        "M3-04",
+        "M3-05"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Uso dei metadati nel browser (M3-10, M3-11)",
+        "Rimozione di `/files` e `/swarm` (M5-01)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Lo stream di un torrent di test contiene una riga `info` il cui SHA-1 coincide con l'info-hash; per un torrent solo-v2 di test coincide lo SHA-256 troncato",
+        "Due richieste concorrenti per lo stesso info-hash producono un solo fetch verso i peer",
+        "Un info dict che non corrisponde all'info-hash (fake peer che mente) non viene mai servito né messo in cache e si passa al peer successivo",
+        "La cache resta entro il budget in byte e non contiene voci oltre la dimensione massima configurata",
+        "`GET /metadata?ih=` risponde dalla cache senza contattare peer e con le intestazioni di cache immutabile",
+        "Nessun info-hash nei log",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Verifica v1/v2, peso ed evizione della cache, codifica della riga `info`"
+        },
+        {
+          "type": "integration",
+          "covers": "Fake peer onesti e bugiardi: riga `info` nello stream, single-flight, `/metadata?ih=` da cache, limiti di concorrenza dei fetch"
+        }
+      ],
+      "functional_test": [
+        "1. `cargo test --manifest-path services/seeders/Cargo.toml` → verde",
+        "2. Stack locale: `curl -N '<seeders>/peers?ih=…' | grep info` → una riga; `curl '<seeders>/metadata?ih=…' | sha1sum` → l'info-hash"
+      ],
+      "security": [
+        "Dimensione dichiarata dai peer (`metadata_size`) limitata prima di allocare; memoria transitoria limitata da `METADATA_FETCHES` × 8 MiB",
+        "Mai servito un info dict non verificato",
+        "Log senza info-hash, magnet o indirizzi",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M3-10",
+      "parent_id": "T0",
+      "milestone": "M3 - Picker, buffer, scout e reciprocità",
+      "executor": "agent",
+      "title": "Engine: dial guidato dallo scout, ampiezza iniziale e preferenza per i peer utili",
+      "description": "In `packages/engine`, come da docs/architecture.md §Chunk recovery › Session start (passi 3–4) e › Connection management (revisione del 2026-11-19, OQ-21, OQ-23). (1) `readPeerStream`: leggere i nuovi campi delle righe (`score` in [0,1], `alive`, `seed`, `have` in [0,1], `md`, `unchoked`, `rtt`) e la riga `info` (base64 valida, al massimo 16 MiB decodificati) con callback dedicata; campi sconosciuti ignorati, righe non valide scartate. (2) `PeerBook`: conservare i fatti dello scout e usarli nella priorità (vivi seed > vivi parziali > sconosciuti > morti), sostituiti da quanto misurato dall'engine dopo il primo contatto. (3) `ConnectionManager`: gli indirizzi che lo scout ha visto vivi possono occupare tutti i 6 slot di un socket; il limite di 3 dial non provati per socket (OQ-03) vale per gli altri; un indirizzo 'vivo' che fallisce via tunnel diventa non provato e segue il back-off normale. Finché nessun peer consegna (metadati o primo pezzo mancanti) e i candidati superano gli slot liberi, aprire subito il secondo e il terzo WebSocket (sostituisce la regola attuale di `explore`, che si ferma appena un peer qualsiasi è connesso). Sostituzione: una connessione che non ha nessuno dei pezzi voluti è la prima a essere sostituita quando aspetta un candidato migliore; i seed hanno la precedenza nel dial. (4) `MetadataFetcher`: `offerBytes(bytes)` per un info dict arrivato da fuori (stesso controllo degli hash), parallelismo di default 4, timeout per pezzo 5 s. (5) Contatori per la diagnostica: dial tentati / riusciti / falliti per motivo, distinti tra vivi-da-scout e non provati; peer connessi, unchoked, che consegnano, seed connessi; tempo al primo unchoke; sorgente dei metadati. Larghezza massima invariata: 6 connessioni per WebSocket, 3 WebSocket.",
+      "depends_on": [
+        "M3-09"
+      ],
+      "parallel_with": [
+        "M3-06"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Corsa dei metadati e timeout nella pagina, diagnostica in UI (M3-11)",
+        "Upload (M3-12)",
+        "Più di 6 connessioni per WebSocket o più di 3 WebSocket",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Con 30 fake peer morti e 2 vivi segnalati dallo scout, i 2 vivi sono connessi entro 3 s dall'arrivo delle loro righe",
+        "Gli indirizzi non provati in volo non superano mai 3 per socket; quelli vivi-da-scout usano gli slot restanti",
+        "Senza peer che consegnano e con candidati in eccesso, il secondo e il terzo WebSocket si aprono subito; con un peer che consegna e rate sopra soglia si resta a 1",
+        "Un info dict ricevuto da fuori e corretto chiude la ricerca dei metadati; uno sbagliato viene rifiutato e la ricerca via peer continua",
+        "Una connessione senza pezzi voluti viene sostituita prima di una choked che ha pezzi voluti",
+        "Righe dello stream malformate o con valori fuori intervallo non entrano nella rubrica",
+        "Nessun indirizzo o info-hash nei log",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Parsing dello stream con input ostili, priorità della rubrica, limiti di dial con clock simulato, regola di apertura dei socket, scelta della vittima"
+        },
+        {
+          "type": "integration",
+          "covers": "wrangler dev + fake peer vivi e indirizzi morti con stream `/peers` simulato o seeders locale: tempi di connessione, metadati da fuori, conteggio dei messaggi"
+        }
+      ],
+      "functional_test": [
+        "1. `npm test -w packages/engine` → verde",
+        "2. `npm run e2e` → verde, il report stampa i dial per esito e i messaggi upstream"
+      ],
+      "security": [
+        "I fatti dello scout sono solo priorità: il gate di handshake e la verifica dei metadati restano obbligatori",
+        "Limiti rigidi su connessioni, dial e dimensione della riga `info`, indipendenti dal contenuto dello stream",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M3-11",
+      "parent_id": "T0",
+      "milestone": "M3 - Picker, buffer, scout e reciprocità",
+      "executor": "agent",
+      "title": "Pagina: metadati dal VPS, attesa della lista file legata al progresso e diagnostica",
+      "description": "In `apps/web` (`session.worker.ts`, `page-session.ts`, `magnet-flow.svelte`, diagnostica), come da docs/architecture.md §Chunk recovery › Session start e › Connection management (revisione del 2026-11-19). (1) Lista dei file dalla prima sorgente: cache IndexedDB (M3-04), riga `info` dello stream `/peers` (via `offerBytes` di M3-10) o BEP 9 dai peer; sempre verificata contro l'info-hash. (2) Sostituire il timeout fisso di 60 s (`METADATA_TIMEOUT_MS`) con un'attesa legata al progresso: si rinuncia solo quando discovery è finita e non restano candidati vivi o sconosciuti né dial in volo, oppure al limite massimo (default 120 s, configurabile); durante l'attesa la pagina mostra il progresso (peer trovati, provati, connessi) senza indirizzi. (3) Una ricerca fallita non chiude la sessione: 'Riprova' riusa la sessione e la rubrica dei peer invece di ripartire da zero; la sessione si chiude cambiando magnet o dopo un periodo di inattività. (4) Diagnostica: il report usa i contatori di M3-10 (dial per esito, peer connessi/unchoked/che consegnano, seed, sorgente e tempo dei metadati, stream dello scout: vivi/morti/sconosciuti) e sostituisce le sezioni legate al PoC (`magnet-worker`, `/swarm`, `/metadata` come API, conteggio seeder) con quelle del tunnel e dello scout; la riga di misura copiabile resta compatibile con `docs/measurements.md`.",
+      "depends_on": [
+        "M3-10",
+        "M3-04"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Upload e relative metriche (M3-12)",
+        "Logica dell'engine (M3-10)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Con la riga `info` presente la lista dei file compare senza attendere BEP 9; con una riga `info` falsificata compare comunque quella corretta dai peer",
+        "Con candidati ancora da provare la ricerca non fallisce prima del limite massimo; senza candidati e con discovery finita fallisce subito con un messaggio chiaro",
+        "'Riprova' dopo un fallimento non riapre i WebSocket già aperti e non ridialla gli indirizzi già falliti prima del loro back-off",
+        "Il report di diagnostica esportato contiene i nuovi contatori e nessuna sezione del PoC; resta anonimo (nessun indirizzo, info-hash, magnet, nome di file)",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Macchina a stati dell'attesa dei metadati con clock simulato, scelta della sorgente, nuove sezioni del report"
+        },
+        {
+          "type": "e2e",
+          "covers": "Playwright: lista file da riga `info`; da peer con riga `info` assente o falsa; 'Riprova' dopo fallimento; contatori nel report"
+        }
+      ],
+      "functional_test": [
+        "1. `npm run e2e` → verde",
+        "2. Stack locale contro uno swarm reale grande: incollare il magnet → lista file in pochi secondi; menu diagnostica → dial per esito e sorgente dei metadati"
+      ],
+      "security": [
+        "I metadati da VPS o cache sono non fidati finché non verificati",
+        "Il report esportato resta anonimo come oggi",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M3-12",
+      "parent_id": "T0",
+      "milestone": "M3 - Picker, buffer, scout e reciprocità",
+      "executor": "agent",
+      "title": "Upload ai peer: choker tit-for-tat, servizio dei pezzi verificati e limiti",
+      "description": "Implementare docs/architecture.md §Chunk recovery › Reciprocation (upload) e le regole di §Tunnel protocol and request budget riviste (OQ-04). Engine (`packages/engine`): dopo i metadati inviare bitfield (o `have_none` + `have`) dei pezzi verificati presenti nello store (M3-03, anche da sessioni precedenti) e `have` per ogni nuovo pezzo verificato, accodati al prossimo messaggio upstream; choker: ogni 10 s unchoke dei 4 peer interessati che ci hanno dato di più negli ultimi 20 s, più 1 slot ottimistico ruotato ogni 30 s che favorisce le connessioni nuove, seed mai unchoked; servire `request` solo per peer unchoked, pezzi verificati, offset e lunghezze validi (blocchi ≤ 16 KiB), al massimo `reqq` annunciato (250) richieste e 2 MiB in coda per peer, il resto rifiutato con `reject_request` (BEP 6) o ignorato; letture dallo store nel worker dell'engine; rispondere alle richieste `ut_metadata` con l'info dict verificato. Costo: i dati di upload viaggiano nei messaggi upstream già previsti; se nessun altro messaggio è dovuto, flush al massimo ogni 2 s per socket (configurabile); upload solo mentre un download è attivo (sessione sospesa, inattiva o completa: choke di tutti); rate totale limitato (default 2 MiB/s, token bucket). Gateway (`apps/gateway`): limitare i byte non ancora scritti verso un peer (default 4 MiB, `TUNNEL_MAX_PENDING_WRITE_BYTES`) chiudendo la connessione con un motivo dedicato (aggiungerlo a `packages/tunnel-protocol` e `docs/tunnel-protocol.md`). Pagina (`apps/web`): impostazione 'Condividi con i peer' attiva di default, persistita e validata, che disattiva l'upload (comportamento di M1-06); diagnostica con byte caricati, peer unchoked da noi e messaggi causati dall'upload. Tools: modalità del fake peer 'leecher tit-for-tat' che fa unchoke solo a chi gli carica. Aggiornare i commenti dell'engine che dichiarano 'nessun upload'.",
+      "depends_on": [
+        "M3-01",
+        "M3-03",
+        "M3-10"
+      ],
+      "parallel_with": [],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Upload verso peer WebRTC (M5-03)",
+        "Super-seeding, richieste di hash v2 (BEP 52 hash request) dai peer",
+        "Annunciarsi negli swarm (M4-02)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Con un fake leecher tit-for-tat che possiede pezzi che ci mancano, l'engine viene unchoked solo con l'upload attivo e scarica da esso",
+        "Vengono serviti solo pezzi verificati; richieste per pezzi mancanti, fuori limiti, troppo grandi o da peer choked non leggono mai lo store",
+        "Il rate di upload non supera il limite configurato e si azzera con sessione sospesa o download completo",
+        "Con l'impostazione disattivata non partono bitfield, `unchoke` né `piece` (come M1-06)",
+        "Nell'e2e su swarm misto le richieste fatturate per GB scaricato restano entro 40",
+        "Il gateway chiude una connessione il cui peer non legge oltre il limite di byte in sospeso, senza toccare le altre del socket",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Choker con clock simulato (regolari, ottimistico, seed esclusi), validazione delle `request`, token bucket, politica di flush, limite di scrittura del gateway"
+        },
+        {
+          "type": "integration",
+          "covers": "wrangler dev + fake leecher tit-for-tat e fake seed: unchoke ottenuto solo con upload, conteggio dei messaggi, peer che non legge"
+        },
+        {
+          "type": "e2e",
+          "covers": "Playwright: impostazione on/off, byte caricati nella diagnostica, budget di 40 richieste per GB"
+        }
+      ],
+      "functional_test": [
+        "1. `npm test -w packages/engine && npm run test:integration -w apps/gateway` → verde",
+        "2. `npm run e2e` → verde, il report stampa byte caricati e richieste fatturate per GB",
+        "3. Stack locale contro uno swarm reale con leecher: diagnostica → byte caricati > 0 e più peer che consegnano rispetto all'impostazione disattivata"
+      ],
+      "security": [
+        "Ogni `request` ricevuta è validata (indice, offset, lunghezza, stato di choke) prima di qualsiasi lettura; limiti di coda per peer contro l'esaurimento di memoria",
+        "Solo pezzi verificati escono dal browser, e solo verso peer del torrent attraverso il gate di handshake",
+        "Il gateway non bufferizza senza limite i dati diretti ai peer",
+        "L'impostazione dell'utente letta dallo storage è validata e in caso di dubbio vale il default documentato",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
       "id": "M3-07",
       "parent_id": "T0",
-      "milestone": "M3 - Picker e buffer",
+      "milestone": "M3 - Picker, buffer, scout e reciprocità",
       "executor": "human",
       "title": "Revisione manuale M3",
-      "description": "Revisione umana: diff, test funzionali di M3, prove con file reali di formati diversi, verifica dell'uso di storage e della pulizia, commit.",
+      "description": "Revisione umana: diff, test funzionali di M3 (M3-01…M3-12), prove con file reali di formati diversi, verifica dell'uso di storage e della pulizia, prove su swarm grandi e sottili con scout e upload, memoria del VPS, commit.",
       "depends_on": [
         "M3-02",
         "M3-04",
-        "M3-06"
+        "M3-06",
+        "M3-11",
+        "M3-12"
       ],
       "parallel_with": [],
       "blocked_by_open_questions": [],
@@ -1550,7 +1862,11 @@
       ],
       "acceptance_criteria": [
         "Criteri di accettazione di M3 verificati",
-        "Misure dei tre numeri aggiornate in `docs/measurements.md`",
+        "Misure dei tre numeri aggiornate in `docs/measurements.md`, con almeno uno swarm grande (> 500 peer noti) e uno sottile, confrontate con la riga del 2026-11-19 (4400 MB, 1582 / 2, 0,07 MB/s)",
+        "Su almeno 10 ricerche di magnet reali la lista dei file arriva in ≥ 95 % dei casi; tempi annotati, con la sorgente (cache, VPS, peer)",
+        "Su uno swarm grande più di 2 peer consegnano e la quota di tempo senza dati scende sotto il 20 %",
+        "Upload osservato verso peer che ricambiano; con l'impostazione disattivata nessun byte caricato; richieste fatturate per GB entro 40 sullo swarm sano",
+        "RSS del servizio VPS sotto ~150 MiB dopo un'ora di uso con cache piene (budget di OQ-22)",
         "Verificati il salvataggio automatico di ogni video e l'eliminazione esplicita",
         "Commit creati dall'umano; CI verde"
       ],
@@ -1558,10 +1874,13 @@
       "functional_test": [
         "1. `npm ci && npm run verify && npm run e2e`",
         "2. Sessioni reali con MP4 e MKV, seek ripetuti, reload a metà",
-        "3. DevTools › Application: controllare OPFS e IndexedDB dopo la chiusura e dopo l'eliminazione da 'Saved'"
+        "3. DevTools › Application: controllare OPFS e IndexedDB dopo la chiusura e dopo l'eliminazione da 'Saved'",
+        "4. Stack locale contro swarm reali (docs/measurements.md): magnet con molti peer e magnet con pochi seed; esportare la diagnostica e confrontare peer provati/connessi/che consegnano, upload e tempi della lista file",
+        "5. Sul VPS di staging: `ps -o rss` del servizio prima e dopo una serie di ricerche"
       ],
       "security": [
-        "Confermare che nessun dato dei pezzi o indirizzo peer lasci il browser"
+        "Confermare che nessun dato dei pezzi o indirizzo peer lasci il browser se non come upload ai peer",
+        "Confermare che i log del VPS non contengano indirizzi dei peer, info-hash o magnet anche con lo scout attivo"
       ]
     },
     {
@@ -1808,7 +2127,7 @@
       "milestone": "M4 - Percorso pochi seeder",
       "executor": "agent",
       "title": "Engine: regole di escalation e degrado dichiarato",
-      "description": "Implementare in `packages/engine` e `apps/web` la scala di docs/architecture.md §Chunk recovery › Swarms with few seeders: (1) pazienza sui tunnel Cloudflare restando connessi e interested in attesa dell'unchoke ottimistico, (2) uso dei peer parziali, (3) apertura del tunnel verso il gateway VPS e richiesta di ingresso nello swarm quando meno di 2 peer consegnano o il rate resta sotto il bitrate, (5) messaggio in pagina quando il rate è sotto il bitrate, con opzione di continuare a bufferizzare. URL del gateway VPS da variabile pubblica di build. Soglie configurabili con default volutamente esigenti (decisione registrata): l'escalation al VPS scatta solo se meno di 2 peer consegnano per 90 s consecutivi, oppure se il rate resta sotto il bitrate per 90 s consecutivi; l'avviso in pagina compare dopo 30 s di rate sotto il bitrate.",
+      "description": "Implementare in `packages/engine` e `apps/web` la scala di docs/architecture.md §Chunk recovery › Swarms with few seeders: (1) pazienza sui tunnel Cloudflare restando connessi e interested in attesa dell'unchoke ottimistico, (2) uso dei peer parziali, (3) apertura del tunnel verso il gateway VPS e richiesta di ingresso nello swarm quando meno di 2 peer consegnano o il rate resta sotto il bitrate, (5) messaggio in pagina quando il rate è sotto il bitrate, con opzione di continuare a bufferizzare. URL del gateway VPS da variabile pubblica di build. Soglie configurabili con default volutamente esigenti (decisione registrata): l'escalation al VPS scatta solo se meno di 2 peer consegnano per 90 s consecutivi, oppure se il rate resta sotto il bitrate per 90 s consecutivi; l'avviso in pagina compare dopo 30 s di rate sotto il bitrate. Le connessioni consegnate dal gateway VPS partecipano al choker e all'upload di M3-12 (OQ-04) come quelle dei tunnel Cloudflare; la soglia 'meno di 2 peer che consegnano' si valuta dopo che lo scout (M3-08) ha esaurito i candidati vivi.",
       "depends_on": [
         "M4-02"
       ],
@@ -1818,7 +2137,7 @@
       "blocked_by_open_questions": [],
       "out_of_scope": [
         "uTP e hole punching lato VPS",
-        "Upload verso i peer (escluso per decisione registrata)",
+        "Choker e upload (M3-12): qui le connessioni accettate dal VPS vi partecipano come le altre, senza logica nuova",
         "Eseguire git commit, push o deploy"
       ],
       "acceptance_criteria": [
@@ -1972,8 +2291,8 @@
       "parent_id": "T0",
       "milestone": "M5 - Pulizia e sorgenti extra",
       "executor": "agent",
-      "title": "Rimozione degli endpoint legacy da services/seeders",
-      "description": "Rimuovere `/swarm`, `/metadata`, `/files`, il probing e i token da `services/seeders` (`swarm.rs`, `probe.rs`, `metadata.rs`, `files.rs`, `token.rs`, parti di `main.rs`, `config.rs`, `testpeer.rs` se non più usato) e `WORKER_TOKEN_SECRET` da config ed esempi. Valutare `/peers` (formato non streaming del PoC): rimuoverlo solo se nessun client lo usa. Aggiornare README e `docs/discovery-api.md`. Riferimento: docs/architecture.md §Risks, open questions and delivery › Phase 4.",
+      "title": "Rimozione degli endpoint legacy da services/seeders (scout e metadati restano)",
+      "description": "Rimuovere da `services/seeders` solo ciò che serviva al flusso del PoC: `/swarm` (snapshot, polling, `swarm.rs` per la parte non riusata dallo scout), `/files` (`files.rs` se non più usato), il formato JSON non streaming `GET /peers?hash=` (solo se nessun client lo usa), i token (`token.rs`, `WORKER_TOKEN_SECRET`, `TOKEN_TTL_SECS`) e le variabili di configurazione usate solo da questi (`REFRESH_INTERVAL_SECS`, `ACTIVE_TTL_SECS` se non riusate). NON rimuovere (OQ-21): il probing (`probe.rs`), `peerwire.rs`, il fetch dei metadati (`metadata.rs`), lo scout e le sue cache (M3-08), la riga `info` dello stream e `GET /metadata?ih=` (M3-09), `testpeer.rs` se usato dai test dello scout. Aggiornare README e `docs/discovery-api.md`. Riferimento: docs/architecture.md §Risks, open questions and delivery › Phase 4 (versione rivista).",
       "depends_on": [
         "M4-09"
       ],
@@ -1983,12 +2302,13 @@
       ],
       "blocked_by_open_questions": [],
       "out_of_scope": [
-        "Modifiche a discovery o gateway VPS",
+        "Modifiche al comportamento di discovery, scout, metadati o gateway VPS",
         "Eseguire git commit, push o deploy"
       ],
       "acceptance_criteria": [
-        "Le route rimosse rispondono 404",
-        "Nessun riferimento a token o probing nel codice e nella configurazione",
+        "`/swarm`, `/files` e (se rimosso) `/peers?hash=` rispondono 404",
+        "`/peers?ih=` con scout e riga `info` e `GET /metadata?ih=` invariati: le loro suite di test restano verdi senza modifiche",
+        "Nessun riferimento a token o `WORKER_TOKEN_SECRET` nel codice e nella configurazione",
         "`cargo clippy -- -D warnings` senza codice morto",
         "e2e completi verdi",
         "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
@@ -1997,7 +2317,7 @@
       "automated_tests": [
         {
           "type": "integration",
-          "covers": "Route rimosse → 404; suite di discovery e gateway invariate"
+          "covers": "Route rimosse → 404; suite di discovery, scout, metadati e gateway invariate"
         },
         {
           "type": "e2e",
@@ -2005,8 +2325,9 @@
         }
       ],
       "functional_test": [
-        "1. `grep -rn 'WORKER_TOKEN_SECRET\\|/swarm\\|/metadata' services apps packages` → nessun risultato fuori dai documenti storici",
-        "2. `npm run verify && npm run e2e` → exit 0"
+        "1. `grep -rn 'WORKER_TOKEN_SECRET\\|/swarm\\|/files' services apps packages` → nessun risultato fuori dai documenti storici",
+        "2. `curl '<seeders>/metadata?ih=<test>'` sullo stack locale → info dict del torrent di test",
+        "3. `npm run verify && npm run e2e` → exit 0"
       ],
       "security": [
         "Riduzione della superficie d'attacco e rimozione di un segreto condiviso non più necessario",
@@ -2065,7 +2386,7 @@
       "milestone": "M5 - Pulizia e sorgenti extra",
       "executor": "agent",
       "title": "Tracker WebSocket e peer WebRTC come tipo di connessione",
-      "description": "Aggiungere a `packages/engine` l'announce ai tracker WebSocket presenti nel magnet e le connessioni WebRTC (data channel) verso peer WebTorrent, esposte tramite la stessa interfaccia `Transport`. Riferimento: docs/architecture.md §Chunk recovery › Peer sources (riga WebSocket trackers and WebRTC peers), §Summary (ultima frase).",
+      "description": "Aggiungere a `packages/engine` l'announce ai tracker WebSocket presenti nel magnet e le connessioni WebRTC (data channel) verso peer WebTorrent, esposte tramite la stessa interfaccia `Transport`. Riferimento: docs/architecture.md §Chunk recovery › Peer sources (riga WebSocket trackers and WebRTC peers), §Summary (ultima frase). I peer WebRTC partecipano al choker e all'upload di M3-12 (OQ-04) come le altre connessioni.",
       "depends_on": [
         "M4-09"
       ],
@@ -2075,7 +2396,6 @@
       ],
       "blocked_by_open_questions": [],
       "out_of_scope": [
-        "Fare da seed per peer WebRTC: nessun upload verso i peer (decisione registrata)",
         "Aggiunta di tracker WebSocket non presenti nel magnet",
         "Eseguire git commit, push o deploy"
       ],
@@ -2111,7 +2431,7 @@
       "milestone": "M5 - Pulizia e sorgenti extra",
       "executor": "agent",
       "title": "Runbook operativi e configurazione di deploy",
-      "description": "Scrivere `docs/operations.md` e aggiornare i file di esempio: rimando al deploy automatico di gateway e frontend (M2-10) con le sue variabili; procedura MANUALE completa di deploy del servizio VPS, passo per passo: build release, copia del binario, file env, unità systemd, nginx, verifica di salute, rollback (`services/seeders/deploy/*.service`, nginx con WebSocket e stream NDJSON senza buffering partendo da `deploy/nginx-magnet-seeders.conf` del PoC, endpoint pubblico con TLS e origine del frontend come unica origine ammessa, env example), del sito statico; limiti di richieste configurati (gateway e `/peers`) e come modificarli; Turnstile resta un'opzione non implementata; procedura per cambiare percorso di default; elenco completo delle variabili d'ambiente per componente. Riferimenti: docs/architecture.md §Cost model, §Tunnel protocol and request budget › Rules (Abuse limits), §Risks.",
+      "description": "Scrivere `docs/operations.md` e aggiornare i file di esempio: rimando al deploy automatico di gateway e frontend (M2-10) con le sue variabili; procedura MANUALE completa di deploy del servizio VPS, passo per passo: build release, copia del binario, file env, unità systemd, nginx, verifica di salute, rollback (`services/seeders/deploy/*.service`, nginx con WebSocket e stream NDJSON senza buffering partendo da `deploy/nginx-magnet-seeders.conf` del PoC, endpoint pubblico con TLS e origine del frontend come unica origine ammessa, env example), del sito statico; limiti di richieste configurati (gateway e `/peers`) e come modificarli; Turnstile resta un'opzione non implementata; procedura per cambiare percorso di default; elenco completo delle variabili d'ambiente per componente. Riferimenti: docs/architecture.md §Cost model, §Tunnel protocol and request budget › Rules (Abuse limits), §Risks. Documentare anche i budget di memoria del VPS (OQ-22: `METADATA_CACHE_MB`, `SCOUT_CACHE_MB`, `PEERS_CACHE_MB`, `PROBE_CONCURRENCY`, `SCOUT_PER_STREAM`, `METADATA_FETCHES` e gli altri introdotti da M3-08/M3-09), come stimarli per la RAM disponibile e come controllare l'RSS del servizio; nell'unità systemd un `MemoryMax` coerente.",
       "depends_on": [
         "M5-01",
         "M5-02",
@@ -2127,6 +2447,7 @@
       "acceptance_criteria": [
         "La procedura manuale di deploy e rollback del VPS è eseguibile seguendo solo `docs/operations.md`",
         "Ogni variabile d'ambiente usata dal codice è documentata con scopo, default e se è segreta",
+        "I budget di memoria del VPS sono documentati con default, effetto e procedura di verifica dell'RSS; l'unità systemd ha `MemoryMax`",
         "I file di esempio contengono solo segnaposto",
         "L'unità systemd usa utente dedicato, `NoNewPrivileges`, e solo le capability necessarie",
         "La configurazione nginx disabilita il buffering per `/peers` e supporta l'upgrade WebSocket",

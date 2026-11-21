@@ -4,20 +4,26 @@
 	import DiagnosticsMenu from "./diagnostics-menu.svelte";
 	import MagnetForm from "./magnet-form.svelte";
 	import PageShell from "./page-shell.svelte";
+	import ShareToggle from "./share-toggle.svelte";
+	import type { LookupProgress } from "$lib/torrent/lookup-wait";
 
 	let {
 		value = $bindable(""),
 		verifying = false,
 		phase = null,
 		error = null,
+		progress = null,
 		onSubmit,
+		onRetry = undefined,
 		onShowSaved,
 	}: {
 		value: string;
 		verifying?: boolean;
 		phase?: "metadata" | "seeders" | null;
 		error?: string | null;
+		progress?: LookupProgress | null;
 		onSubmit: () => void;
+		onRetry?: () => void;
 		onShowSaved: () => void;
 	} = $props();
 </script>
@@ -29,6 +35,7 @@
 			Saved
 		</Button>
 		<DiagnosticsMenu />
+		<ShareToggle />
 	{/snippet}
 
 	<!-- Sits a bit above the middle, like a prompt. -->
@@ -37,6 +44,6 @@
 			<img src={`${import.meta.env.BASE_URL.replace(/\/?$/, "/")}favicon.svg`} alt="" class="size-8 shrink-0 sm:size-9" />
 			What do you want to watch?
 		</h1>
-		<MagnetForm bind:value {verifying} {phase} {error} {onSubmit} />
+		<MagnetForm bind:value {verifying} {phase} {error} {progress} {onSubmit} {onRetry} />
 	</div>
 </PageShell>

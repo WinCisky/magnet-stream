@@ -2,10 +2,11 @@
 	import { onMount } from "svelte";
 	import { ModeWatcher } from "mode-watcher";
 	import type { Metainfo } from "@magnet-stream/engine/metainfo";
-	import { type TorrentMetadata } from "$lib/magnet/api";
-	import { PageSession } from "$lib/torrent/page-session";
+	import { LOOKUP_CAP_MS, type TorrentMetadata } from "$lib/magnet/api";
+	import { LookupFailedError, PageSession, type LookupResult } from "$lib/torrent/page-session";
+	import type { LookupProgress } from "$lib/torrent/lookup-wait";
 	import { isVideoFile } from "$lib/magnet/files";
-	import { diagnostics } from "$lib/diagnostics/recorder";
+	import { diagnostics, type SessionRecorder } from "$lib/diagnostics/recorder";
 	import MagnetInputStep from "./magnet-input-step.svelte";
 	import FileSelectStep from "./file-select-step.svelte";
 	import FileViewStep from "./file-view-step.svelte";
@@ -20,6 +21,9 @@
 	let seedersCount = $state<number | null>(null);
 	let selectedFileIndex = $state<number | null>(null);
 	let currentMagnet = $state<string | null>(null);
+	let lookupProgress = $state<LookupProgress | null>(null);
+	/** A lookup failed and its session waits for a retry: the magnet and file asked for. */
+	let failed = $state<{ magnet: string; file: number | null } | null>(null);
 
 	let abortController: AbortController | null = null;
 	// Raw state: passed to the view as props; the objects themselves are not made reactive.
@@ -27,6 +31,39 @@
 	let knownMeta = $state.raw<Metainfo | null>(null);
 	/** Home was opened from a video's search button (for diagnostics). */
 	let searchFromVideo = false;
+	/** Diagnostics of the current session (lookup, tunnel, scout). */
+	let sessionRecorder: SessionRecorder | null = null;
+	/** A failed lookup's session closes after this long without a retry. */
+	const FAILED_SESSION_IDLE_MS = 120_000;
+	let failedTimer: ReturnType<typeof setTimeout> | undefined;
+
+	function clearFailed() {
+		clearTimeout(failedTimer);
+		failedTimer = undefined;
+		failed = null;
+	}
+
+	/** Close the torrent session (another magnet, home, inactivity after a failure). */
+	function closeSession() {
+		clearFailed();
+		session?.close();
+		session = null;
+		sessionRecorder?.end();
+		sessionRecorder = null;
+	}
+
+	function openSession(): PageSession {
+		closeSession();
+		const current = new PageSession();
+		const recorder = diagnostics.session();
+		current.onDiag = (d) => recorder.update(d);
+		current.onLookupProgress = (p) => {
+			if (session === current) lookupProgress = p;
+		};
+		session = current;
+		sessionRecorder = recorder;
+		return current;
+	}
 
 	const videoFiles = $derived(
 		metadata
@@ -71,22 +108,45 @@
 		error = null;
 		verifying = true;
 		verifyPhase = "metadata";
+		lookupProgress = null;
 		step = "input";
 
+		// The same magnet after a failed lookup: look again in its session
+		// (open WebSockets, peer book and back-offs kept), not from scratch.
+		const again = failed !== null && failed.magnet === magnetUri && session !== null && session.retryable;
+		let current: PageSession;
+		let run: () => Promise<LookupResult>;
+		if (again && session) {
+			current = session;
+			clearFailed();
+			sessionRecorder?.retried();
+			run = () => current.retry();
+		} else {
+			current = openSession();
+			run = () => current.lookup(magnetUri, { capMs: LOOKUP_CAP_MS });
+		}
+		const recorder = sessionRecorder;
+
 		try {
-			session?.close();
-			const current = new PageSession();
-			session = current;
-			// A lookup that fails must not leave its worker and WebSockets behind.
-			const lookedUp = await timed(
-				() => current.lookup(magnetUri).catch((e: unknown) => {
-					current.close();
-					if (session === current) session = null;
-					throw e;
-				}),
-				controller.signal,
-				(ms, e) => diagnostics.metadataApi(ms, e)
-			);
+			let lookedUp: LookupResult;
+			try {
+				lookedUp = await timed(run, controller.signal, (ms, e) => diagnostics.metadataApi(ms, e));
+			} catch (e) {
+				if (controller.signal.aborted || session !== current) throw e;
+				if (e instanceof LookupFailedError && current.retryable) {
+					// The session stays for a retry, then closes when left alone.
+					recorder?.failed(e.reason, e.progress);
+					failed = { magnet: magnetUri, file: fileIndexParam };
+					failedTimer = setTimeout(() => {
+						if (session === current && failed) closeSession();
+					}, FAILED_SESSION_IDLE_MS);
+				} else {
+					// Nothing to retry: no worker and WebSockets left behind.
+					closeSession();
+				}
+				throw e;
+			}
+			recorder?.listed(lookedUp.source);
 			const meta = lookedUp.metadata;
 			knownMeta = lookedUp.meta;
 			const count = lookedUp.seeders;
@@ -97,8 +157,7 @@
 
 			if (videos.length === 0) {
 				diagnostics.count("no_video_in_magnet");
-				session?.close();
-				session = null;
+				closeSession();
 				knownMeta = null;
 				metadata = null;
 				currentMagnet = null;
@@ -155,7 +214,9 @@
 			report(performance.now() - started, null);
 			return result;
 		} catch (e) {
-			if (!signal.aborted) report(performance.now() - started, e instanceof Error ? e.message : String(e));
+			// A lookup that gave up is counted by its reason (its message carries counts).
+			const why = e instanceof LookupFailedError ? `lookup ${e.reason}` : e instanceof Error ? e.message : String(e);
+			if (!signal.aborted) report(performance.now() - started, why);
 			throw e;
 		}
 	}
@@ -180,8 +241,7 @@
 
 		if (!magnet) {
 			abortController?.abort();
-			session?.close();
-			session = null;
+			closeSession();
 			knownMeta = null;
 			abortController = null;
 			verifying = false;
@@ -231,7 +291,13 @@
 		error = null;
 		diagnostics.count(searchFromVideo ? "magnet_submitted_from_video" : "magnet_submitted");
 		searchFromVideo = false;
-		runVerification(value, null, { push: true });
+		runVerification(value, failed?.magnet === value ? failed.file : null, { push: true });
+	}
+
+	function handleRetry() {
+		if (verifying || !failed) return;
+		diagnostics.count("lookup_retried");
+		runVerification(failed.magnet, failed.file, { push: false });
 	}
 
 	function navigate(params: { magnet: string; file?: number } | "saved" | null) {
@@ -254,6 +320,7 @@
 		return () => {
 			window.removeEventListener("popstate", syncFromUrl);
 			abortController?.abort();
+			closeSession();
 		};
 	});
 </script>
@@ -297,7 +364,9 @@
 		{verifying}
 		phase={verifyPhase}
 		{error}
+		progress={lookupProgress}
 		onSubmit={handleSubmit}
+		onRetry={failed ? handleRetry : undefined}
 		onShowSaved={() => {
 			diagnostics.count("saved_opened");
 			navigate("saved");

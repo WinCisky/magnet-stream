@@ -168,6 +168,18 @@ describe("replacement policy", () => {
 		expect(replacementVictim([young, old], 30_000, 30_000)?.key).toBe("old");
 		expect(replacementVictim([old, slower], 30_000, 30_000)?.key).toBe("slow");
 	});
+
+	it("replaces a connection with none of the wanted pieces first, before a choked one that has some", () => {
+		const chokedUseful = slot({ key: "choked", choked: true, openedAt: 0, score: -5 });
+		const useless = slot({ key: "useless", openedAt: 29_000, downloaded: 1_000_000, score: 10 });
+		const slower = slot({ key: "slow", slow: true, downloaded: 1, openedAt: 0 });
+		expect(replacementVictim([chokedUseful, slower, useless], 30_000, 30_000)?.key).toBe("choked");
+		useless.useless = true;
+		expect(replacementVictim([chokedUseful, slower, useless], 30_000, 30_000)?.key).toBe("useless");
+		// Even before the choked one's grace period, and never one that delivers.
+		expect(replacementVictim([slot({ key: "young", choked: true, openedAt: 29_000 }), useless], 30_000, 30_000)?.key).toBe("useless");
+		expect(replacementVictim([slot({ key: "d", delivering: true, useless: true })], 30_000, 30_000)).toBeUndefined();
+	});
 });
 
 describe("socket width and in-flight cap", () => {

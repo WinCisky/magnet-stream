@@ -96,6 +96,24 @@ export class FileStream {
 		return copied;
 	}
 
+	/**
+	 * Verified bytes of the file in one run from `offset` (0 before the
+	 * torrent's layout is known), counting no further than `limit`: what
+	 * playback can read from there without waiting.
+	 */
+	available(offset: number, limit = Number.POSITIVE_INFINITY): number {
+		const backend = this.backend;
+		if (!backend || this.closed || !Number.isFinite(offset) || offset < 0) return 0;
+		const { range, pieceLength } = backend;
+		if (offset >= range.size) return 0;
+		const start = range.offset + Math.floor(offset);
+		const fileEnd = range.offset + range.size;
+		const stopAt = Math.min(fileEnd, start + Math.max(0, limit));
+		let piece = Math.floor(start / pieceLength);
+		while (piece <= range.lastPiece && piece * pieceLength < stopAt && backend.isVerified(piece)) piece++;
+		return Math.max(0, Math.min(piece * pieceLength, fileEnd) - start);
+	}
+
 	/** A piece was just verified: wake its readers, keep it if it's read next. */
 	verified(piece: number, data: Uint8Array): void {
 		const waiting = this.waiters.get(piece);

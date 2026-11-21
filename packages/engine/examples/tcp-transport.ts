@@ -10,7 +10,7 @@ const PROTOCOL = Buffer.from("\x13BitTorrent protocol", "latin1");
 export class TcpTransport extends BufferedTransport {
 	readonly remote: HandshakeInfo;
 	readonly local: { reserved: Uint8Array };
-	/** Every byte we sent after the handshake (to check we never upload). */
+	/** Every byte we sent after the handshake (to check what we upload). */
 	readonly sent: Uint8Array[] = [];
 	private readonly socket: net.Socket;
 

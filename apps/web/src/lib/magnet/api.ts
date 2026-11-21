@@ -20,6 +20,15 @@ export const SEEDERS_API_URL: string =
 export const WORKER_API_URL: string =
 	import.meta.env.PUBLIC_WORKER_URL ?? "https://magnet-worker.opentrust.it";
 
+/**
+ * Hard cap on one file-list lookup, in seconds (default 120; the lookup
+ * gives up earlier only when nothing is left to try).
+ */
+export const LOOKUP_CAP_MS: number | undefined = (() => {
+	const raw = Number(import.meta.env.PUBLIC_LOOKUP_CAP_SECONDS);
+	return Number.isFinite(raw) && raw > 0 ? Math.round(raw * 1000) : undefined;
+})();
+
 /** A peer the scheduler can assign work to. */
 export interface SwarmPeer {
 	addr: string;

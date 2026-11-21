@@ -71,6 +71,36 @@ describe("ReadCursor", () => {
 		]);
 	});
 
+	it("holds a read that left playback waiting until `hold` lets it go, still waiting meanwhile", async () => {
+		const { src, release } = source(50);
+		const changes: boolean[] = [];
+		const holds: number[] = [];
+		let letGo!: () => void;
+		const hold = (offset: number) => {
+			holds.push(offset);
+			return new Promise<void>((resolve) => (letGo = resolve));
+		};
+		const cursor = new ReadCursor(src, (w) => changes.push(w), undefined, 400, hold);
+		const into = new Uint8Array(10);
+		expect(await cursor.read(into)).toBe(10); // no wait: no hold
+		cursor.seek(60);
+		const pending = cursor.read(into);
+		await vi.advanceTimersByTimeAsync(500);
+		release(100);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(holds).toEqual([60]);
+		expect(changes).toEqual([true]);
+		expect(cursor.pos).toBe(60);
+		letGo();
+		expect(await pending).toBe(10);
+		expect(cursor.pos).toBe(70);
+		expect(changes).toEqual([true, false]);
+		// A short wait (under 400 ms) is no stall: no hold.
+		cursor.seek(0);
+		expect(await cursor.read(into)).toBe(10);
+		expect(holds).toEqual([60]);
+	});
+
 	it("stop aborts reads in flight and later ones", async () => {
 		const { src } = source(0);
 		const cursor = new ReadCursor(src);

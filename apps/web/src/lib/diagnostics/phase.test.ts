@@ -87,7 +87,6 @@ describe("report", () => {
 			env,
 			flow: {},
 			metadataApi: { ok: 0, fail: 0, ms: { b: [], n: 0, sum: 0, max: 0 }, errors: {} },
-			seedersCount: { ok: 0, fail: 0, ms: { b: [], n: 0, sum: 0, max: 0 }, errors: {} },
 			errors: [],
 			recoveries: [r],
 			droppedRecoveries: 0,

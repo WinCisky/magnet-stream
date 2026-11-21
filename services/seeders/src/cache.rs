@@ -1,6 +1,8 @@
 //! Per-info-hash result cache. Two requests for the same hash within the
 //! entry's TTL get the identical cached peer list; concurrent misses for the
-//! same hash are coalesced into a single in-flight lookup by `moka`.
+//! same hash are coalesced into a single in-flight lookup by `moka`. Entries
+//! are weighed in bytes (decision OQ-22), so a burst of large swarms cannot
+//! grow memory past the budget.
 
 use crate::lookup::LookupResult;
 use moka::future::Cache;
@@ -13,10 +15,18 @@ pub struct PeerCache {
     inner: Cache<[u8; 20], Arc<LookupResult>>,
 }
 
+/// Estimated bytes of a cached result: a fixed part plus each address.
+pub fn weight(result: &LookupResult) -> u32 {
+    let peers = u32::try_from(result.peers.len()).unwrap_or(u32::MAX);
+    256u32.saturating_add(peers.saturating_mul(std::mem::size_of::<std::net::SocketAddr>() as u32))
+}
+
 impl PeerCache {
-    pub fn new(max_capacity: u64) -> Self {
+    /// A cache holding at most about `max_bytes` of results.
+    pub fn new(max_bytes: u64) -> Self {
         let inner = Cache::builder()
-            .max_capacity(max_capacity)
+            .weigher(|_: &[u8; 20], v: &Arc<LookupResult>| weight(v))
+            .max_capacity(max_bytes)
             .expire_after(PerEntryTtl)
             .build();
         Self { inner }
@@ -84,7 +94,7 @@ mod tests {
 
     #[tokio::test]
     async fn coalesces_concurrent_misses() {
-        let cache = Arc::new(PeerCache::new(1000));
+        let cache = Arc::new(PeerCache::new(1 << 20));
         let calls = Arc::new(AtomicUsize::new(0));
         let key = [1u8; 20];
 
@@ -112,7 +122,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_request_is_a_cache_hit() {
-        let cache = PeerCache::new(1000);
+        let cache = PeerCache::new(1 << 20);
         let key = [2u8; 20];
 
         let (_, cached_first) = cache
@@ -128,7 +138,7 @@ mod tests {
 
     #[tokio::test]
     async fn short_ttl_entry_expires_quickly() {
-        let cache = PeerCache::new(1000);
+        let cache = PeerCache::new(1 << 20);
         let key = [3u8; 20];
 
         cache
@@ -143,5 +153,24 @@ mod tests {
             .get_or_compute(key, async { dummy_result(Duration::from_secs(60)) })
             .await;
         assert!(!cached, "entry should have expired by now");
+    }
+
+    #[tokio::test]
+    async fn stays_within_its_byte_budget() {
+        let budget = 64 * 1024;
+        let cache = PeerCache::new(budget);
+        let peers: Vec<std::net::SocketAddr> = (0..500u16)
+            .map(|i| std::net::SocketAddr::from(([8, 8, (i >> 8) as u8, i as u8], 6881)))
+            .collect();
+        for k in 0..100u8 {
+            let result = Arc::new(LookupResult {
+                peers: peers.clone(),
+                ..(*dummy_result(Duration::from_secs(60))).clone()
+            });
+            cache.insert([k; 20], result).await;
+        }
+        cache.inner.run_pending_tasks().await;
+        assert!(cache.inner.weighted_size() <= budget);
+        assert!(cache.inner.entry_count() >= 1);
     }
 }

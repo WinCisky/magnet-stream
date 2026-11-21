@@ -18,36 +18,17 @@ const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
 		<title>Magnet Watcher</title>
 		<script is:inline set:html={createInitialModeExpression()} />
 		<!--
-			Cross-origin isolation (see public/coi-sw.js). Once its service
-			worker controls the page, responses carry COOP/COEP; the first visit
-			reloads once to get there (never twice in a session).
+			The streaming service worker (src/lib/stream/sw.ts): serves
+			/stream/<info-hash>/<file> with range support from the files this
+			page has open, so MP4 and WebM play in a native <video>. Isolation
+			(COOP/COEP) comes from the server: public/_headers on Pages, the dev
+			server's headers in development. Registering it at the root also
+			replaces the old isolation worker (coi-sw.js) where it is installed.
 		-->
-		<script is:inline define:vars={{ worker: `${base}coi-sw.js` }}>
-			(() => {
-				const key = "mw-coi-reload";
-				try {
-					if (window.crossOriginIsolated) sessionStorage.removeItem(key);
-				} catch {}
-				if (window.crossOriginIsolated || !window.isSecureContext || !("serviceWorker" in navigator)) return;
-				const reload = () => {
-					try {
-						if (sessionStorage.getItem(key)) return;
-						sessionStorage.setItem(key, "1");
-					} catch {
-						return;
-					}
-					location.reload();
-				};
-				navigator.serviceWorker
-					.register(worker)
-					.then((registration) => {
-						// Controlled yet not isolated: this browser can't; don't loop.
-						if (navigator.serviceWorker.controller) return;
-						if (registration.active) reload();
-						else navigator.serviceWorker.addEventListener("controllerchange", reload);
-					})
-					.catch(() => {});
-			})();
+		<script is:inline define:vars={{ worker: `${base}stream-sw.js`, scope: base }}>
+			if (window.isSecureContext && "serviceWorker" in navigator) {
+				navigator.serviceWorker.register(worker, { scope }).catch(() => {});
+			}
 		</script>
 	</head>
 	<body>

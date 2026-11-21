@@ -21,6 +21,12 @@ export const SessionCloseCode = {
 /** Defaults (each gateway may configure its own). */
 export const DEFAULT_IDLE_TIMEOUT_MS = 90_000;
 export const DEFAULT_SESSION_TIMEOUT_S = 7_200;
+/**
+ * Bytes a gateway holds for one peer that were not written to it yet: past
+ * this, the peer is not reading and its connection is closed with
+ * `close` WRITE_OVERFLOW (the browser caps its upload too, OQ-04).
+ */
+export const DEFAULT_MAX_PENDING_WRITE_BYTES = 4 * 1024 * 1024;
 /** WebSockets per session (one Durable Object); each carries its own 6 connections. */
 export const DEFAULT_SOCKETS_PER_SESSION = 3;
 /**

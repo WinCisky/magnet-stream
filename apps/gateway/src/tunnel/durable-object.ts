@@ -67,6 +67,7 @@ export class TunnelSession extends DurableObject<TunnelEnv> {
 				maxConnections: config.maxConnections,
 				idleTimeoutMs: config.idleTimeoutMs,
 				failedConnectHoldMs: config.failedConnectHoldMs,
+				maxPendingWriteBytes: config.maxPendingWriteBytes,
 				log,
 			},
 		);

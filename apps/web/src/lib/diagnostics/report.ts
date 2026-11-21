@@ -4,8 +4,8 @@
 
 import type { Environment } from "./env";
 import { measurementRow, phaseMetrics } from "./phase";
-import type { Milestone, PlaybackRecord, RecoveryRecord, Timed, VisitRecord } from "./records";
-import { MS_BOUNDS, RATE_BOUNDS, add, hist, merge, mergeCounts, quantile, type Counts, type Hist } from "./stats";
+import type { Milestone, PlaybackRecord, RecoveryRecord, SessionRecord, Timed, VisitRecord } from "./records";
+import { MS_BOUNDS, RATE_BOUNDS, add, bump, hist, merge, mergeCounts, quantile, type Counts, type Hist } from "./stats";
 
 export type Status = "good" | "fair" | "poor" | "no data";
 
@@ -25,18 +25,11 @@ const GiB = 1024 * MB;
  * RATE_BOUNDS, so a verdict never hinges on where a value fell in a bucket.
  */
 export const THRESHOLDS = {
-	metadataApi: { goodSuccess: 0.95, poorSuccess: 0.8, goodP90Ms: 8_000, poorP90Ms: 30_000 },
-	seedersCount: { goodSuccess: 0.95, poorSuccess: 0.8, goodP90Ms: 3_000, poorP90Ms: 13_000 },
-	infoDict: { goodSuccess: 0.95, poorSuccess: 0.8, goodP90Ms: 5_000, poorP90Ms: 20_000 },
-	swarm: {
-		goodSuccess: 0.95,
-		poorSuccess: 0.8,
-		goodFirstP90Ms: 5_000,
-		poorFirstP90Ms: 13_000,
-		goodReachable: 10,
-		poorReachable: 3,
-	},
-	worker: { goodServed: 0.7, poorServed: 0.4, goodErrors: 0.02, poorErrors: 0.1 },
+	lookup: { goodSuccess: 0.95, poorSuccess: 0.8, goodP90Ms: 8_000, poorP90Ms: 30_000 },
+	/** Sessions that reached at least one peer, and the first unchoke. */
+	tunnel: { goodReached: 0.95, poorReached: 0.8, goodUnchokeP90Ms: 8_000, poorUnchokeP90Ms: 30_000 },
+	/** `/peers` streams answered, and sessions the scout found a live peer for. */
+	scout: { goodAnswered: 0.95, poorAnswered: 0.8, goodAlive: 0.8, poorAlive: 0.5 },
 	startup: { goodP90Ms: 8_000, poorP90Ms: 30_000, goodFailShare: 0.05, poorFailShare: 0.25, failAfterMs: 30_000 },
 	throughput: { goodMedian: 3 * MB, poorMedian: 1 * MB, goodStallShare: 0.05, poorStallShare: 0.2 },
 	seeking: { goodP90Ms: 5_000, poorP90Ms: 13_000 },
@@ -65,24 +58,11 @@ export interface ReportInput {
 export function buildReport(input: ReportInput) {
 	const visits = [...input.visits].sort((a, b) => a.startedAt - b.startedAt);
 	const recoveries = visits.flatMap((v) => v.recoveries);
+	const sessions = visits.flatMap((v) => v.sessions ?? []);
 	const health: Record<string, PartHealth> = {
-		metadataApi: requests(
-			"Torrent lookup (magnet → file list: /peers, tunnel, BEP 9)",
-			mergeTimed(visits.map((v) => v.metadataApi)),
-			THRESHOLDS.metadataApi,
-		),
-		seedersCount: requests(
-			"Seeder count (magnet-seeders /peers)",
-			mergeTimed(visits.map((v) => v.seedersCount)),
-			THRESHOLDS.seedersCount,
-		),
-		infoDict: requests(
-			"Piece hashes (magnet-seeders /metadata)",
-			mergeTimed(recoveries.map((r) => r.infoDict)),
-			THRESHOLDS.infoDict,
-		),
-		swarm: swarm(recoveries),
-		worker: worker(recoveries),
+		lookup: lookup(mergeTimed(visits.map((v) => v.metadataApi)), sessions),
+		tunnel: tunnel(sessions),
+		scout: scout(sessions),
 		startup: startup(recoveries),
 		throughput: throughput(recoveries),
 		seeking: seeking(recoveries),
@@ -95,7 +75,7 @@ export function buildReport(input: ReportInput) {
 	const parts = Object.entries(health).sort(([, a], [, b]) => rank[a.status] - rank[b.status]);
 	return {
 		format: "magnet-watcher-diagnostics",
-		version: 1,
+		version: 2,
 		exportedAt: new Date(input.now).toISOString(),
 		installId: input.installId,
 		build: input.build,
@@ -107,6 +87,7 @@ export function buildReport(input: ReportInput) {
 			from: visits.length ? new Date(visits[0].startedAt).toISOString() : null,
 			to: visits.length ? new Date(visits[visits.length - 1].updatedAt).toISOString() : null,
 			visits: visits.length,
+			sessions: sessions.length,
 			recoveries: recoveries.length,
 			completed: recoveries.filter((r) => r.outcome === "complete").length,
 			failed: recoveries.filter((r) => r.outcome === "error").length,
@@ -156,92 +137,161 @@ function requests(
 	};
 }
 
-function swarm(recoveries: RecoveryRecord[]): PartHealth {
-	const title = "Peer discovery (magnet-seeders /swarm)";
-	const t = mergeTimed(recoveries.map((r) => r.swarm));
-	const n = t.ok + t.fail;
-	if (n === 0) return noData(title);
-	const th = THRESHOLDS.swarm;
-	const success = t.ok / n;
-	const first = milestoneHist(recoveries, "peers");
-	const firstP90 = quantile(first, MS_BOUNDS, 0.9);
-	const reachable = median(recoveries.filter((r) => r.swarm.ok > 0).map((r) => r.swarm.reachable));
-	const fewPeers = recoveries.filter((r) => r.swarm.ok > 0 && r.swarm.reachable < th.poorReachable).length;
+/** Magnet → file list: each attempt's outcome and time, where the file list came from, why lookups gave up. */
+function lookup(t: Timed, sessions: SessionRecord[]): PartHealth {
+	const part = requests("Torrent lookup (magnet → file list: cache, VPS info line, BEP 9 from peers)", t, THRESHOLDS.lookup);
+	if (part.status === "no data" && sessions.length === 0) return part;
+	const sources: Counts = {};
+	const failures: Counts = {};
+	for (const s of sessions) {
+		if (s.metadata) bump(sources, s.metadata.source);
+		mergeCounts(failures, s.failures);
+	}
+	const retries = sum(sessions, (s) => s.retries);
+	const listedAfterRetry = sessions.filter((s) => s.retries > 0 && s.lookup === "listed").length;
+	const from = Object.entries(sources)
+		.map(([k, v]) => `${SOURCE_NAMES[k] ?? k} ${v}`)
+		.join(", ");
 	return {
-		title,
-		status: grade(
-			success >= th.goodSuccess && (firstP90 ?? 0) <= th.goodFirstP90Ms && (reachable ?? 0) >= th.goodReachable,
-			success < th.poorSuccess || (firstP90 ?? 0) > th.poorFirstP90Ms || (reachable ?? 0) < th.poorReachable,
-		),
+		...part,
 		summary:
-			`${t.ok} of ${n} requests ok (${pct(success)})` +
-			(first.n
-				? `; first peers within ${sec(quantile(first, MS_BOUNDS, 0.5))} for half the videos, ${sec(firstP90)} for 90%` +
-					`; median ${reachable ?? 0} reachable peers`
-				: "; no peers found") +
-			(fewPeers ? `; ${fewPeers} video(s) had fewer than ${th.poorReachable} reachable` : "") +
-			(topKey(t.errors) ? `; most common error: ${topKey(t.errors)}` : ""),
+			part.summary +
+			(from ? `; file list from ${from}` : "") +
+			(retries ? `; ${retries} retr${retries === 1 ? "y" : "ies"}, ${listedAfterRetry} listed after one` : ""),
 		details: {
-			requests: n,
-			successRate: round(success),
-			errors: t.errors,
-			firstAnswerP50Ms: quantile(first, MS_BOUNDS, 0.5),
-			firstAnswerP90Ms: firstP90,
-			medianReachable: reachable,
-			medianKnown: median(recoveries.map((r) => r.swarm.known)),
-			medianSeeds: median(recoveries.map((r) => r.swarm.seeds)),
-			partialAnswers: sum(recoveries, (r) => r.swarm.partial),
-			fewPeers,
+			...part.details,
+			sessions: sessions.length,
+			sources,
+			failures,
+			retries,
+			listedAfterRetry,
+			lookupP50Ms: percentile(listedMs(sessions), 0.5),
+			lookupP90Ms: percentile(listedMs(sessions), 0.9),
+			metadataP50MsBySource: Object.fromEntries(
+				Object.keys(sources).map((k) => [k, percentile(sessions.filter((s) => s.metadata?.source === k).map((s) => s.metadata!.ms), 0.5)]),
+			),
 		},
 	};
 }
 
-function worker(recoveries: RecoveryRecord[]): PartHealth {
-	const title = "Peer requests (magnet-worker)";
-	const ends: Counts = {};
-	const candidates: Counts = {};
-	const messages: Counts = {};
-	const clients: Counts = {};
-	const unchoke = hist(MS_BOUNDS);
-	for (const r of recoveries) {
-		mergeCounts(ends, r.worker.ends);
-		mergeCounts(candidates, r.worker.candidates);
-		mergeCounts(messages, r.worker.messages);
-		mergeCounts(clients, r.worker.clients);
-		merge(unchoke, r.worker.unchokeMs);
-	}
-	const count = (k: string) => ends[k] ?? 0;
-	const total = Object.values(ends).reduce((a, b) => a + b, 0) - count("aborted");
-	if (total <= 0) return noData(title);
-	const th = THRESHOLDS.worker;
-	const served = (count("done") + count("ended") + count("choked")) / total;
-	const errors = (count("error") + count("refused")) / total;
-	const failures = Object.entries(candidates).filter(([k]) => k !== "lost" && k !== "untried");
-	const topFailure = topKey(Object.fromEntries(failures));
-	const failureTotal = failures.reduce((a, [, v]) => a + v, 0);
+const SOURCE_NAMES: Record<string, string> = { cache: "the cache", vps: "the VPS", peer: "peers" };
+
+function listedMs(sessions: SessionRecord[]): number[] {
+	return sessions.map((s) => s.lookupMs).filter((ms): ms is number => ms !== null);
+}
+
+/** The tunnel gateway: dials by class and outcome, peers reached, unchoked, delivering. */
+function tunnel(sessions: SessionRecord[]): PartHealth {
+	const title = "Tunnel (gateway dials and peers)";
+	const used = sessions.filter((s) => dialsOf(s).attempted > 0);
+	if (used.length === 0) return noData(title);
+	const th = THRESHOLDS.tunnel;
+	const reached = used.filter((s) => s.tunnel.connected > 0).length / used.length;
+	const unchokes = used.map((s) => s.tunnel.firstUnchokeMs).filter((ms): ms is number => ms !== null);
+	const unchokeP50 = percentile(unchokes, 0.5);
+	const unchokeP90 = percentile(unchokes, 0.9);
+	const byClass = Object.fromEntries(
+		(["scout", "untried", "known"] as const).map((k) => {
+			const failed: Counts = {};
+			let attempted = 0;
+			let succeeded = 0;
+			for (const s of used) {
+				const d = s.tunnel.dials[k];
+				attempted += d.attempted;
+				succeeded += d.succeeded;
+				mergeCounts(failed, d.failed);
+			}
+			return [k, { attempted, succeeded, failed }];
+		}),
+	);
+	const allFailed: Counts = {};
+	for (const c of Object.values(byClass)) mergeCounts(allFailed, c.failed);
+	const top = topKey(allFailed);
+	const share = (k: string) => {
+		const c = byClass[k];
+		return c.attempted ? `${pct(c.succeeded / c.attempted)} (${c.succeeded}/${c.attempted})` : "none";
+	};
 	return {
 		title,
-		status: grade(served >= th.goodServed && errors < th.goodErrors, served < th.poorServed || errors >= th.poorErrors),
+		status: grade(
+			reached >= th.goodReached && (unchokeP90 ?? 0) <= th.goodUnchokeP90Ms,
+			reached < th.poorReached || (unchokeP90 ?? 0) > th.poorUnchokeP90Ms,
+		),
 		summary:
-			`${pct(served)} of ${total} requests served (no peer ${pct(count("no_peer") / total)}, ` +
-			`stalled ${pct(count("stalled") / total)}, worker/network errors ${pct(errors)})` +
-			(unchoke.n ? `; a peer unchoked within ${sec(quantile(unchoke, MS_BOUNDS, 0.5))} for half` : "") +
-			(topFailure ? `; most common candidate failure: ${topFailure} (${pct((candidates[topFailure] ?? 0) / failureTotal)})` : ""),
+			`${pct(reached)} of ${used.length} sessions reached a peer; dials connected: scout-alive ${share("scout")}, ` +
+			`untried ${share("untried")}, known ${share("known")}` +
+			(unchokeP50 !== null ? `; first unchoke within ${sec(unchokeP50)} for half, ${sec(unchokeP90)} for 90%` : "; never unchoked") +
+			`; median peers connected ${median(used.map((s) => s.tunnel.connected))}, delivering ${median(used.map((s) => s.tunnel.delivering))}` +
+			(top ? `; most common dial failure: ${top}` : ""),
 		details: {
-			requests: total,
-			cancelledByUs: count("aborted"),
-			servedRate: round(served),
-			errorRate: round(errors),
-			ends,
-			unchokeP50Ms: quantile(unchoke, MS_BOUNDS, 0.5),
-			unchokeP90Ms: quantile(unchoke, MS_BOUNDS, 0.9),
-			fallbackWins: sum(recoveries, (r) => r.worker.fallbackWins),
-			stolen: sum(recoveries, (r) => r.worker.stolen),
-			hedges: sum(recoveries, (r) => r.worker.hedges),
-			candidateOutcomes: candidates,
-			errorMessages: messages,
-			servedByClient: clients,
-			maxCandidates: [...new Set(recoveries.map((r) => r.worker.maxCandidates).filter((n) => n !== null))],
+			sessions: used.length,
+			reachedShare: round(reached),
+			dials: byClass,
+			medianConnected: median(used.map((s) => s.tunnel.connected)),
+			medianUnchoked: median(used.map((s) => s.tunnel.unchoked)),
+			medianDelivering: median(used.map((s) => s.tunnel.delivering)),
+			medianSeeds: median(used.map((s) => s.tunnel.seeds)),
+			firstUnchokeP50Ms: unchokeP50,
+			firstUnchokeP90Ms: unchokeP90,
+			maxSockets: Math.max(...used.map((s) => s.tunnel.sockets)),
+			recycles: sum(used, (s) => s.tunnel.recycles),
+			untestedHighWater: Math.max(...used.map((s) => s.tunnel.untestedHighWater)),
+			upload: {
+				sessionsSharing: used.filter((s) => s.tunnel.upload?.enabled === true).length,
+				sessionsUploaded: used.filter((s) => (s.tunnel.upload?.bytes ?? 0) > 0).length,
+				bytes: sum(used, (s) => s.tunnel.upload?.bytes ?? 0),
+				messages: sum(used, (s) => s.tunnel.upload?.messages ?? 0),
+				maxUnchoked: Math.max(0, ...used.map((s) => s.tunnel.upload?.unchoked ?? 0)),
+			},
+		},
+	};
+}
+
+function dialsOf(s: SessionRecord): { attempted: number; succeeded: number } {
+	const d = s.tunnel.dials;
+	return { attempted: d.scout.attempted + d.untried.attempted + d.known.attempted, succeeded: d.scout.succeeded + d.untried.succeeded + d.known.succeeded };
+}
+
+/** The VPS `/peers` stream: answered, what the scout said about the addresses, the `info` line. */
+function scout(sessions: SessionRecord[]): PartHealth {
+	const title = "Discovery and scout (VPS /peers stream)";
+	const asked = sessions.filter((s) => s.scout.streams > 0 && s.scout.state !== "open");
+	if (asked.length === 0) return noData(title);
+	const th = THRESHOLDS.scout;
+	const answered = asked.filter((s) => s.scout.state === "done");
+	const answeredShare = answered.length / asked.length;
+	const aliveShare = answered.length ? answered.filter((s) => s.scout.alive > 0).length / answered.length : 0;
+	const info: Counts = {};
+	for (const s of asked) bump(info, s.scout.info);
+	const rejected = info.rejected ?? 0;
+	const first = asked.map((s) => s.scout.firstPeerMs).filter((ms): ms is number => ms !== null);
+	return {
+		title,
+		status: grade(
+			answeredShare >= th.goodAnswered && aliveShare >= th.goodAlive && rejected === 0,
+			answeredShare < th.poorAnswered || aliveShare < th.poorAlive || rejected > 0,
+		),
+		summary:
+			`${answered.length} of ${asked.length} streams answered (${pct(answeredShare)}); a live peer for ${pct(aliveShare)}` +
+			`; median ${median(asked.map((s) => s.scout.peers))} peers (alive ${median(asked.map((s) => s.scout.alive))}, ` +
+			`dead ${median(asked.map((s) => s.scout.dead))}, unknown ${median(asked.map((s) => s.scout.unknown))})` +
+			(first.length ? `; first peer within ${sec(percentile(first, 0.5))} for half` : "") +
+			`; info line accepted ${info.accepted ?? 0}, rejected ${rejected}`,
+		details: {
+			sessions: asked.length,
+			streams: sum(asked, (s) => s.scout.streams),
+			failed: asked.filter((s) => s.scout.state === "failed").length,
+			answeredShare: round(answeredShare),
+			aliveShare: round(aliveShare),
+			medianPeers: median(asked.map((s) => s.scout.peers)),
+			medianAlive: median(asked.map((s) => s.scout.alive)),
+			medianSeeds: median(asked.map((s) => s.scout.seeds)),
+			medianDead: median(asked.map((s) => s.scout.dead)),
+			medianUnknown: median(asked.map((s) => s.scout.unknown)),
+			rejectedLines: sum(asked, (s) => s.scout.rejected),
+			info,
+			firstPeerP50Ms: percentile(first, 0.5),
+			firstPeerP90Ms: percentile(first, 0.9),
 		},
 	};
 }
@@ -261,7 +311,7 @@ function startup(recoveries: RecoveryRecord[]): PartHealth {
 	if (n === 0) return noData(title);
 	const failShare = failed / n;
 	const p90 = quantile(times, MS_BOUNDS, 0.9);
-	const steps: Milestone[] = ["infoDict", "peers", "recovering", "firstByte", "ready1MiB", "ready4MiB", "ready16MiB"];
+	const steps: Milestone[] = ["recovering", "firstByte", "firstPiece", "ready1MiB", "ready4MiB", "ready16MiB"];
 	const medians = Object.fromEntries(steps.map((m) => [m, quantile(milestoneHist(fresh, m), MS_BOUNDS, 0.5)]));
 	return {
 		title,
@@ -274,8 +324,7 @@ function startup(recoveries: RecoveryRecord[]): PartHealth {
 				? `4 MiB ready within ${sec(quantile(times, MS_BOUNDS, 0.5))} for half the videos, ${sec(p90)} for 90%`
 				: "4 MiB never became ready") +
 			(failed ? `; ${failed} of ${n} never got there in ${sec(th.failAfterMs)}+` : "") +
-			`; typical path: piece hashes ${sec(medians.infoDict)}, peers ${sec(medians.peers)}, ` +
-			`first data ${sec(medians.firstByte)}`,
+			`; typical path: first data ${sec(medians.firstByte)}, first verified piece ${sec(medians.firstPiece)}`,
 		details: { videos: n, failed, p50Ms: quantile(times, MS_BOUNDS, 0.5), p90Ms: p90, medianMsByStep: medians },
 	};
 }

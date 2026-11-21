@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { EngineSnapshot } from "$lib/torrent/engine";
-import type { BatchReport } from "$lib/torrent/scheduler";
-import { RecoveryRecorder, clientFamily } from "./recorder";
-import { newRecovery } from "./records";
+import type { SessionDiag } from "$lib/torrent/session-protocol";
+import { RecoveryRecorder, SessionRecorder } from "./recorder";
+import { newRecovery, newSession } from "./records";
 import { quantile, MS_BOUNDS } from "./stats";
 
 const MiB = 1024 * 1024;
@@ -34,9 +34,13 @@ function snapshot(over: Partial<EngineSnapshot>): EngineSnapshot {
 		hashFailures: 0,
 		storeErrors: 0,
 		peers: { known: 50, reachable: 12, seeds: 10, active: 3, connections: 4, usable: 12, backedOff: 1, banned: 0 },
-		storage: "cache",
+		storage: "opfs",
+		storageError: null,
 		swarmError: null,
 		tunnel: null,
+		bitrate: 0,
+		windowBytes: 0,
+		rateThreshold: 0,
 		...over,
 	};
 }
@@ -65,13 +69,9 @@ function setup() {
 }
 
 describe("RecoveryRecorder", () => {
-	it("times a fresh start from piece hashes to 16 MiB ready", () => {
-		const { record, recorder, at, set } = setup();
+	it("times a fresh start from opening the video to 16 MiB ready", () => {
+		const { record, at } = setup();
 		at(0, { phase: "metadata", states: new Uint8Array(0) });
-		set(700);
-		recorder.infoDict(650, null);
-		set(900);
-		recorder.swarm(850, { counts: { known: 80, probed: 10, reachable: 9, seeds: 7, unchoked: 8 }, complete: false } as never, null);
 		at(1_000, { phase: "peers" });
 		at(1_200);
 		at(2_000, { bytesReceived: 500_000 });
@@ -79,8 +79,6 @@ describe("RecoveryRecorder", () => {
 		at(3_400, { bytesReceived: 5 * MiB, front: 5, verifiedPieces: 5 });
 		at(6_000, { bytesReceived: 17 * MiB, front: 17, verifiedPieces: 17 });
 		expect(record.milestones).toEqual({
-			infoDict: 700,
-			peers: 900,
 			recovering: 1_200,
 			firstByte: 2_000,
 			firstPiece: 2_600,
@@ -90,8 +88,6 @@ describe("RecoveryRecorder", () => {
 			complete: null,
 		});
 		expect(record.traits.freshStart).toBe(true);
-		expect(record.swarm).toMatchObject({ ok: 1, partial: 1, known: 80, reachable: 9 });
-		expect(record.infoDict.ok).toBe(1);
 	});
 
 	it("counts stalls from the last byte, and rates per 10 s window", () => {
@@ -162,36 +158,6 @@ describe("RecoveryRecorder", () => {
 		expect(record.seeks.readyMs.n).toBe(1);
 	});
 
-	it("aggregates worker requests without keeping them", () => {
-		const { record, recorder } = setup();
-		const base: BatchReport = {
-			kind: "done",
-			ms: 3_000,
-			unchokeMs: 400,
-			bytes: 2 * MiB,
-			urgent: true,
-			hedge: false,
-			stolen: false,
-			fallbackWon: true,
-			others: [{ err: "connect_timeout" }, { err: "lost" }],
-			winnerClient: "qBittorrent 4.6.2",
-			message: null,
-		};
-		recorder.batch(base);
-		recorder.batch({ ...base, kind: "no_peer", unchokeMs: null, bytes: 0, fallbackWon: false, others: [{ err: "connect_timeout" }], winnerClient: null });
-		recorder.batch({ ...base, kind: "error", unchokeMs: null, bytes: 0, others: [], winnerClient: null, message: "network: fetch failed from 10.0.0.2" });
-		expect(record.worker).toMatchObject({
-			ends: { done: 1, no_peer: 1, error: 1 },
-			candidates: { connect_timeout: 2, lost: 1 },
-			clients: { qBittorrent: 1 },
-			messages: { "network: fetch failed from <ip>": 1 },
-			fallbackWins: 2,
-			urgent: 3,
-			bytes: 2 * MiB,
-		});
-		expect(record.worker.unchokeMs.n).toBe(1);
-	});
-
 	it("records the outcome and stops recording after end", () => {
 		const { record, at, recorder, counts } = setup();
 		at(0, { phase: "recovering" });
@@ -201,18 +167,67 @@ describe("RecoveryRecorder", () => {
 		recorder.end();
 		const before = counts().changes;
 		at(2_000, { phase: "error", message: "boom" });
-		recorder.batch({ kind: "done" } as never);
 		expect(counts()).toEqual({ changes: before, flushed: 1 });
 		expect(record.outcome).toBe("complete");
 	});
 });
 
-describe("clientFamily", () => {
-	it("keeps the client's name only", () => {
-		expect(clientFamily("qBittorrent 4.6.2")).toBe("qBittorrent");
-		expect(clientFamily("libtorrent (Rasterbar) 2.0.10")).toBe("libtorrent");
-		expect(clientFamily("Transmission/4.0.5")).toBe("Transmission");
-		expect(clientFamily("  ")).toBe("unknown");
+function diag(over: Partial<SessionDiag> = {}): SessionDiag {
+	const dials = (attempted: number, succeeded: number, failed: Record<string, number> = {}) => ({ attempted, succeeded, failed });
+	return {
+		dials: { scout: dials(4, 3, { timeout: 1 }), untried: dials(6, 1, { refused: 2, timeout: 3 }), known: dials(0, 0) },
+		connected: 4,
+		unchoked: 2,
+		delivering: 1,
+		seeds: 1,
+		firstUnchokeMs: 1_800,
+		metadata: { source: "vps", ms: 900 },
+		sockets: 2,
+		upgrades: 2,
+		messages: 30,
+		recycles: 0,
+		untestedHighWater: 3,
+		scout: { state: "done", streams: 1, peers: 40, alive: 5, seeds: 2, dead: 30, unknown: 5, rejected: 1, info: "accepted", firstPeerMs: 300 },
+		upload: { enabled: true, bytes: 0, unchoked: 0, messages: 0 },
+		...over,
+	};
+}
+
+describe("SessionRecorder", () => {
+	it("keeps the lookup's outcome, retries and the session's counters (peers at once: the most seen)", () => {
+		let now = 0;
+		let changes = 0;
+		let finished = 0;
+		const record = newSession();
+		const recorder = new SessionRecorder(record, () => changes++, () => finished++, () => now);
+		now = 5_000;
+		recorder.failed("exhausted", { found: 12, tried: 12, connected: 0, elapsedMs: 5_000, discovering: false });
+		expect(record).toMatchObject({ lookup: "failed", failures: { exhausted: 1 }, progress: { found: 12, tried: 12, connected: 0 } });
+		recorder.retried();
+		expect(record.lookup).toBe("running");
+		recorder.update(diag());
+		recorder.update(diag({ connected: 2, delivering: 3, firstUnchokeMs: 9_000, upload: { enabled: true, bytes: 65_536, unchoked: 2, messages: 1 } }));
+		recorder.update(diag({ upload: { enabled: true, bytes: 131_072, unchoked: 1, messages: 2 } }));
+		now = 7_500;
+		recorder.listed("vps");
+		expect(record).toMatchObject({ lookup: "listed", lookupMs: 7_500, retries: 1, metadata: { source: "vps", ms: 900 } });
+		expect(record.tunnel).toMatchObject({ connected: 4, delivering: 3, firstUnchokeMs: 1_800, sockets: 2, messages: 30 });
+		expect(record.tunnel.dials.untried).toEqual({ attempted: 6, succeeded: 1, failed: { refused: 2, timeout: 3 } });
+		expect(record.scout).toMatchObject({ alive: 5, dead: 30, info: "accepted" });
+		expect(record.tunnel.upload).toEqual({ enabled: true, bytes: 131_072, unchoked: 2, messages: 2 });
+		recorder.end();
+		recorder.update(diag({ connected: 9 }));
+		expect(record.tunnel.connected).toBe(4);
+		expect(finished).toBe(1);
+		expect(changes).toBeGreaterThan(3);
+	});
+
+	it("marks a session closed while looking as left", () => {
+		const record = newSession();
+		const recorder = new SessionRecorder(record, () => {});
+		recorder.end();
+		expect(record.lookup).toBe("left");
+		expect(JSON.stringify(record)).not.toMatch(/\d+\.\d+\.\d+\.\d+|[0-9a-f]{40}/);
 	});
 });
 
@@ -220,7 +235,7 @@ describe("RecoveryRecorder.playback", () => {
 	it("keeps what the player reported, and its last totals after the recovery ended", () => {
 		const { record, recorder } = setup();
 		expect(record.playback).toBeUndefined();
-		recorder.playback({ type: "loaded", ms: 1_234.5, mode: null, videoCodec: "hevc", audioCodec: "ac3", height: 800 });
+		recorder.playback({ type: "loaded", ms: 1_234.5, durationMs: 5_400_000, mode: null, videoCodec: "hevc", audioCodec: "ac3", height: 800 });
 		recorder.playback({ type: "started", ms: 2_100, mode: "decode" });
 		recorder.playback({ type: "started", ms: 9_000, mode: "decode" });
 		recorder.playback({ type: "waited", ms: 1_500 });

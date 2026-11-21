@@ -117,7 +117,7 @@ export function keepAlive(): Uint8Array {
 	return new Uint8Array(4);
 }
 
-export function encodeRequest(id: typeof MSG.REQUEST | typeof MSG.CANCEL, piece: number, begin: number, length: number): Uint8Array {
+export function encodeRequest(id: typeof MSG.REQUEST | typeof MSG.CANCEL | typeof MSG.REJECT, piece: number, begin: number, length: number): Uint8Array {
 	const out = new Uint8Array(17);
 	const view = new DataView(out.buffer);
 	view.setUint32(0, 13);

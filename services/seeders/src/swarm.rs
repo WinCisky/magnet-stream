@@ -14,8 +14,9 @@
 
 use crate::cache::PeerCache;
 use crate::config::{Config, Secret};
+use crate::info::InfoService;
 use crate::lookup::Lookup;
-use crate::metadata::{self, InfoDict, MetadataError};
+use crate::metadata::{InfoDict, MetadataError};
 use crate::netguard;
 use crate::peerwire::WireError;
 use crate::probe::{self, Availability, PeerProbe, ProbeTimeouts};
@@ -34,7 +35,6 @@ use tokio::time::MissedTickBehavior;
 const REFRESH_TICK: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_REFRESHES: usize = 4;
 const MAX_SWARMS: u64 = 1000;
-const METADATA_TTI: Duration = Duration::from_secs(24 * 3600);
 /// A cold build answers as soon as this many peers unchoked a probe...
 const FIRST_PUBLISH_UNCHOKED: usize = 8;
 /// ...or this long after it started, if anyone is reachable by then.
@@ -76,7 +76,8 @@ pub struct SwarmService {
     lookup: Arc<Lookup>,
     peer_cache: Arc<PeerCache>,
     snapshots: moka::future::Cache<[u8; 20], Arc<SwarmSnapshot>>,
-    metadata: moka::future::Cache<[u8; 20], Arc<InfoDict>>,
+    /// Info dicts: shared with `/peers` and `/metadata` (fetch slots and cache).
+    metadata: Arc<InfoService>,
     active: Mutex<HashMap<[u8; 20], ActiveSwarm>>,
     /// Cold builds in progress; requests wait for their first snapshot.
     building: Mutex<HashMap<[u8; 20], Published>>,
@@ -84,16 +85,16 @@ pub struct SwarmService {
 }
 
 impl SwarmService {
-    pub fn new(cfg: Arc<Config>, lookup: Arc<Lookup>, peer_cache: Arc<PeerCache>) -> Arc<Self> {
-        let metadata = moka::future::Cache::builder()
-            .weigher(|_: &[u8; 20], info: &Arc<InfoDict>| {
-                u32::try_from(info.bytes.len()).unwrap_or(u32::MAX)
-            })
-            .max_capacity(cfg.metadata_cache_bytes)
-            .time_to_idle(METADATA_TTI)
-            .build();
+    /// `probe_permits` is the global probe pool, shared with the scout.
+    pub fn new(
+        cfg: Arc<Config>,
+        lookup: Arc<Lookup>,
+        peer_cache: Arc<PeerCache>,
+        probe_permits: Arc<Semaphore>,
+        metadata: Arc<InfoService>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            probe_permits: Arc::new(Semaphore::new(cfg.probe_concurrency)),
+            probe_permits,
             snapshots: moka::future::Cache::builder()
                 .max_capacity(MAX_SWARMS)
                 .build(),
@@ -161,49 +162,25 @@ impl SwarmService {
     }
 
     pub async fn cached_metadata(&self, info_hash: [u8; 20]) -> Option<Arc<InfoDict>> {
-        self.metadata.get(&info_hash).await
+        self.metadata.cached(&info_hash).await
     }
 
-    /// The verified info dict. Concurrent requests share one fetch, and a
-    /// failure isn't cached, so the next request tries again.
+    /// The verified info dict (`/files`). Concurrent requests share one
+    /// fetch, and a failure isn't cached, so the next request tries again.
     pub async fn metadata(
         self: &Arc<Self>,
         info_hash: [u8; 20],
         trackers: Vec<String>,
-    ) -> Result<Arc<InfoDict>, Arc<MetadataError>> {
-        let this = self.clone();
-        self.metadata
-            .try_get_with(info_hash, async move {
-                let deadline = Instant::now() + this.cfg.metadata_deadline;
-                // The browser asks for the swarm next anyway: probe it now, and
-                // ask the first peers that answer (partial snapshots come
-                // within a second or so), then the ones still being probed.
-                let snapshot = this.snapshot(info_hash, trackers).await;
-                let mut candidates = metadata_candidates(&snapshot);
-                candidates.extend(&snapshot.pending);
-                let parallel = if snapshot.complete { 3 } else { 6 };
-                this.fetch_metadata(info_hash, candidates, parallel, deadline)
-                    .await
-            })
-            .await
-    }
-
-    async fn fetch_metadata(
-        &self,
-        info_hash: [u8; 20],
-        candidates: Vec<SocketAddr>,
-        parallel: usize,
-        deadline: Instant,
     ) -> Result<Arc<InfoDict>, MetadataError> {
-        let bytes = metadata::fetch_from_any(
-            candidates,
-            info_hash,
-            parallel,
-            self.cfg.probe_connect_timeout,
-            deadline,
-        )
-        .await?;
-        Ok(Arc::new(InfoDict::parse(bytes)?))
+        if let Some(info) = self.metadata.cached(&info_hash).await {
+            return Ok(info);
+        }
+        // The first peers that answer a probe (partial snapshots come within
+        // a second or so), then the ones still being probed.
+        let snapshot = self.snapshot(info_hash, trackers).await;
+        let mut candidates = metadata_candidates(&snapshot);
+        candidates.extend(&snapshot.pending);
+        self.metadata.fetch(info_hash, &candidates).await
     }
 
     /// Announce and probe every announced peer (up to `max_probe_peers`),
@@ -366,19 +343,7 @@ impl SwarmService {
     /// `/metadata` call right after is usually a cache hit.
     fn warm_metadata(self: &Arc<Self>, snapshot: &SwarmSnapshot) {
         let candidates = metadata_candidates(snapshot);
-        if candidates.is_empty() {
-            return;
-        }
-        let info_hash = snapshot.info_hash;
-        let this = self.clone();
-        tokio::spawn(async move {
-            if this.metadata.get(&info_hash).await.is_some() {
-                return;
-            }
-            let deadline = Instant::now() + this.cfg.metadata_deadline;
-            let fetch = this.fetch_metadata(info_hash, candidates, 3, deadline);
-            let _ = this.metadata.try_get_with(info_hash, fetch).await;
-        });
+        self.metadata.offer(snapshot.info_hash, &candidates);
     }
 
     fn mark_requested(&self, info_hash: [u8; 20], trackers: &[String]) {
@@ -953,7 +918,7 @@ mod tests {
         let cfg = Arc::new(cfg);
         let dht = Arc::new(crate::dht::DhtClient::new(0).unwrap());
         let lookup = Arc::new(Lookup::new(reqwest::Client::new(), dht));
-        let cache = Arc::new(PeerCache::new(10));
+        let cache = Arc::new(PeerCache::new(1 << 20));
         // Announce already done: the build takes the cached peer list.
         cache
             .insert(
@@ -970,7 +935,9 @@ mod tests {
                 }),
             )
             .await;
-        let service = SwarmService::new(cfg, lookup, cache);
+        let permits = Arc::new(Semaphore::new(cfg.probe_concurrency));
+        let info = crate::info::InfoService::new(cfg.info_settings());
+        let service = SwarmService::new(cfg, lookup, cache, permits, info);
 
         let started = Instant::now();
         let first = service.snapshot(info_hash, vec![]).await;

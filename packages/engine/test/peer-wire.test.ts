@@ -121,7 +121,7 @@ describe("PeerConnection", () => {
 		expect(blocks).toHaveLength(2);
 	});
 
-	it("ignores the peer's requests: it never uploads", async () => {
+	it("without an uploader it ignores the peer's requests (as M1-06)", async () => {
 		const t = new MemoryTransport();
 		new PeerConnection(t, { geometry, keepAliveMs: 0 });
 		await Promise.resolve();

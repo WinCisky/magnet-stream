@@ -67,7 +67,7 @@ describe("PeerBook", () => {
 		expect(v4.seedHint).toBe(true);
 		expect([...v6.origins].sort()).toEqual(["magnet", "pex"]);
 		expect(v6.state).toBe("new");
-		expect(book.rejected).toEqual({ invalid: 0, forbidden: 0, full: 0, batch: 0 });
+		expect(book.rejected).toEqual({ invalid: 0, forbidden: 0, banned: 0, full: 0, batch: 0 });
 	});
 
 	it("discards private, reserved and low-port addresses before they can be dialled", () => {
@@ -100,6 +100,26 @@ describe("PeerBook", () => {
 		expect(local.add("127.0.0.1:6881", "manual")).toBe(true);
 		expect(local.add("127.0.0.1:80", "manual")).toBe(false);
 		expect(local.addressForOpen("127.0.0.1:6881")?.port).toBe(6881);
+	});
+
+	it("never proposes a peer banned for corrupt data again, even once evicted and named again by pex", () => {
+		const book = new PeerBook({ maxPeers: 2 });
+		book.add("1.2.3.4:6881", "discovery");
+		book.markConnecting("1.2.3.4:6881");
+		book.markConnected("1.2.3.4:6881");
+		book.markFailed("1.2.3.4:6881", "corrupt");
+		expect(book.isBanned("1.2.3.4:6881")).toBe(true);
+		expect(book.addressForOpen("1.2.3.4:6881")).toBeUndefined();
+		book.add("1.2.3.5:6881", "pex");
+		// Full: the banned entry is the one evicted, but the ban stays.
+		expect(book.add("1.2.3.6:6881", "pex")).toBe(true);
+		expect(book.get("1.2.3.4:6881")).toBeUndefined();
+		expect(book.add("1.2.3.4:6881", "pex")).toBe(false);
+		expect(book.rejected.banned).toBe(1);
+		expect(book.candidates(10).map((p) => p.key)).not.toContain("1.2.3.4:6881");
+		book.ban("1.2.3.5:6881", "corrupt");
+		expect(book.get("1.2.3.5:6881")?.lastFailure).toBe("corrupt");
+		expect(book.candidates(10).map((p) => p.key)).toEqual(["1.2.3.6:6881"]);
 	});
 
 	it("does not propose a failed address again before its back-off", () => {
@@ -270,5 +290,85 @@ describe("discovery by peer exchange", () => {
 		expect(book.candidates(10)).toEqual([]);
 		expect(book.addressForOpen("127.0.0.1:6881")).toBeUndefined();
 		conn.close();
+	});
+});
+
+describe("PeerBook and the VPS scout", () => {
+	it("dials live seeds, then live partial peers, then unknown addresses; dead ones only once pex names them again", () => {
+		const { book } = clock();
+		book.add("8.8.0.1:6881", "discovery", 0, { score: 0.02, alive: false });
+		book.add("8.8.0.2:6881", "discovery", 0, { score: 0.2 });
+		book.add("8.8.0.3:6881", "discovery");
+		book.add("8.8.0.4:6881", "discovery", 0, { score: 0.6, alive: true, have: 0.9, md: true, unchoked: true });
+		book.add("8.8.0.5:6881", "discovery", 0, { score: 0.55, alive: true, seed: true, have: 1 });
+		book.add("8.8.0.6:6881", "discovery", 0, { score: 0.9, alive: true, seed: true, have: 1, md: true });
+		book.add("8.8.0.7:6881", "pex", 0x02);
+		expect(book.candidates(10).map((p) => p.key)).toEqual([
+			"8.8.0.6:6881",
+			"8.8.0.5:6881",
+			"8.8.0.4:6881",
+			"8.8.0.7:6881",
+			"8.8.0.2:6881",
+			"8.8.0.3:6881",
+		]);
+		// A peer names the dead address: it may have come back, and goes last.
+		book.add("8.8.0.1:6881", "pex");
+		expect(book.candidates(10).map((p) => p.key).at(-1)).toBe("8.8.0.1:6881");
+		// Or every dead one goes last when the book is told so.
+		const all = new PeerBook({ dialScoutDead: true });
+		all.add("8.8.0.1:6881", "discovery", 0, { score: 0.02, alive: false });
+		all.add("8.8.0.2:6881", "discovery");
+		expect(all.candidates(10).map((p) => p.key)).toEqual(["8.8.0.2:6881", "8.8.0.1:6881"]);
+		expect(book.dialClass(book.get("8.8.0.6:6881")!)).toBe("scout");
+		expect(book.dialClass(book.get("8.8.0.2:6881")!)).toBe("untried");
+		expect(book.dialClass(book.get("8.8.0.1:6881")!)).toBe("untried");
+	});
+
+	it("replaces the scout's word with what the engine measured", () => {
+		const { now, book } = clock();
+		const live = "8.8.0.1:6881";
+		const other = "8.8.0.2:6881";
+		book.add(live, "discovery", 0, { score: 0.95, alive: true, seed: true });
+		book.add(other, "discovery", 0, { score: 0.6, alive: true });
+		book.markConnecting(live);
+		book.markFailed(live, "timeout");
+		const entry = book.get(live)!;
+		// Untried from now on, normal back-off, below the live partial peer.
+		expect(book.dialClass(entry)).toBe("untried");
+		expect(entry.retryAt).toBe(now.t + 5 * 60_000);
+		now.t += 5 * 60_000;
+		expect(book.candidates(2).map((p) => p.key)).toEqual([other, live]);
+		// A later discovery line does not resurrect it.
+		book.add(live, "discovery", 0, { score: 0.95, alive: true, seed: true });
+		expect(book.dialClass(entry)).toBe("untried");
+
+		book.markConnecting(other);
+		book.markConnected(other);
+		expect(book.dialClass(book.get(other)!)).toBe("known");
+	});
+
+	it("takes scout facts from discovery only, and drops facts out of range", () => {
+		const { book } = clock();
+		book.add("8.8.0.1:6881", "pex", 0, { score: 0.9, alive: true, seed: true });
+		expect(book.get("8.8.0.1:6881")!.scout).toBeUndefined();
+		book.add("8.8.0.2:6881", "discovery", 0, { score: 3, alive: true });
+		book.add("8.8.0.3:6881", "discovery", 0, { score: 0.5, alive: true, have: Number.NaN });
+		book.add("8.8.0.4:6881", "discovery", 0, { score: 0.5, alive: "yes" as unknown as boolean });
+		for (const k of ["8.8.0.2:6881", "8.8.0.3:6881", "8.8.0.4:6881"]) {
+			expect(book.get(k)!.scout, k).toBeUndefined();
+			expect(book.dialClass(book.get(k)!)).toBe("untried");
+		}
+		// A known address learns the scout's facts from a later discovery line.
+		book.add("8.8.0.1:6881", "discovery", 0, { score: 0.9, alive: true, seed: true });
+		expect(book.dialClass(book.get("8.8.0.1:6881")!)).toBe("scout");
+	});
+
+	it("ranks a peer vouched for by a deliverer above other pex addresses", () => {
+		const { book } = clock();
+		book.add("8.8.0.1:6881", "pex");
+		book.add("8.8.0.2:6881", "pex");
+		book.add("8.8.0.3:6881", "discovery", 0, { score: 0.6, alive: true });
+		book.vouch("8.8.0.2:6881");
+		expect(book.candidates(10).map((p) => p.key)).toEqual(["8.8.0.3:6881", "8.8.0.2:6881", "8.8.0.1:6881"]);
 	});
 });

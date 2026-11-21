@@ -1,6 +1,8 @@
 // The player's position in its source: libmedia's IO loader seeks and
 // reads through this. Reads that have to wait (the data isn't in yet) flip
-// `waiting` after a moment, for the buffering spinner.
+// `waiting` after a moment, for the buffering spinner; once such a read's
+// data is in, `hold` may keep it back longer (playback resumes only with
+// a few seconds verified, buffering.ts), the spinner still up.
 
 import type { ByteSource } from "./source";
 
@@ -21,6 +23,8 @@ export class ReadCursor {
 		private readonly onWaiting: (waiting: boolean, ms: number) => void = () => {},
 		private readonly now: () => number = () => performance.now(),
 		private readonly waitingAfterMs = WAITING_AFTER_MS,
+		/** After a read that left playback waiting: resolve when it may go on (from `offset`). */
+		private readonly hold?: (offset: number, signal: AbortSignal) => Promise<void>,
 	) {}
 
 	size(): Promise<number> {
@@ -36,8 +40,10 @@ export class ReadCursor {
 		const startedAt = this.now();
 		if (this.pending++ === 0) this.timer = setTimeout(() => this.startWaiting(startedAt), this.waitingAfterMs);
 		try {
-			const n = await this.source.read(this.pos, into, this.controller.signal);
-			this.pos += n;
+			const at = this.pos;
+			const n = await this.source.read(at, into, this.controller.signal);
+			if (n > 0 && this.waitingSince !== null && this.hold) await this.hold(at, this.controller.signal);
+			this.pos = at + n;
 			return n;
 		} finally {
 			if (--this.pending === 0) {

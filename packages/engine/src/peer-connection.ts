@@ -7,9 +7,13 @@
 // start): what the peer says it has is kept as is, and checked against the
 // geometry once `setGeometry` is called.
 //
-// The engine does not upload (decision OQ-04): it never sends `unchoke`,
-// `bitfield`/`have` or `piece`, rejects metadata and hash requests, and
-// ignores the peer's block `request`s.
+// Upload (decision OQ-04, M3-12, upload.ts): the connection tracks the
+// peer's interest and our choke state, and hands the peer's `request`,
+// `cancel` and ut_metadata requests to the uploader, which decides. Every
+// upload message (bitfield/have, choke/unchoke, piece, reject, metadata)
+// is lazy: it rides on the next upstream message. Without an uploader (or
+// with upload off) the connection behaves as M1-06: no bitfield, `have`,
+// unchoke or piece; requests ignored, metadata and hash requests rejected.
 
 import {
 	ExtensionError,
@@ -17,6 +21,7 @@ import {
 	decodeHandshake,
 	decodeMetadataMessage,
 	decodePex,
+	encodeMetadataData,
 	encodeMetadataReject,
 	encodeOurHandshake,
 	type ExtensionHandshake,
@@ -42,6 +47,7 @@ import {
 	type WireMessage,
 } from "./peer-wire.ts";
 import type { Transport } from "./transport.ts";
+import type { UploadPeer } from "./upload.ts";
 
 export interface PeerEvents {
 	unchoke?(): void;
@@ -62,6 +68,14 @@ export interface PeerEvents {
 	hashes?(request: HashRequest, hashes: Uint8Array): void;
 	/** BEP 52 `hash reject`. */
 	hashReject?(request: HashRequest): void;
+	/** The peer asks us for a block (upload). Unhandled: ignored. */
+	request?(piece: number, begin: number, length: number): void;
+	/** The peer withdrew a block request. */
+	cancelRequest?(piece: number, begin: number, length: number): void;
+	/** The peer became interested in us, or stopped being. */
+	interest?(interested: boolean): void;
+	/** A ut_metadata request (BEP 9). Unhandled: rejected. */
+	metadataRequest?(piece: number): void;
 	/** The connection ended; `error` for protocol violations and transport failures. */
 	close?(error?: Error): void;
 }
@@ -74,6 +88,14 @@ export interface PeerConnectionOptions {
 	keepAliveMs?: number;
 	/** Request queue depth we announce (default 250). */
 	reqq?: number;
+	/**
+	 * Verified pieces we offer, sent as the first message (a bitfield, or
+	 * have-all with the fast extension). Absent: have-none with the fast
+	 * extension, nothing without it.
+	 */
+	bitfield?: Uint8Array;
+	/** Size of the verified info dict we serve over ut_metadata (announced in our extended handshake). */
+	metadataSize?: number;
 }
 
 /** Most `have`s remembered before the metadata says how many pieces exist. */
@@ -84,7 +106,7 @@ export const DEFAULT_REQQ = 250;
 const blockKey = (piece: number, begin: number) => `${piece}:${begin}`;
 const bit = (r: Uint8Array, b: { byte: number; mask: number }) => (r[b.byte] & b.mask) !== 0;
 
-export class PeerConnection {
+export class PeerConnection implements UploadPeer {
 	readonly transport: Transport;
 	/** Both sides set the BEP 6 bit. */
 	readonly fast: boolean;
@@ -110,6 +132,12 @@ export class PeerConnection {
 	lastBlockAt = 0;
 	/** BEP 6 rejects received. */
 	rejects = 0;
+	/** We choke the peer (we never unchoke without an uploader). */
+	amChoking = true;
+	/** The peer said it is interested in our pieces. */
+	peerInterested = false;
+	/** Payload bytes of blocks we sent. */
+	uploaded = 0;
 
 	private readonly parser: WireParser;
 	private bits: Uint8Array | undefined;
@@ -129,12 +157,16 @@ export class PeerConnection {
 		this.v2 = bit(transport.remote.reserved, RESERVED_V2);
 		const keepAliveMs = options.keepAliveMs ?? 60_000;
 		if (keepAliveMs > 0) this.keepAliveTimer = setInterval(() => this.write(keepAlive()), keepAliveMs);
-		// BEP 6: with fast on both sides the first message must say what we
-		// have; we have nothing to offer (no upload). BEP 10: the extended
-		// handshake may follow right away.
+		// BEP 3 / BEP 6: the first message says what we have (a bitfield,
+		// have-all, or have-none with fast on both sides; without fast and
+		// with nothing to offer, nothing). BEP 10: the extended handshake may
+		// follow right away.
 		const setup: Uint8Array[] = [];
-		if (this.fast) setup.push(encodeMessage(MSG.HAVE_NONE));
-		if (this.extended) setup.push(extendedMessage(0, encodeOurHandshake({ reqq: options.reqq })));
+		const bits = options.bitfield && options.geometry && options.bitfield.length === Math.ceil(options.geometry.pieceCount / 8) ? options.bitfield : undefined;
+		if (bits && this.fast && isFull(bits, options.geometry!.pieceCount)) setup.push(encodeMessage(MSG.HAVE_ALL));
+		else if (bits && bits.some((b) => b !== 0)) setup.push(encodeMessage(MSG.BITFIELD, bits));
+		else if (this.fast) setup.push(encodeMessage(MSG.HAVE_NONE));
+		if (this.extended) setup.push(extendedMessage(0, encodeOurHandshake({ reqq: options.reqq, metadataSize: options.metadataSize })));
 		if (setup.length > 0) this.write(concat(setup));
 		if (options.geometry) this.setGeometry(options.geometry);
 		// Attach on the next microtask: bytes that arrived with the handshake
@@ -246,13 +278,19 @@ export class PeerConnection {
 		return this.outstanding.has(blockKey(piece, begin));
 	}
 
-	cancel(piece: number, begin: number): void {
+	/**
+	 * Withdraw a request. A block that still arrives for it is dropped as
+	 * unsolicited. `urgent` (a cancel after a seek) skips the upstream batch
+	 * timer; a duplicate request that lost its race can wait for the next
+	 * message.
+	 */
+	cancel(piece: number, begin: number, urgent = true): boolean {
 		const key = blockKey(piece, begin);
 		const length = this.outstanding.get(key);
-		if (length === undefined) return;
+		if (length === undefined) return false;
 		this.outstanding.delete(key);
-		// A cancel after a seek must not wait for the upstream batch timer.
-		this.write(encodeRequest(MSG.CANCEL, piece, begin, length), true);
+		this.write(encodeRequest(MSG.CANCEL, piece, begin, length), urgent);
+		return true;
 	}
 
 	/** Send an extension message the peer accepts; false if it doesn't. */
@@ -268,6 +306,56 @@ export class PeerConnection {
 		this.write(encodeHashRequest(MSG.HASH_REQUEST, request));
 	}
 
+	// ---------------------------------------------------------- upload (lazy)
+
+	chokePeer(): void {
+		if (this.amChoking) return;
+		this.amChoking = true;
+		this.write(encodeMessage(MSG.CHOKE), "lazy");
+	}
+
+	unchokePeer(): void {
+		if (!this.amChoking) return;
+		this.amChoking = false;
+		this.write(encodeMessage(MSG.UNCHOKE), "lazy");
+	}
+
+	sendHave(piece: number): void {
+		const payload = new Uint8Array(4);
+		new DataView(payload.buffer).setUint32(0, piece);
+		this.write(encodeMessage(MSG.HAVE, payload), "lazy");
+	}
+
+	/** A block of a verified piece (the uploader checked the request). */
+	sendPiece(piece: number, begin: number, data: Uint8Array): void {
+		const payload = new Uint8Array(8 + data.length);
+		const view = new DataView(payload.buffer);
+		view.setUint32(0, piece);
+		view.setUint32(4, begin);
+		payload.set(data, 8);
+		this.uploaded += data.length;
+		this.write(encodeMessage(MSG.PIECE, payload), "lazy");
+	}
+
+	/** BEP 6 reject (only with the fast extension on both sides). */
+	rejectRequest(piece: number, begin: number, length: number): void {
+		if (!this.fast) return;
+		this.write(encodeRequest(MSG.REJECT, piece, begin, length), "lazy");
+	}
+
+	/** A piece of the verified info dict (BEP 9); false if the peer does not accept ut_metadata. */
+	sendMetadataPiece(piece: number, totalSize: number, data: Uint8Array): boolean {
+		const id = this.remoteExtensions?.m.get("ut_metadata");
+		if (!id) return false;
+		this.write(extendedMessage(id, encodeMetadataData(piece, totalSize, data)), "lazy");
+		return true;
+	}
+
+	rejectMetadata(piece: number): void {
+		const id = this.remoteExtensions?.m.get("ut_metadata");
+		if (id) this.write(extendedMessage(id, encodeMetadataReject(piece)), "lazy");
+	}
+
 	close(): void {
 		this.shutdown();
 		this.transport.close();
@@ -278,10 +366,12 @@ export class PeerConnection {
 		this.write(keepAlive());
 	}
 
-	private write(bytes: Uint8Array, urgent = false): void {
+	private write(bytes: Uint8Array, mode: "normal" | "urgent" | "lazy" | boolean = "normal"): void {
 		if (this.closed || this.transport.closed) return;
 		this.lastSentAt = Date.now();
-		if (urgent && this.transport.sendUrgent) this.transport.sendUrgent(bytes);
+		const how = mode === true ? "urgent" : mode === false ? "normal" : mode;
+		if (how === "urgent" && this.transport.sendUrgent) this.transport.sendUrgent(bytes);
+		else if (how === "lazy" && this.transport.sendLazy) this.transport.sendLazy(bytes);
 		else this.transport.send(bytes);
 	}
 
@@ -369,11 +459,24 @@ export class PeerConnection {
 				this.events.hashReject?.(m.request);
 				return;
 			case "hash_request":
-				// We serve nothing (no upload).
-				this.write(encodeHashRequest(MSG.HASH_REJECT, m.request));
+				// BEP 52 hash requests are not served (out of M3-12's scope).
+				this.write(encodeHashRequest(MSG.HASH_REJECT, m.request), "lazy");
 				return;
-			// request / cancel: we never upload, so there's nothing to serve or cancel.
-			// interested / not interested / keep-alive / others: nothing to do.
+			case "request":
+				this.events.request?.(m.piece, m.begin, m.length);
+				return;
+			case "cancel":
+				this.events.cancelRequest?.(m.piece, m.begin, m.length);
+				return;
+			case "interested":
+			case "not_interested": {
+				const interested = m.type === "interested";
+				if (interested === this.peerInterested) return;
+				this.peerInterested = interested;
+				this.events.interest?.(interested);
+				return;
+			}
+			// keep-alive / others: nothing to do.
 			default:
 				return;
 		}
@@ -386,9 +489,11 @@ export class PeerConnection {
 				this.events.extensions?.(this.remoteExtensions);
 			} else if (id === LOCAL_EXTENSIONS.ut_metadata) {
 				const msg = decodeMetadataMessage(payload);
-				// We have no metadata to give (and never upload): refuse requests.
-				if (msg.type === "request") this.sendExtended("ut_metadata", encodeMetadataReject(msg.piece));
-				else this.events.metadata?.(msg);
+				// Requests go to the uploader (the verified info dict); without one, refused.
+				if (msg.type === "request") {
+					if (this.events.metadataRequest) this.events.metadataRequest(msg.piece);
+					else this.rejectMetadata(msg.piece);
+				} else this.events.metadata?.(msg);
 			} else if (id === LOCAL_EXTENSIONS.ut_pex) {
 				this.events.pex?.(decodePex(payload));
 			}
@@ -412,6 +517,12 @@ function extendedMessage(id: number, payload: Uint8Array): Uint8Array {
 	body[0] = id;
 	body.set(payload, 1);
 	return encodeMessage(MSG.EXTENDED, body);
+}
+
+/** Every one of `pieceCount` bits is set. */
+function isFull(bits: Uint8Array, pieceCount: number): boolean {
+	for (let p = 0; p < pieceCount; p++) if ((bits[p >> 3] & (0x80 >> (p & 7))) === 0) return false;
+	return true;
 }
 
 function concat(parts: Uint8Array[]): Uint8Array {

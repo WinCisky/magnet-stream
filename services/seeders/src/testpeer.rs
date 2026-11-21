@@ -3,6 +3,8 @@
 use crate::bencode::{self, Value};
 use crate::peerwire::{self, HANDSHAKE_LEN};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -26,6 +28,8 @@ pub struct FakePeer {
     pub reqq: Option<u32>,
     pub metadata: Option<Vec<u8>>,
     pub corrupt_metadata: bool,
+    /// ut_metadata requests for the first block (one per fetch), shared by clones.
+    pub metadata_fetches: Arc<AtomicUsize>,
 }
 
 impl FakePeer {
@@ -40,6 +44,7 @@ impl FakePeer {
             reqq: Some(500),
             metadata: None,
             corrupt_metadata: false,
+            metadata_fetches: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -141,6 +146,9 @@ async fn serve(mut stream: TcpStream, peer: FakePeer) -> std::io::Result<()> {
                 };
                 let (request, _) = bencode::parse_prefix(&body[2..]).unwrap();
                 let piece = request.get("piece").and_then(Value::as_int).unwrap() as usize;
+                if piece == 0 {
+                    peer.metadata_fetches.fetch_add(1, Ordering::SeqCst);
+                }
                 let start = piece * 16 * 1024;
                 let end = (start + 16 * 1024).min(metadata.len());
                 let mut block = metadata[start..end].to_vec();
@@ -173,5 +181,26 @@ pub fn fake_info_dict(num_pieces: usize) -> Vec<u8> {
         (b"name".to_vec(), Value::Bytes(b"fake.bin".to_vec())),
         (b"piece length".to_vec(), Value::Int(16384)),
         (b"pieces".to_vec(), Value::Bytes(pieces)),
+    ]))
+}
+
+/// A minimal v2-only info dict (BEP 52): one file in a `file tree`.
+pub fn fake_v2_info_dict() -> Vec<u8> {
+    let root = vec![7u8; 32];
+    let file = Value::Dict(vec![(
+        b"".to_vec(),
+        Value::Dict(vec![
+            (b"length".to_vec(), Value::Int(16384)),
+            (b"pieces root".to_vec(), Value::Bytes(root)),
+        ]),
+    )]);
+    bencode::encode(&Value::Dict(vec![
+        (
+            b"file tree".to_vec(),
+            Value::Dict(vec![(b"v2.bin".to_vec(), file)]),
+        ),
+        (b"meta version".to_vec(), Value::Int(2)),
+        (b"name".to_vec(), Value::Bytes(b"v2.bin".to_vec())),
+        (b"piece length".to_vec(), Value::Int(16384)),
     ]))
 }

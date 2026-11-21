@@ -1,12 +1,22 @@
 //! Streamed discovery, `GET /peers?ih=…` (docs/discovery-api.md): every
-//! tracker and the DHT are queried in parallel, and each peer address is
-//! written as one NDJSON line the moment a source returns it, deduplicated
-//! and filtered (public addresses, ports >= 1024). The response closes when
-//! every source has finished or at the stream deadline (~30 s), whichever
-//! comes first. No probing, no tokens.
+//! tracker and the DHT are queried in parallel, and each address they return
+//! (deduplicated, public, port >= 1024) is scouted (`scout`): probed, scored
+//! and written as one NDJSON line. Addresses the scout knows from the last
+//! minutes come first, best first; live addresses are written as their
+//! probe ends; addresses left unprobed are written as unknown shortly before
+//! the deadline (or at once when the info-hash used its probe budget), and
+//! dead ones last. The response closes when every source and probe has
+//! finished, or at the stream deadline (~30 s). No tokens.
 //!
-//! A finished lookup is cached for 5 minutes (30 s if empty): a second
-//! request for the same info-hash gets the cached list at once.
+//! The info dict (`info`): live peers offering `ut_metadata` are handed to
+//! the metadata fetcher as they are found, and one line
+//! `{"info":"<base64>","size":n}` is written as soon as a verified info dict
+//! is in (first of all when it is already cached). The stream stays open
+//! for a fetch in the air, up to its deadline.
+//!
+//! A finished lookup is cached for 5 minutes (30 s if empty): a later
+//! request for the same info-hash replays its addresses at once, with their
+//! current scores.
 //!
 //! Abuse limits (OQ-14), checked before any lookup starts: requests per
 //! minute and concurrent streams per client IP, and concurrent streams in
@@ -14,18 +24,19 @@
 
 use crate::cache::PeerCache;
 use crate::config::Config;
+use crate::info::{self, InfoService, Outcome};
 use crate::lookup::{Lookup, LookupResult};
 use crate::netguard;
+use crate::scout::{Ask, Entry, Scout, UNKNOWN_SCORE};
 use bytes::Bytes;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-use tokio::task::JoinHandle;
-use tokio::time::Sleep;
+use tokio::sync::mpsc::{channel, unbounded_channel, Sender};
+use tokio::sync::watch;
+use tokio::task::{JoinHandle, JoinSet};
 
 /// The sources stop this long before the stream's deadline, so a lookup
 /// that runs to the deadline still completes (and is cached).
@@ -132,36 +143,60 @@ impl Limiter {
 }
 
 /// Whether discovery hands out this address: a public IP the gateways may
-/// dial (they refuse ports below 1024).
-pub fn is_dialable(addr: &SocketAddr) -> bool {
-    addr.port() >= 1024 && netguard::is_public(addr.ip())
+/// dial (they refuse ports below 1024). `allow_private` (local tests and
+/// development only, `ALLOW_PRIVATE_PEERS`) lifts the public-IP rule.
+pub fn is_dialable(addr: &SocketAddr, allow_private: bool) -> bool {
+    addr.port() >= 1024 && (allow_private || netguard::is_public(addr.ip()))
 }
 
-/// `{"peer":"1.2.3.4:6881"}\n`
-pub fn peer_line(addr: &SocketAddr) -> String {
-    format!("{{\"peer\":\"{addr}\"}}\n")
-}
-
-/// The last line: how many peers were sent, whether they came from the
-/// cache, and whether every source finished (false: cut at the deadline).
-pub fn end_line(count: usize, cached: bool, complete: bool) -> String {
-    format!("{{\"done\":true,\"count\":{count},\"cached\":{cached},\"complete\":{complete}}}\n")
-}
-
-/// The whole body for a cached result.
-pub fn cached_body(result: &LookupResult) -> Bytes {
-    let mut seen = HashSet::new();
-    let mut out = String::new();
-    for addr in result.peers.iter().filter(|a| is_dialable(a)) {
-        if seen.insert(*addr) {
-            out.push_str(&peer_line(addr));
-        }
+/// A probed address: `{"peer":…,"score":…,"alive":true,"seed":…,…}` for a
+/// live one, `{"peer":…,"score":…,"alive":false}` for a dead one.
+pub fn scouted_line(addr: &SocketAddr, entry: &Entry, now: Instant, half_life: Duration) -> String {
+    let score = entry.score(now, half_life);
+    let f = &entry.facts;
+    if !f.alive {
+        return format!("{{\"peer\":\"{addr}\",\"score\":{score:.2},\"alive\":false}}\n");
     }
-    out.push_str(&end_line(seen.len(), true, true));
-    Bytes::from(out)
+    let mut line = format!(
+        "{{\"peer\":\"{addr}\",\"score\":{score:.2},\"alive\":true,\"seed\":{},\"md\":{},\"unchoked\":{}",
+        f.seed, f.md, f.unchoked
+    );
+    if let Some(have) = f.have {
+        line.push_str(&format!(",\"have\":{have:.2}"));
+    }
+    if let Some(rtt) = f.rtt_ms {
+        line.push_str(&format!(",\"rtt\":{rtt}"));
+    }
+    line.push_str("}\n");
+    line
 }
 
-/// Aborts the lookup task when the response is dropped (client gone).
+/// An address nobody probed: `{"peer":…,"score":0.2}`.
+pub fn unknown_line(addr: &SocketAddr) -> String {
+    format!("{{\"peer\":\"{addr}\",\"score\":{UNKNOWN_SCORE:.2}}}\n")
+}
+
+/// The last line: how many addresses were sent (and how many of them
+/// alive, dead or unknown), whether the lookup came from the cache, and
+/// whether every source finished (false: cut at the deadline).
+pub fn end_line(counts: &Counts, cached: bool, complete: bool) -> String {
+    format!(
+        "{{\"done\":true,\"count\":{},\"cached\":{cached},\"complete\":{complete},\"alive\":{},\"dead\":{},\"unknown\":{}}}\n",
+        counts.alive + counts.dead + counts.unknown,
+        counts.alive,
+        counts.dead,
+        counts.unknown
+    )
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Counts {
+    pub alive: usize,
+    pub dead: usize,
+    pub unknown: usize,
+}
+
+/// Aborts a task when dropped (the response went away).
 struct AbortOnDrop(JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -170,73 +205,318 @@ impl Drop for AbortOnDrop {
     }
 }
 
-struct LiveStream {
-    rx: UnboundedReceiver<Vec<SocketAddr>>,
-    seen: HashSet<SocketAddr>,
-    deadline: Pin<Box<Sleep>>,
-    finished: bool,
-    _task: AbortOnDrop,
-    _permit: Permit,
+/// Where a stream's addresses come from.
+pub enum Source {
+    /// A new lookup (trackers + DHT); its result is cached when it finishes.
+    Lookup {
+        lookup: Arc<Lookup>,
+        cache: Arc<PeerCache>,
+        trackers: Vec<String>,
+    },
+    /// A lookup finished within the cache's TTL.
+    Cached(Arc<LookupResult>),
 }
 
-/// Start a lookup and return its NDJSON body as a stream of chunks.
-pub fn live(
-    lookup: Arc<Lookup>,
-    cache: Arc<PeerCache>,
+/// Unprobed addresses are written as unknown this long before the deadline.
+const FLUSH_BEFORE: Duration = Duration::from_secs(1);
+/// A finished lookup gets this long to land in the cache once the stream ends.
+const CACHE_GRACE: Duration = Duration::from_secs(1);
+
+/// Start a stream and return its NDJSON body as a stream of chunks. The
+/// work runs in a task that ends (with its lookup and its waits) when the
+/// body is dropped; probes already started finish and are remembered.
+pub fn stream(
+    scout: Arc<Scout>,
+    info: Arc<InfoService>,
     cfg: Arc<Config>,
     info_hash: [u8; 20],
-    trackers: Vec<String>,
+    source: Source,
     permit: Permit,
 ) -> impl futures_lite::Stream<Item = Result<Bytes, Infallible>> + Send + 'static {
-    let (tx, rx) = unbounded_channel();
-    let stream_deadline = cfg.peers_stream_deadline;
-    let sources_deadline = stream_deadline.saturating_sub(SOURCE_SLACK);
+    let (tx, rx) = channel::<Bytes>(64);
     let task = tokio::spawn(async move {
-        let result = lookup
-            .run_streaming_for(info_hash, trackers, &cfg, sources_deadline, Some(tx))
-            .await;
-        cache.insert(info_hash, Arc::new(result)).await;
+        let _permit = permit;
+        run(scout, info, cfg, info_hash, source, tx).await;
     });
-    let state = LiveStream {
-        rx,
-        seen: HashSet::new(),
-        deadline: Box::pin(tokio::time::sleep(stream_deadline)),
-        finished: false,
-        _task: AbortOnDrop(task),
-        _permit: permit,
-    };
-    futures_lite::stream::unfold(state, |mut st| async move {
-        if st.finished {
-            return None;
+    futures_lite::stream::unfold((rx, AbortOnDrop(task)), |(mut rx, guard)| async move {
+        let chunk = rx.recv().await?;
+        Some((Ok(chunk), (rx, guard)))
+    })
+}
+
+/// One stream's state: what was written, what waits for a probe.
+struct Run {
+    tx: Sender<Bytes>,
+    half_life: Duration,
+    seen: HashSet<SocketAddr>,
+    queue: VecDeque<SocketAddr>,
+    probing: HashSet<SocketAddr>,
+    dead: Vec<(SocketAddr, Entry)>,
+    counts: Counts,
+    out: String,
+    /// Live peers offering ut_metadata, in the order found.
+    md_peers: Vec<SocketAddr>,
+    /// New ones since the last offer to the metadata fetcher.
+    md_new: bool,
+}
+
+impl Run {
+    fn found(&mut self, entry: Entry, addr: SocketAddr) {
+        if entry.facts.alive && entry.facts.md {
+            self.md_peers.push(addr);
+            self.md_new = true;
         }
-        loop {
-            tokio::select! {
-                batch = st.rx.recv() => match batch {
-                    Some(batch) => {
-                        let mut chunk = String::new();
-                        for addr in batch.iter().filter(|a| is_dialable(a)) {
-                            if st.seen.insert(*addr) {
-                                chunk.push_str(&peer_line(addr));
-                            }
-                        }
-                        if !chunk.is_empty() {
-                            return Some((Ok(Bytes::from(chunk)), st));
-                        }
-                    }
-                    None => {
-                        st.finished = true;
-                        let end = end_line(st.seen.len(), false, true);
-                        return Some((Ok(Bytes::from(end)), st));
-                    }
-                },
-                _ = st.deadline.as_mut() => {
-                    st.finished = true;
-                    let end = end_line(st.seen.len(), false, false);
-                    return Some((Ok(Bytes::from(end)), st));
+        if entry.facts.alive {
+            self.counts.alive += 1;
+            self.out
+                .push_str(&scouted_line(&addr, &entry, Instant::now(), self.half_life));
+        } else {
+            self.dead.push((addr, entry));
+        }
+    }
+
+    fn unknown(&mut self, addr: SocketAddr) {
+        self.counts.unknown += 1;
+        self.out.push_str(&unknown_line(&addr));
+    }
+
+    /// Send what was written so far. False: the client went away.
+    async fn flush(&mut self) -> bool {
+        if self.out.is_empty() {
+            return true;
+        }
+        let chunk = Bytes::from(std::mem::take(&mut self.out));
+        self.tx.send(chunk).await.is_ok()
+    }
+}
+
+/// The metadata side of a stream: written yet, or the fetch to wait for.
+struct InfoState {
+    written: bool,
+    waiting: Option<watch::Receiver<Option<Outcome>>>,
+}
+
+impl InfoState {
+    /// Hand new md peers to the fetcher and follow its flight (or write
+    /// the info dict, if a flight just put it in the cache).
+    async fn offer(&mut self, service: &Arc<InfoService>, info_hash: [u8; 20], st: &mut Run) {
+        if self.written || !st.md_new {
+            return;
+        }
+        st.md_new = false;
+        service.offer(info_hash, &st.md_peers);
+        if self.waiting.is_none() {
+            self.waiting = service.watch(&info_hash);
+        }
+        if self.waiting.is_none() {
+            if let Some(dict) = service.cached(&info_hash).await {
+                st.out.push_str(&info::info_line(&dict));
+                self.written = true;
+            }
+        }
+    }
+
+    fn pending(&self) -> bool {
+        !self.written && self.waiting.is_some()
+    }
+}
+
+/// The flight's outcome (None: the flight went away without one).
+async fn outcome_of(waiting: &mut Option<watch::Receiver<Option<Outcome>>>) -> Option<Outcome> {
+    let rx = waiting.as_mut()?;
+    match rx.wait_for(Option::is_some).await {
+        Ok(v) => v.clone(),
+        Err(_) => None,
+    }
+}
+
+async fn run(
+    scout: Arc<Scout>,
+    service: Arc<InfoService>,
+    cfg: Arc<Config>,
+    info_hash: [u8; 20],
+    source: Source,
+    tx: Sender<Bytes>,
+) {
+    let started = tokio::time::Instant::now();
+    let deadline = started + cfg.peers_stream_deadline;
+    let flush_at = deadline
+        .checked_sub(FLUSH_BEFORE)
+        .filter(|t| *t > started)
+        .unwrap_or(started + cfg.peers_stream_deadline / 2);
+    let allow_private = cfg.allow_private_peers;
+    let per_stream = cfg.scout_per_stream.max(1);
+
+    let (found_tx, mut found_rx) = unbounded_channel::<Vec<SocketAddr>>();
+    let cached = matches!(source, Source::Cached(_));
+    let mut lookup_task = match source {
+        Source::Lookup {
+            lookup,
+            cache,
+            trackers,
+        } => {
+            let sources_deadline = cfg.peers_stream_deadline.saturating_sub(SOURCE_SLACK);
+            let cfg = cfg.clone();
+            Some(AbortOnDrop(tokio::spawn(async move {
+                let result = lookup
+                    .run_streaming_for(info_hash, trackers, &cfg, sources_deadline, Some(found_tx))
+                    .await;
+                cache.insert(info_hash, Arc::new(result)).await;
+            })))
+        }
+        Source::Cached(result) => {
+            let _ = found_tx.send(result.peers.clone());
+            // The only batch: closing the channel ends the sources.
+            drop(found_tx);
+            None
+        }
+    };
+
+    let mut st = Run {
+        tx,
+        half_life: scout.settings().half_life,
+        seen: HashSet::new(),
+        queue: VecDeque::new(),
+        probing: HashSet::new(),
+        dead: Vec::new(),
+        counts: Counts::default(),
+        out: String::new(),
+        md_peers: Vec::new(),
+        md_new: false,
+    };
+    let mut meta = InfoState {
+        written: false,
+        waiting: None,
+    };
+    // A cached info dict goes first of all.
+    if let Some(dict) = service.cached(&info_hash).await {
+        st.out.push_str(&info::info_line(&dict));
+        meta.written = true;
+    }
+
+    // What the scout already knows comes first, best first.
+    for (addr, entry) in scout.fresh(info_hash).await {
+        if is_dialable(&addr, allow_private) && st.seen.insert(addr) {
+            st.found(entry, addr);
+        }
+    }
+    meta.offer(&service, info_hash, &mut st).await;
+    if !st.flush().await {
+        return;
+    }
+
+    let mut waits: JoinSet<(SocketAddr, Option<Entry>)> = JoinSet::new();
+    let mut sources_done = false;
+    let mut flushing = false;
+    let mut complete = true;
+    loop {
+        // Start probes (or reuse fresh results) up to the per-stream limit.
+        while !flushing && waits.len() < per_stream {
+            let Some(addr) = st.queue.pop_front() else {
+                break;
+            };
+            match scout.ask(info_hash, addr).await {
+                Ask::Fresh(entry) => st.found(entry, addr),
+                Ask::OverBudget => st.unknown(addr),
+                Ask::Wait(mut rx) => {
+                    st.probing.insert(addr);
+                    waits.spawn(async move {
+                        let entry = rx.wait_for(Option::is_some).await.ok().and_then(|e| *e);
+                        (addr, entry)
+                    });
                 }
             }
         }
-    })
+        meta.offer(&service, info_hash, &mut st).await;
+        if !st.flush().await {
+            return;
+        }
+        if sources_done && st.queue.is_empty() && waits.is_empty() && !meta.pending() {
+            break;
+        }
+        tokio::select! {
+            batch = found_rx.recv(), if !sources_done => match batch {
+                Some(batch) => {
+                    for addr in batch {
+                        if !is_dialable(&addr, allow_private) || !st.seen.insert(addr) {
+                            continue;
+                        }
+                        if flushing {
+                            st.unknown(addr);
+                        } else {
+                            st.queue.push_back(addr);
+                        }
+                    }
+                }
+                None => sources_done = true,
+            },
+            Some(joined) = waits.join_next(), if !waits.is_empty() => {
+                if let Ok((addr, entry)) = joined {
+                    st.probing.remove(&addr);
+                    match entry {
+                        Some(entry) => st.found(entry, addr),
+                        // The probe's task died: nothing learned.
+                        None => st.unknown(addr),
+                    }
+                }
+            },
+            outcome = outcome_of(&mut meta.waiting), if meta.pending() => {
+                match outcome {
+                    Some(Ok(dict)) => {
+                        st.out.push_str(&info::info_line(&dict));
+                        meta.written = true;
+                    }
+                    // That flight failed (or is gone): a peer found later
+                    // may start another.
+                    _ => meta.waiting = None,
+                }
+            },
+            _ = tokio::time::sleep_until(flush_at), if !flushing => {
+                // Too late to probe: what is left goes out unprobed. Probes
+                // already running finish and are remembered for next time.
+                flushing = true;
+                waits.abort_all();
+                waits = JoinSet::new();
+                let left: Vec<SocketAddr> = st.queue.drain(..).chain(st.probing.drain()).collect();
+                for addr in left {
+                    st.unknown(addr);
+                }
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                complete = sources_done;
+                break;
+            },
+        }
+    }
+
+    let mut dead = std::mem::take(&mut st.dead);
+    dead.sort_by_key(|(addr, _)| *addr);
+    let now = Instant::now();
+    for (addr, entry) in &dead {
+        st.counts.dead += 1;
+        st.out
+            .push_str(&scouted_line(addr, entry, now, st.half_life));
+    }
+    st.out.push_str(&end_line(&st.counts, cached, complete));
+    let counts = st.counts;
+    if !st.flush().await {
+        return;
+    }
+    tracing::debug!(
+        info = meta.written,
+        alive = counts.alive,
+        dead = counts.dead,
+        unknown = counts.unknown,
+        cached,
+        complete,
+        "peers stream done"
+    );
+    // A lookup whose sources all finished is about to land in the cache.
+    if let Some(task) = lookup_task.as_mut() {
+        if sources_done {
+            let _ = tokio::time::timeout(CACHE_GRACE, &mut task.0).await;
+        }
+    }
 }
 
 /// The client IP for the limits: the trusted proxy's header (nginx's
@@ -305,7 +585,7 @@ mod tests {
     #[test]
     fn filters_private_reserved_and_low_ports() {
         for ok in ["8.8.8.8:6881", "[2001:4860::1]:51413"] {
-            assert!(is_dialable(&ok.parse().unwrap()), "{ok}");
+            assert!(is_dialable(&ok.parse().unwrap(), false), "{ok}");
         }
         for bad in [
             "10.0.0.1:6881",
@@ -317,20 +597,82 @@ mod tests {
             "8.8.8.8:80",
             "8.8.8.8:0",
         ] {
-            assert!(!is_dialable(&bad.parse().unwrap()), "{bad}");
+            assert!(!is_dialable(&bad.parse().unwrap(), false), "{bad}");
         }
+        // Local tests and development may reach private peers, never low ports.
+        assert!(is_dialable(&"127.0.0.1:6881".parse().unwrap(), true));
+        assert!(!is_dialable(&"127.0.0.1:80".parse().unwrap(), true));
     }
 
     #[test]
     fn lines_are_ndjson() {
+        use crate::scout::Facts;
         let v4: SocketAddr = "1.2.3.4:6881".parse().unwrap();
         let v6: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
-        for line in [peer_line(&v4), peer_line(&v6), end_line(2, true, false)] {
+        let now = Instant::now();
+        let hl = Duration::from_secs(1800);
+        let alive = Entry {
+            facts: Facts {
+                alive: true,
+                seed: false,
+                have: Some(0.42),
+                md: true,
+                unchoked: false,
+                rtt_ms: Some(45),
+            },
+            probed_at: now,
+        };
+        let bare = Entry {
+            facts: Facts {
+                have: None,
+                rtt_ms: None,
+                ..alive.facts
+            },
+            probed_at: now,
+        };
+        let dead = Entry {
+            facts: Facts::dead(),
+            probed_at: now,
+        };
+        let counts = Counts {
+            alive: 1,
+            dead: 1,
+            unknown: 1,
+        };
+        for line in [
+            scouted_line(&v4, &alive, now, hl),
+            scouted_line(&v6, &bare, now, hl),
+            scouted_line(&v6, &dead, now, hl),
+            unknown_line(&v6),
+            end_line(&counts, true, false),
+        ] {
             assert!(line.ends_with('\n'));
+            assert!(line.len() < 256, "{line}");
             let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
             assert!(v.is_object());
         }
-        assert_eq!(peer_line(&v6), "{\"peer\":\"[2001:db8::1]:6881\"}\n");
+        let v: serde_json::Value =
+            serde_json::from_str(scouted_line(&v4, &alive, now, hl).trim_end()).unwrap();
+        assert_eq!(v["peer"], "1.2.3.4:6881");
+        assert_eq!(v["alive"], true);
+        assert_eq!(v["seed"], false);
+        assert_eq!(v["md"], true);
+        assert_eq!(v["unchoked"], false);
+        assert_eq!(v["have"], 0.42);
+        assert_eq!(v["rtt"], 45);
+        assert!(v["score"].as_f64().unwrap() > 0.5);
+        assert_eq!(
+            unknown_line(&v6),
+            "{\"peer\":\"[2001:db8::1]:6881\",\"score\":0.20}\n"
+        );
+        assert_eq!(
+            scouted_line(&v6, &dead, now, hl),
+            "{\"peer\":\"[2001:db8::1]:6881\",\"score\":0.02,\"alive\":false}\n"
+        );
+        let end: serde_json::Value =
+            serde_json::from_str(end_line(&counts, true, false).trim_end()).unwrap();
+        assert_eq!(end["count"], 3);
+        assert_eq!(end["unknown"], 1);
     }
 
     #[test]

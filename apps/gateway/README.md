@@ -20,6 +20,7 @@ billed 20:1, so the browser batches them. Details: `docs/tunnel-protocol.md`.
 | `TUNNEL_SOCKETS_PER_SESSION` | default 3 WebSockets per `?session=` object, 6 connections each |
 | `TUNNEL_FAILED_CONNECT_HOLD_MS` | default 20000: a timed-out connect keeps its slot this long |
 | `TUNNEL_UPGRADES_PER_MINUTE` | default 30 upgrades per minute per client IP, then 429 |
+| `TUNNEL_MAX_PENDING_WRITE_BYTES` | default 4194304 (4 MiB): bytes held for a peer and not yet written to it; past this the peer is not reading and its connection is closed (`close` WRITE_OVERFLOW), the others go on |
 
 Values are validated: an unset variable takes its default, a malformed or
 out-of-range one makes the gateway refuse tunnels with 500

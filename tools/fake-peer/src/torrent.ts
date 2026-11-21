@@ -38,6 +38,11 @@ export interface TorrentOptions {
 	files?: readonly FileSpec[];
 	/** 1 (default), 2 (v2 only) or "hybrid". */
 	version?: 1 | 2 | "hybrid";
+	/**
+	 * The bytes of a single-file torrent (a real video, say) instead of noise;
+	 * `size` is then its length. Not with `files`.
+	 */
+	content?: Uint8Array;
 }
 
 export interface TorrentFileInfo {
@@ -154,7 +159,9 @@ export function merkleTree(file: Uint8Array, pieceLength: number): MerkleTree {
 }
 
 export function makeTorrent(options: TorrentOptions = {}): FakeTorrent {
-	const { seed = 1, size = 8 * MiB, pieceLength = 256 * 1024, version = 1 } = options;
+	const { seed = 1, pieceLength = 256 * 1024, version = 1 } = options;
+	if (options.content && options.files) throw new RangeError("content is for single-file torrents");
+	const size = options.content?.length ?? options.size ?? 8 * MiB;
 	if (!Number.isSafeInteger(pieceLength) || pieceLength <= 0) throw new RangeError("pieceLength must be a positive integer");
 	if (!Number.isInteger(seed)) throw new RangeError("seed must be an integer");
 	if (version !== 1 && (pieceLength < BLOCK || (pieceLength & (pieceLength - 1)) !== 0)) {
@@ -169,7 +176,7 @@ export function makeTorrent(options: TorrentOptions = {}): FakeTorrent {
 	const realSize = specs.reduce((n, f) => n + f.length, 0);
 	if (realSize <= 0) throw new RangeError("size must be a positive integer");
 	const torrentName = options.name ?? (multi ? `fake-${seed}` : `fake-${seed}.bin`);
-	const content = noise(seed, realSize);
+	const content = options.content ?? noise(seed, realSize);
 
 	// Layout in the piece space.
 	const aligned = version !== 1;

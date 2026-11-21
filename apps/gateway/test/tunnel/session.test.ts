@@ -23,7 +23,7 @@ type Behaviour =
 	| { kind: "hang" } // never connects
 	| { kind: "silent" } // connects, never answers
 	| { kind: "raw"; bytes: Uint8Array } // answers with these bytes
-	| { kind: "peer"; infoHash?: Uint8Array; extra?: Uint8Array; chunked?: boolean };
+	| { kind: "peer"; infoHash?: Uint8Array; extra?: Uint8Array; chunked?: boolean; stall?: boolean };
 
 /** Fake remote side of a socket: records writes, lets the test push bytes. */
 class Remote {
@@ -36,12 +36,17 @@ class Remote {
 	constructor(behaviour: Behaviour) {
 		const closed = new Promise<void>((r) => (this.resolveClosed = r));
 		const readable = new ReadableStream<Uint8Array>({ start: (c) => void (this.controller = c) });
-		const writable = new WritableStream<Uint8Array>({
-			write: (chunk) => {
-				this.written.push(chunk.slice());
-				if (this.written.length === 1) this.answer(behaviour);
+		const writable = new WritableStream<Uint8Array>(
+			{
+				write: (chunk) => {
+					this.written.push(chunk.slice());
+					if (this.written.length === 1) this.answer(behaviour);
+					// A peer that stops reading after the handshake: later writes never complete.
+					else if (behaviour.kind === "peer" && behaviour.stall) return new Promise<void>(() => {});
+				},
 			},
-		});
+			{ highWaterMark: 1 },
+		);
 		const opened =
 			behaviour.kind === "refuse"
 				? Promise.reject(new Error("refused"))
@@ -87,6 +92,7 @@ interface SetupOptions {
 	connectTimeoutMs?: number;
 	idleTimeoutMs?: number;
 	failedConnectHoldMs?: number;
+	maxPendingWriteBytes?: number;
 	now?: () => number;
 }
 
@@ -111,6 +117,7 @@ function setup(behaviours: Behaviour[] | ((i: number) => Behaviour), options: Se
 			connectTimeoutMs: options.connectTimeoutMs ?? 300,
 			failedConnectHoldMs: options.failedConnectHoldMs ?? 0,
 			...(options.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: options.idleTimeoutMs }),
+			...(options.maxPendingWriteBytes === undefined ? {} : { maxPendingWriteBytes: options.maxPendingWriteBytes }),
 			...(options.now === undefined ? {} : { now: options.now }),
 			connect: (address) => {
 				connected.push(address);
@@ -166,6 +173,38 @@ describe("tunnel session", () => {
 		t.remotes[0].close();
 		await until(() => t.frames().some((f) => f.type === "close"));
 		expect(t.frames().at(-1)).toEqual({ type: "close", conn: 1, reason: CloseReason.REMOTE_CLOSED });
+	});
+
+	it("closes a peer that does not read past the pending-write bound, and only that one", async () => {
+		const t = setup([{ kind: "peer", stall: true }, { kind: "peer" }], { maxPendingWriteBytes: 64 * 1024 });
+		t.send(open(1), open(2));
+		await until(() => t.frames().filter((f) => f.type === "opened").length === 2);
+		const chunk = new Uint8Array(16 * 1024);
+		// The first write is in progress (and never ends); the next ones wait behind it.
+		for (let i = 0; i < 4; i++) t.send({ type: "data", conn: 1, payload: chunk });
+		await tick(10);
+		expect(t.frames().some((f) => f.type === "close")).toBe(false);
+		t.send({ type: "data", conn: 1, payload: Uint8Array.of(1) });
+		await until(() => t.frames().some((f) => f.type === "close"));
+		expect(t.frames().filter((f) => f.type === "close")).toEqual([{ type: "close", conn: 1, reason: CloseReason.WRITE_OVERFLOW }]);
+		expect(t.session.stats.overflowClosed).toBe(1);
+		expect(t.logs.some((l) => l.event === "tunnel.closed" && l.fields.reason === "write_overflow")).toBe(true);
+		// The other connection of the socket goes on.
+		t.send({ type: "data", conn: 2, payload: chunk }, { type: "data", conn: 2, payload: chunk });
+		await until(() => t.remotes[1].written.length === 3);
+		expect(t.session.isEnded).toBe(false);
+	});
+
+	it("frees the bound as the peer reads", async () => {
+		const t = setup([{ kind: "peer" }], { maxPendingWriteBytes: 64 * 1024 });
+		t.send(open(1));
+		await until(() => t.frames().some((f) => f.type === "opened"));
+		const chunk = new Uint8Array(32 * 1024);
+		for (let i = 0; i < 20; i++) {
+			t.send({ type: "data", conn: 1, payload: chunk });
+			await until(() => t.remotes[0].written.length === i + 2);
+		}
+		expect(t.frames().some((f) => f.type === "close")).toBe(false);
 	});
 
 	it("handles a handshake arriving one byte at a time", async () => {

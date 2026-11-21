@@ -6,8 +6,14 @@
 //
 // The rest of the app sees one `PlayerState` (for the controls) and a few
 // `PlayerEvent`s (for diagnostics); nothing here knows about torrents.
+//
+// Playback starts once the container index is read and about 10 s of
+// video are verified, and after running dry resumes with 5 s
+// (buffering.ts): the first play waits for the source to have them, and a
+// read that left playback waiting is held back until it has them.
 
 import type AVPlayerType from "@libmedia/avplayer";
+import { averageBitrate, byteAt, waitForBuffer, type BufferView, type HoldResult } from "./buffering";
 import { codecName, extensionOf, wasmBaseUrl } from "./codecs";
 import { ReadCursor } from "./cursor";
 import { AVI_HEADER_BYTES, fixAviFourcc, normalizeSubtitle, webGpuFlickers } from "./quirks";
@@ -58,8 +64,21 @@ export interface PlayerState {
 }
 
 export type PlayerEvent =
-	/** The container was read and its streams are known. */
-	| { type: "loaded"; ms: number; mode: "native" | "decode" | null; videoCodec: string | null; audioCodec: string | null; height: number | null }
+	/** The container was read and its streams are known (`durationMs`: 0 if unknown). */
+	| {
+			type: "loaded";
+			ms: number;
+			durationMs: number;
+			mode: "native" | "decode" | null;
+			videoCodec: string | null;
+			audioCodec: string | null;
+			height: number | null;
+	  }
+	/**
+	 * A held start or resume was let go: this much video was verified ahead
+	 * (`toEnd`: up to the end of the file), after holding this long.
+	 */
+	| ({ type: "buffered" } & HoldResult)
 	/** First picture (or sound) after pressing play, and how it's decoded. */
 	| { type: "started"; ms: number; mode: "native" | "decode" }
 	/** Playback waited for data this long. */
@@ -79,6 +98,29 @@ export type PlayerEvent =
 	 * may never come back) and when the player closes.
 	 */
 	| { type: "stats"; playedMs: number; videoStutters: number; audioStutters: number };
+
+/** What the controls drive: the libmedia player below, or the browser's own (native.ts). */
+export interface MediaPlayer {
+	readonly current: PlayerState;
+	/**
+	 * Start the first play at `ms` (where the viewer stopped last time).
+	 * Ignored once play was pressed or the viewer sought.
+	 */
+	resumeAt(ms: number): void;
+	/** Must run in a click handler: that's what lets the sound start. */
+	play(): Promise<void>;
+	pause(): Promise<void>;
+	/** Also a click handler (sound blocked until one). */
+	resumeSound(): Promise<void>;
+	seek(ms: number): Promise<void>;
+	setVolume(volume: number): void;
+	setMuted(muted: boolean): void;
+	selectAudio(id: number): Promise<void>;
+	/** A subtitle track's key, or null for none. */
+	selectSubtitle(key: string | null): void;
+	toggleSubtitles(): void;
+	destroy(): Promise<void>;
+}
 
 export interface PlayerOptions {
 	container: HTMLDivElement;
@@ -114,7 +156,7 @@ function unlockAudio(lib: typeof AVPlayerType | null): void {
 	}
 }
 
-export class VideoPlayer {
+export class VideoPlayer implements MediaPlayer {
 	private player: AVPlayerType | null = null;
 	private lib: typeof AVPlayerType | null = null;
 	private readonly cursor: ReadCursor;
@@ -165,15 +207,34 @@ export class VideoPlayer {
 	 * Re-enabling it needlessly re-seeks a file, doubling a line.
 	 */
 	private subtitlesShown = true;
+	/** Where the first play starts (a remembered position, M3-04); 0: the start. */
+	private resumeMs = 0;
+	/** The file's size in bytes, once loaded. */
+	private size = 0;
+	/** The start threshold was met (the first play may go). */
+	private startHeld = false;
+	private starting: Promise<boolean> | null = null;
+	/** Stops the start hold (destroy). */
+	private readonly holds = new AbortController();
+	/** Where a seek in progress goes (null: none): later seeks wait for it, and the clock shows it. */
+	private seekTarget: number | null = null;
+	/** Lets a held read go at once (a seek: the position it waited at no longer matters). */
+	private releaseHold: (() => void) | null = null;
 	private readonly onHidden = () => {
 		if (document.visibilityState === "hidden") this.reportStats();
 	};
 
 	constructor(private readonly opts: PlayerOptions) {
-		this.cursor = new ReadCursor(opts.source, (waiting, ms) => {
-			this.set({ waiting });
-			if (!waiting && ms > 0 && this.state.status === "playing") this.emit({ type: "waited", ms });
-		});
+		this.cursor = new ReadCursor(
+			opts.source,
+			(waiting, ms) => {
+				this.set({ waiting });
+				if (!waiting && ms > 0 && this.state.status === "playing") this.emit({ type: "waited", ms });
+			},
+			undefined,
+			undefined,
+			(offset, signal) => this.holdResume(offset, signal),
+		);
 		this.resizer = new ResizeObserver(() => {
 			const { offsetWidth: w, offsetHeight: h } = opts.container;
 			if (w > 0 && h > 0) this.player?.resize(w, h);
@@ -188,11 +249,22 @@ export class VideoPlayer {
 		return this.state;
 	}
 
+	/**
+	 * Start the first play at `ms` (where the viewer stopped last time).
+	 * Ignored once play was pressed or the viewer sought.
+	 */
+	resumeAt(ms: number): void {
+		if (this.playPressedAt !== null || !Number.isFinite(ms) || ms <= 0) return;
+		this.resumeMs = ms;
+		this.set({ currentMs: ms });
+	}
+
 	/** Must run in a click handler: that's what lets the sound start. */
 	async play(): Promise<void> {
 		this.playPressedAt ??= performance.now();
 		unlockAudio(this.lib);
 		if (!(await this.loaded) || this.destroyed) return;
+		if (!this.startHeld && !(await this.holdStart())) return;
 		const player = this.player!;
 		try {
 			if (player.isSuspended()) await player.resume();
@@ -203,7 +275,11 @@ export class VideoPlayer {
 			if (!player.isMSE()) this.markStarted();
 		} catch (e) {
 			this.fail("play", e);
+			return;
 		}
+		const resume = this.resumeMs;
+		this.resumeMs = 0;
+		if (resume > 0) await this.seek(resume);
 	}
 
 	async pause(): Promise<void> {
@@ -229,18 +305,34 @@ export class VideoPlayer {
 		const player = this.player;
 		if (!player || this.state.status === "loading" || this.state.status === "error") return;
 		const target = Math.max(0, Math.min(ms, this.state.durationMs || ms));
+		this.resumeMs = 0;
 		this.set({ currentMs: target });
+		// A read held at the old position is let go: the new one holds instead.
+		this.releaseHold?.();
+		// libmedia ignores a seek while one runs ("player is seeking now"):
+		// the latest target waits for it, so quick skips add up.
+		if (this.seekTarget !== null) {
+			this.seekTarget = target;
+			return;
+		}
+		this.seekTarget = target;
 		const startedAt = performance.now();
 		try {
 			if (this.state.status === "ended") {
 				await player.play();
 				this.set({ status: "playing" });
 			}
-			await player.seek(BigInt(Math.round(target)));
+			let done: number | null = null;
+			while (this.seekTarget !== null && this.seekTarget !== done && !this.destroyed) {
+				done = this.seekTarget;
+				await player.seek(BigInt(Math.round(done)));
+			}
 			this.keepSubtitlesOff();
 			this.emit({ type: "seeked", ms: performance.now() - startedAt });
 		} catch (e) {
 			this.fail("play", e);
+		} finally {
+			this.seekTarget = null;
 		}
 	}
 
@@ -286,6 +378,7 @@ export class VideoPlayer {
 		if (this.destroyed) return;
 		this.reportStats();
 		this.destroyed = true;
+		this.holds.abort();
 		this.externalAbort.abort();
 		clearInterval(this.timer);
 		this.resizer.disconnect();
@@ -333,11 +426,13 @@ export class VideoPlayer {
 			const ext = extensionOf(this.opts.name);
 			await player.load(sourceLoader(AVPlayer.IOLoader.CustomIOLoader, this.cursor, ext), { ext });
 			if (this.destroyed) return false;
+			this.size = await this.cursor.size();
 			this.describe(player);
 			this.set({ status: this.state.status === "loading" ? "ready" : this.state.status });
 			this.emit({
 				type: "loaded",
 				ms: performance.now() - startedAt,
+				durationMs: this.state.durationMs,
 				mode: this.state.mode,
 				videoCodec: this.state.videoCodec,
 				audioCodec: this.state.audioCodec,
@@ -348,6 +443,63 @@ export class VideoPlayer {
 		} catch (e) {
 			if (!this.destroyed) this.fail("load", e);
 			return false;
+		}
+	}
+
+	/** What the thresholds are measured against: verified bytes, at the video's average bitrate. */
+	private bufferView(): BufferView {
+		const source = this.opts.source;
+		const size = this.size;
+		return {
+			size,
+			bitrate: averageBitrate(size, this.state.durationMs),
+			available: (offset, limit) => (source.available ? source.available(offset, limit) : Math.max(0, size - offset)),
+		};
+	}
+
+	/**
+	 * Before the first play: wait for ~10 s verified where it starts. A
+	 * read there tells the recovery where that is (reads steer it).
+	 */
+	private holdStart(): Promise<boolean> {
+		this.starting ??= (async () => {
+			const at = () => byteAt(this.resumeMs || this.state.currentMs, this.state.durationMs, this.size);
+			if (this.opts.source.available) void this.opts.source.read(at(), new Uint8Array(1), this.holds.signal).catch(() => {});
+			this.set({ waiting: true });
+			try {
+				const held = await waitForBuffer("start", () => this.bufferView(), at, this.holds.signal);
+				this.startHeld = true;
+				this.emit({ type: "buffered", ...held });
+				return true;
+			} catch {
+				return false;
+			} finally {
+				this.starting = null;
+				this.set({ waiting: false });
+			}
+		})();
+		return this.starting;
+	}
+
+	/**
+	 * A read left playback waiting (its data wasn't in): once in, it goes
+	 * on only with ~5 s verified from there, so playback doesn't stutter
+	 * through every piece as it arrives. A seek lets it go at once.
+	 */
+	private async holdResume(offset: number, signal: AbortSignal): Promise<void> {
+		if (!this.started || this.destroyed || signal.aborted) return;
+		const release = new AbortController();
+		const stop = () => release.abort();
+		signal.addEventListener("abort", stop, { once: true });
+		this.releaseHold = stop;
+		try {
+			const held = await waitForBuffer("resume", () => this.bufferView(), () => offset, release.signal);
+			this.emit({ type: "buffered", ...held });
+		} catch {
+			// Let go by a seek, or the player closed.
+		} finally {
+			signal.removeEventListener("abort", stop);
+			if (this.releaseHold === stop) this.releaseHold = null;
 		}
 	}
 
@@ -539,6 +691,8 @@ export class VideoPlayer {
 		const player = this.player;
 		if (!player || this.state.status !== "playing") return;
 		const now = performance.now();
+		// Mid-seek the player's clock still shows the old time.
+		if (this.seekTarget !== null) return;
 		const currentMs = Number(player.currentTime);
 		if (currentMs !== this.state.currentMs) {
 			this.movedAt = now;

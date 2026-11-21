@@ -11,6 +11,7 @@
 	let visits: number | null = $state(null);
 	let metrics: PhaseMetrics | null = $state(null);
 	let lastRow: string | null = $state(null);
+	let upload: { enabled: boolean; bytes: number; unchoked: number; messages: number } | null = $state(null);
 	let copied = $state(false);
 	let busy = $state(false);
 	let error: string | null = $state(null);
@@ -23,6 +24,7 @@
 		const phase = await diagnostics.phase().catch(() => null);
 		metrics = phase?.metrics ?? null;
 		lastRow = phase?.lastRow ?? null;
+		upload = await diagnostics.lastUpload().catch(() => null);
 	}
 
 	async function copyRow() {
@@ -92,6 +94,19 @@
 					<span data-metric="requests-per-gb" class:text-destructive={metrics.withinBudget === false}>
 						{show(metrics.billedRequestsPerGB)} / {metrics.budgetPerGB}
 					</span>
+				</span>
+			{/if}
+			{#if upload}
+				<span class="mt-1 font-medium">Sharing with peers (last session)</span>
+				<span class="grid grid-cols-[1fr_auto] gap-x-3 tabular-nums" data-testid="upload-metrics">
+					<span>Uploaded</span>
+					<span data-metric="upload-mb" data-bytes={upload.bytes}>{(upload.bytes / 1e6).toFixed(1)} MB</span>
+					<span>Peers unchoked by us (most at once)</span>
+					<span data-metric="upload-unchoked">{upload.unchoked}</span>
+					<span>Messages sent only for the upload</span>
+					<span data-metric="upload-messages">{upload.messages}</span>
+					<span>Setting</span>
+					<span data-metric="upload-enabled">{upload.enabled ? "on" : "off"}</span>
 				</span>
 			{/if}
 			{#if error}

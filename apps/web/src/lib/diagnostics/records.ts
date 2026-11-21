@@ -3,6 +3,7 @@
 // per-request logs, and nothing that names a torrent, file or person.
 
 import type { Environment } from "./env";
+import type { DialClassName, DialStats, MetadataOrigin, ScoutStreamStats } from "$lib/torrent/session-protocol";
 import { MS_BOUNDS, RATE_BOUNDS, hist, type Counts, type Hist } from "./stats";
 
 /** Requests to one service: outcomes, latency, and why the failures failed. */
@@ -31,19 +32,17 @@ export interface VisitRecord {
 	env: Environment;
 	/** What the user did: "magnet_submitted", "file_picked"… */
 	flow: Counts;
-	/** Magnet link → file list (now the session worker: /peers + BEP 9; the key predates it). */
+	/** Each magnet → file list attempt (a lookup or a retry; the key predates the session worker). */
 	metadataApi: Timed;
-	/** magnet-seeders' /peers: the seeder count checked before choosing. */
-	seedersCount: Timed;
 	errors: ErrorEntry[];
+	/** One per torrent session (a magnet pasted): lookup, tunnel and scout counters (absent in older records). */
+	sessions?: SessionRecord[];
 	recoveries: RecoveryRecord[];
 	/** Recoveries past the per-visit cap, not kept. */
 	droppedRecoveries: number;
 }
 
 export type Milestone =
-	| "infoDict"
-	| "peers"
 	| "recovering"
 	| "firstByte"
 	| "firstPiece"
@@ -79,35 +78,6 @@ export interface RecoveryRecord {
 	error: string | null;
 	/** Ms from opening the video until each step (null: it never happened). */
 	milestones: Record<Milestone, number | null>;
-	infoDict: Timed;
-	swarm: Timed & {
-		/** Partial answers (magnet-seeders still probing). */
-		partial: number;
-		/** Largest counts any answer reported. */
-		known: number;
-		reachable: number;
-		seeds: number;
-		unchoked: number;
-	};
-	worker: {
-		maxCandidates: number | null;
-		infoMs: number | null;
-		/** Requests by how they ended ("done", "no_peer", "stalled"…). */
-		ends: Counts;
-		/** From request to a peer unchoking. */
-		unchokeMs: Hist;
-		urgent: number;
-		hedges: number;
-		fallbackWins: number;
-		stolen: number;
-		/** Why candidates failed, per magnet-worker ("connect_timeout"…). */
-		candidates: Counts;
-		/** Worker and network errors. */
-		messages: Counts;
-		/** Requests served, by the serving peer's client ("qBittorrent"…). */
-		clients: Counts;
-		bytes: number;
-	};
 	transfer: {
 		bytes: number;
 		recoveringMs: number;
@@ -125,7 +95,7 @@ export interface RecoveryRecord {
 		abandoned: number;
 	};
 	integrity: { hashFailures: number; banned: number };
-	storage: { kind: "cache" | "memory" | null; putErrors: number };
+	storage: { kind: "opfs" | "cache" | "memory" | null; putErrors: number };
 	/** The swarm as the engine last saw it. */
 	peers: { known: number; reachable: number; usable: number; active: number; backedOff: number; banned: number };
 	/** The player (absent in records from before it existed). */
@@ -170,6 +140,79 @@ export interface PlaybackRecord {
 	subtitleLoads?: { ok: number; fail: number; ms: Hist; errors: Counts };
 }
 
+/**
+ * One torrent session (docs/architecture.md › Session start, Connection
+ * management): how the file list was found, what the tunnel dialled and
+ * what the VPS scout said. Counts and reason names only.
+ */
+export interface SessionRecord {
+	id: string;
+	startedAt: number;
+	/** "running": still looking; "listed": the file list arrived; "failed": the last lookup gave up; "left": closed while looking. */
+	lookup: "running" | "listed" | "failed" | "left";
+	/** Ms from the paste to the file list, retries included (null: not listed). */
+	lookupMs: number | null;
+	/** Lookups that gave up, by reason ("exhausted", "cap", "tunnel"). */
+	failures: Counts;
+	retries: number;
+	/** What the lookup had tried when it ended (the most seen). */
+	progress: { found: number; tried: number; connected: number };
+	/** Where the verified info dict came from, and ms from the session start. */
+	metadata: { source: MetadataOrigin; ms: number } | null;
+	tunnel: {
+		/** Dials by class (scout-alive, untried, known) and outcome. */
+		dials: Record<DialClassName, DialStats>;
+		/** The most peers at once: connected, unchoking us, delivering, seeds. */
+		connected: number;
+		unchoked: number;
+		delivering: number;
+		seeds: number;
+		firstUnchokeMs: number | null;
+		sockets: number;
+		upgrades: number;
+		messages: number;
+		recycles: number;
+		untestedHighWater: number;
+		/**
+		 * Reciprocation (M3-12): the setting as last seen, piece bytes sent,
+		 * the most peers unchoked at once, upstream messages that carried only
+		 * upload traffic. Absent in records from before it.
+		 */
+		upload?: { enabled: boolean; bytes: number; unchoked: number; messages: number };
+	};
+	/** The `/peers` stream. */
+	scout: ScoutStreamStats;
+}
+
+export function newSession(now = Date.now()): SessionRecord {
+	const dials = (): DialStats => ({ attempted: 0, succeeded: 0, failed: {} });
+	return {
+		id: newId(now),
+		startedAt: now,
+		lookup: "running",
+		lookupMs: null,
+		failures: {},
+		retries: 0,
+		progress: { found: 0, tried: 0, connected: 0 },
+		metadata: null,
+		tunnel: {
+			dials: { scout: dials(), untried: dials(), known: dials() },
+			connected: 0,
+			unchoked: 0,
+			delivering: 0,
+			seeds: 0,
+			firstUnchokeMs: null,
+			sockets: 0,
+			upgrades: 0,
+			messages: 0,
+			recycles: 0,
+			untestedHighWater: 0,
+			upload: { enabled: false, bytes: 0, unchoked: 0, messages: 0 },
+		},
+		scout: { state: "idle", streams: 0, peers: 0, alive: 0, seeds: 0, dead: 0, unknown: 0, rejected: 0, info: "none", firstPeerMs: null },
+	};
+}
+
 export function newPlayback(): PlaybackRecord {
 	return {
 		mode: null,
@@ -211,8 +254,8 @@ export function newVisit(env: Environment, build: string, now = Date.now()): Vis
 		env,
 		flow: {},
 		metadataApi: timed(),
-		seedersCount: timed(),
 		errors: [],
+		sessions: [],
 		recoveries: [],
 		droppedRecoveries: 0,
 	};
@@ -237,8 +280,6 @@ export function newRecovery(init: { fileSize: number; videos: number; ext: strin
 		outcome: "running",
 		error: null,
 		milestones: {
-			infoDict: null,
-			peers: null,
 			recovering: null,
 			firstByte: null,
 			firstPiece: null,
@@ -246,22 +287,6 @@ export function newRecovery(init: { fileSize: number; videos: number; ext: strin
 			ready4MiB: null,
 			ready16MiB: null,
 			complete: null,
-		},
-		infoDict: timed(),
-		swarm: { ...timed(), partial: 0, known: 0, reachable: 0, seeds: 0, unchoked: 0 },
-		worker: {
-			maxCandidates: null,
-			infoMs: null,
-			ends: {},
-			unchokeMs: hist(MS_BOUNDS),
-			urgent: 0,
-			hedges: 0,
-			fallbackWins: 0,
-			stolen: 0,
-			candidates: {},
-			messages: {},
-			clients: {},
-			bytes: 0,
 		},
 		transfer: { bytes: 0, recoveringMs: 0, stallMs: 0, stalls: 0, windows: hist(RATE_BOUNDS) },
 		seeks: { count: 0, readyMs: hist(MS_BOUNDS), abandoned: 0 },

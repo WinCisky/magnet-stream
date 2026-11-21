@@ -1,73 +1,23 @@
-// Where verified pieces go: the browser's Cache Storage, one cache per
-// torrent and one entry per piece. It survives reloads (recovery resumes
-// where it left off), and a future Service Worker can stream from it.
+// Where the page reads verified pieces from. Saved videos (decision OQ-13)
+// live in OPFS, written by the session worker as soon as a piece is
+// verified (opfs-store.ts); the page reads them back through the session.
+// Pieces the worker couldn't save (the quota, say) and files that are never
+// saved (a subtitle fetched whole) stay in memory.
+
+import { storedPieces } from "./library";
+import type { PageSession } from "./page-session";
 
 export interface PieceStore {
-	readonly kind: "cache" | "memory";
+	readonly kind: "opfs" | "memory";
 	/** Pieces already stored (all verified before being stored). */
 	list(): Promise<number[]>;
+	/** Keep a piece (in memory: the worker saves to OPFS itself). */
 	put(piece: number, data: Uint8Array): Promise<void>;
 	get(piece: number): Promise<Uint8Array | undefined>;
 }
 
-/** Every torrent's cache is named this plus its info-hash. */
-export const PIECE_CACHE_PREFIX = "mw-pieces-";
-
-export function pieceUrl(infoHash: string, piece: number): string {
-	return `https://magnet-watcher.pieces/${infoHash}/${piece}`;
-}
-
-/** The piece a cache key holds, or null for other entries (see library.ts). */
-export function pieceOfUrl(url: string): number | null {
-	const tail = url.slice(url.lastIndexOf("/") + 1);
-	return /^\d+$/.test(tail) ? Number(tail) : null;
-}
-
-export async function openPieceStore(infoHash: string): Promise<PieceStore> {
-	if (typeof caches !== "undefined") {
-		try {
-			return new CachePieceStore(await caches.open(PIECE_CACHE_PREFIX + infoHash), infoHash);
-		} catch {
-			// Cache Storage unavailable (e.g. some private modes): keep going in memory.
-		}
-	}
-	return new MemoryPieceStore();
-}
-
-class CachePieceStore implements PieceStore {
-	readonly kind = "cache";
-
-	constructor(
-		private readonly cache: Cache,
-		private readonly infoHash: string,
-	) {}
-
-	private key(piece: number): string {
-		return pieceUrl(this.infoHash, piece);
-	}
-
-	async list(): Promise<number[]> {
-		const keys = await this.cache.keys();
-		return keys.map((r) => pieceOfUrl(r.url)).filter((p) => p !== null);
-	}
-
-	async put(piece: number, data: Uint8Array): Promise<void> {
-		await this.cache.put(
-			this.key(piece),
-			new Response(data as Uint8Array<ArrayBuffer>, {
-				headers: { "content-type": "application/octet-stream" },
-			}),
-		);
-	}
-
-	async get(piece: number): Promise<Uint8Array | undefined> {
-		const res = await this.cache.match(this.key(piece));
-		return res ? new Uint8Array(await res.arrayBuffer()) : undefined;
-	}
-}
-
 export class MemoryPieceStore implements PieceStore {
-	readonly kind = "memory";
+	readonly kind: "opfs" | "memory" = "memory";
 	private readonly pieces = new Map<number, Uint8Array>();
 
 	async list(): Promise<number[]> {
@@ -80,6 +30,30 @@ export class MemoryPieceStore implements PieceStore {
 
 	async get(piece: number): Promise<Uint8Array | undefined> {
 		return this.pieces.get(piece);
+	}
+}
+
+/** A torrent's OPFS pieces, read through the session worker; pieces it couldn't save, in memory. */
+export class SessionPieceStore implements PieceStore {
+	readonly kind = "opfs";
+	private readonly memory = new MemoryPieceStore();
+
+	constructor(
+		private readonly session: Pick<PageSession, "readPiece">,
+		private readonly infoHash: string,
+	) {}
+
+	async list(): Promise<number[]> {
+		const [saved, kept] = await Promise.all([storedPieces(this.infoHash), this.memory.list()]);
+		return [...new Set([...saved, ...kept])];
+	}
+
+	put(piece: number, data: Uint8Array): Promise<void> {
+		return this.memory.put(piece, data);
+	}
+
+	async get(piece: number): Promise<Uint8Array | undefined> {
+		return (await this.memory.get(piece)) ?? this.session.readPiece(piece);
 	}
 }
 

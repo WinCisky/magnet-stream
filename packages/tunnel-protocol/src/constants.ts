@@ -84,6 +84,11 @@ export const CloseReason = {
 	IDLE: 6,
 	/** The session reached its maximum length (default 2 h). */
 	SESSION_TIMEOUT: 7,
+	/**
+	 * The peer does not read: more bytes than the gateway's bound (default
+	 * 4 MiB) waited to be written to it. Only that connection is closed.
+	 */
+	WRITE_OVERFLOW: 8,
 } as const;
 export type CloseReasonCode = (typeof CloseReason)[keyof typeof CloseReason];
 

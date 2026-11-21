@@ -57,6 +57,7 @@ describe("limits", () => {
 				sessionTimeoutMs: 7_200_000,
 				socketsPerSession: 3,
 				upgradesPerMinute: 30,
+				maxPendingWriteBytes: 4 * 1024 * 1024,
 			},
 		});
 	});
@@ -76,6 +77,9 @@ describe("limits", () => {
 		}
 		expect(parseTunnelConfig({ TUNNEL_UPGRADES_PER_MINUTE: "601" }).ok).toBe(false);
 		expect(parseTunnelConfig({ TUNNEL_SOCKETS_PER_SESSION: "9" }).ok).toBe(false);
+		for (const bad of ["65535", "268435457", "4MiB"]) expect(parseTunnelConfig({ TUNNEL_MAX_PENDING_WRITE_BYTES: bad }).ok).toBe(false);
+		const r = parseTunnelConfig({ TUNNEL_MAX_PENDING_WRITE_BYTES: "1048576" });
+		expect(r.ok && r.config.maxPendingWriteBytes).toBe(1048576);
 	});
 });
 

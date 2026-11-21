@@ -91,6 +91,8 @@ describe("connection manager through the gateway", () => {
 			allowPrivate: true,
 			chokeReplaceAfterMs: 400,
 			stallTimeoutMs: 20_000,
+			// One socket: early width would otherwise give the good peer a slot of its own.
+			maxSockets: 1,
 		});
 		mgr.addPeers([...choked.map((p) => p.addr), good.addr]);
 		const result = await mgr.download(meta);

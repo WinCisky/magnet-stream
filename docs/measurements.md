@@ -18,7 +18,14 @@ Where the numbers live (decision OQ-19, option C):
   three numbers over everything recorded in this browser. *Copy measurement
   row (last video)* copies one anonymous row for the real-world table
   below. The exported JSON report carries `phaseMetrics` and
-  `measurementRows`. Nothing is sent anywhere.
+  `measurementRows`, and per torrent session the lookup (where the file
+  list came from, retries, why a lookup gave up), the tunnel's dials by
+  class (scout-alive, untried, known) and outcome with the peers connected,
+  unchoked, delivering and seeds, and the scout's `/peers` stream (alive,
+  dead, unknown, the `info` line accepted or rejected): the `lookup`,
+  `tunnel` and `scout` sections. The tunnel section also says what the
+  session uploaded (bytes, peers unchoked, messages sent only for the
+  upload, the setting), shown in the menu as *Sharing with peers*. Nothing is sent anywhere.
 - **Synthetic, every CI run.** `npm run e2e` (browser session) recovers a
   128 MiB file from a fixed mixed swarm and fails if billed requests per GB
   exceed the budget. Its numbers are written to
@@ -33,13 +40,18 @@ two significant digits.
 ## Synthetic (CI browser e2e)
 
 Swarm: 2 fast seeds, 1 slow seed, 1 partial peer (first half), 2 peers that
-never unchoke, 3 dead addresses. Everything runs locally (fake peers,
+never unchoke, 3 dead addresses; from M3-12 also a tit-for-tat leecher
+(second half) that the page uploads to ("Share with peers" on, the
+default), so the counted requests include the upload's flushes. The run
+also checks that with the setting off the leecher gets no bitfield, have,
+unchoke or piece. Everything runs locally (fake peers,
 `wrangler dev`, `astro dev`, Chromium), so only number 3 says much about
 production; 1 and 2 catch regressions.
 
 | Date | Milestone | Commit / where | File | First piece (s) | MB/s | Requests/GB (page) | Requests/GB (counted) | Budget |
 |---|---|---|---|---|---|---|---|---|
 | 2026-11-18 | M2 (M2-09) | working tree, local run | 128 MiB | 1.2 | 6.6 | 28.3 | 28.3 (1 WebSocket, 56 messages) | 40 |
+| 2026-11-21 | M3 (M3-12) | working tree, local run | 128 MiB | 1.4 | 16.6 | 34.9 | 34.6 (3 WebSockets; 0.39 MB uploaded, 5 upload-only messages) | 40 |
 
 ## Real-world
 
@@ -138,7 +150,13 @@ the budget stays 40/GB for every swarm (decision of 2026-11-18).
   nothing is connected, every slot is busy and untried addresses remain, the
   session opens another WebSocket every 5 s, up to 3 (the "exploration
   socket" of OQ-03): about three times as many addresses in the same time.
-  The file-list timeout is now 60 s.
+  The file-list timeout is now 60 s. *Superseded (M3-10, OQ-21, OQ-23):*
+  the VPS scout ranks the addresses; ones it saw alive may take all 6 slots
+  of a socket (untried ones at most 3, a timed-out connect's held slot
+  counting as in flight), and while nothing has been delivered and the
+  candidates outnumber the free slots the second and third WebSocket open
+  at once. `npm run e2e:scout -w tools/e2e` (part of `npm run e2e`) prints
+  the dials by class and outcome and the upstream messages.
 
 To do: a fourth series on the current build, rows here.
 

@@ -3,6 +3,7 @@
 
 import {
 	DEFAULT_IDLE_TIMEOUT_MS,
+	DEFAULT_MAX_PENDING_WRITE_BYTES,
 	DEFAULT_SESSION_TIMEOUT_S,
 	DEFAULT_SOCKETS_PER_SESSION,
 	FAILED_CONNECT_HOLD_MS,
@@ -42,6 +43,12 @@ export interface TunnelEnv {
 	TUNNEL_FAILED_CONNECT_HOLD_MS?: string;
 	/** WebSocket upgrades per minute per client IP (default 30, 1..600). */
 	TUNNEL_UPGRADES_PER_MINUTE?: string;
+	/**
+	 * Bytes held for one peer and not yet written to it; past this the peer
+	 * is not reading and its connection is closed (`close` WRITE_OVERFLOW).
+	 * Default 4194304 (4 MiB), 65536..268435456.
+	 */
+	TUNNEL_MAX_PENDING_WRITE_BYTES?: string;
 }
 
 export interface TunnelLimits {
@@ -50,6 +57,7 @@ export interface TunnelLimits {
 	maxConnections: number;
 	idleTimeoutMs: number;
 	failedConnectHoldMs: number;
+	maxPendingWriteBytes: number;
 }
 
 export interface TunnelConfig extends TunnelLimits {
@@ -74,6 +82,7 @@ const RULES: Record<keyof Omit<TunnelConfig, "sessionTimeoutMs"> | "sessionTimeo
 	sessionTimeoutS: { key: "TUNNEL_SESSION_TIMEOUT_S", min: 5, max: 86_400, fallback: DEFAULT_SESSION_TIMEOUT_S },
 	socketsPerSession: { key: "TUNNEL_SOCKETS_PER_SESSION", min: 1, max: 8, fallback: DEFAULT_SOCKETS_PER_SESSION },
 	upgradesPerMinute: { key: "TUNNEL_UPGRADES_PER_MINUTE", min: 1, max: 600, fallback: 30 },
+	maxPendingWriteBytes: { key: "TUNNEL_MAX_PENDING_WRITE_BYTES", min: 64 * 1024, max: 256 * 1024 * 1024, fallback: DEFAULT_MAX_PENDING_WRITE_BYTES },
 };
 
 export type ConfigResult = { ok: true; config: TunnelConfig } | { ok: false; invalid: (keyof TunnelEnv)[] };
@@ -106,6 +115,7 @@ export function parseTunnelConfig(env: TunnelEnv): ConfigResult {
 		sessionTimeoutMs: read(RULES.sessionTimeoutS) * 1000,
 		socketsPerSession: read(RULES.socketsPerSession),
 		upgradesPerMinute: read(RULES.upgradesPerMinute),
+		maxPendingWriteBytes: read(RULES.maxPendingWriteBytes),
 	};
 	return invalid.length > 0 ? { ok: false, invalid } : { ok: true, config };
 }

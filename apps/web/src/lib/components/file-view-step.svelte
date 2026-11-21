@@ -5,6 +5,7 @@
 	import ListVideoIcon from "@lucide/svelte/icons/list-video";
 	import SearchIcon from "@lucide/svelte/icons/search";
 	import XIcon from "@lucide/svelte/icons/x";
+	import DownloadIcon from "@lucide/svelte/icons/download";
 	import { Button } from "$lib/components/ui/button/index.js";
 	import { formatBytes } from "$lib/magnet/files";
 	import type { TorrentFile } from "$lib/magnet/api";
@@ -16,8 +17,14 @@
 	import { subtitleFilesFor } from "$lib/magnet/subtitles";
 	import type { SubtitleSource } from "$lib/player/source";
 	import VideoPlayer from "$lib/player/video-player.svelte";
+	import { nativeCandidate } from "$lib/player/native";
+	import { averageBitrate } from "$lib/player/buffering";
+	import type { PlayerEvent } from "$lib/player/player";
+	import { downloadStream, serveFile, streamUrl, streamWorkerReady } from "$lib/stream/bridge";
 	import { diagnostics } from "$lib/diagnostics/recorder";
 	import { savedProgress, type SavedProgress } from "$lib/torrent/library";
+	import { sessionMemory } from "$lib/torrent/memory-db";
+	import { resumePoint } from "$lib/player/resume";
 	import { mode } from "mode-watcher";
 	import { LEGEND, palette } from "$lib/torrent/palette";
 	import FileName from "./file-name.svelte";
@@ -157,6 +164,54 @@
 		return { engine, recorder };
 	}
 
+	/** Playback position: kept in the session memory at most this often (M3-04). */
+	const POSITION_SAVE_MS = 5_000;
+	/** Where the first play starts: the position kept from last time. */
+	let resumeMs = $state(0);
+	let position = { ms: -1, durationMs: 0 };
+	let positionSavedAt = 0;
+	let positionSaved = -1;
+
+	function onTime(ms: number, durationMs: number) {
+		position = { ms, durationMs };
+		if (Date.now() - positionSavedAt >= POSITION_SAVE_MS) savePosition();
+	}
+
+	function savePosition() {
+		const { ms, durationMs } = position;
+		if (ms < 0 || durationMs <= 0 || Math.abs(ms - positionSaved) < 1000) return;
+		positionSavedAt = Date.now();
+		positionSaved = ms;
+		void sessionMemory()
+			.then((memory) => memory?.rememberPosition(infoHash, fileIndex, ms, durationMs))
+			.catch(() => {});
+	}
+
+	/**
+	 * Where the streaming service worker serves this file (M3-05): the
+	 * native player's source and the download link. Null: not served (no
+	 * worker in control, as after a hard reload): libmedia plays, and the
+	 * download reads the pieces itself.
+	 */
+	let served: string | null = $state(null);
+	/** The player waits for that answer (a moment on the first visit). */
+	let playerReady = $state(false);
+	/** MP4 and WebM the browser plays itself go to the native <video>. */
+	const nativeUrl = $derived(served && nativeCandidate(baseName) ? served : null);
+
+	/**
+	 * What the player reports goes to the diagnostics; once it has read
+	 * the container, the video's average bitrate goes to the recovery (the
+	 * picker's window in bytes, the threshold for another socket).
+	 */
+	function onPlayerEvent(event: PlayerEvent) {
+		if (event.type === "loaded") {
+			const bitrate = averageBitrate(file.size, event.durationMs);
+			if (bitrate !== null) engine.setBitrate(bitrate);
+		}
+		recorder.playback(event);
+	}
+
 	function downloadBytes(): ReadableStream<Uint8Array> {
 		const bytes = engine.fileBytes();
 		if (!bytes) throw new Error("The video isn't fully recovered yet");
@@ -165,7 +220,29 @@
 
 	onMount(() => {
 		void engine.start();
+		let unserve: (() => void) | undefined;
+		let gone = false;
+		void streamWorkerReady().then((ok) => {
+			if (gone) return;
+			if (ok) {
+				// Served only while this page has the file open.
+				unserve = serveFile(infoHash, fileIndex, engine.stream, baseName);
+				served = streamUrl(infoHash, fileIndex);
+			}
+			playerReady = true;
+		});
+		void sessionMemory()
+			.then((memory) => memory?.position(infoHash, fileIndex))
+			.then((kept) => (resumeMs = resumePoint(kept)))
+			.catch(() => {});
+		// The tab may never come back: keep where playback is.
+		const onHide = () => savePosition();
+		window.addEventListener("pagehide", onHide);
 		return () => {
+			gone = true;
+			unserve?.();
+			window.removeEventListener("pagehide", onHide);
+			savePosition();
 			engine.stop();
 			recorder.end();
 		};
@@ -187,7 +264,28 @@
 	{/snippet}
 	{#snippet end()}
 		{#if snapshot?.phase === "complete"}
-			<DownloadButton name={baseName} size={file.size} open={downloadBytes} />
+			{#if served}
+				<!-- The stream URL as an attachment: the browser saves it as it reads. -->
+				<Button
+					variant="outline"
+					size="sm"
+					href={`${served}?download=1`}
+					onclick={(e: MouseEvent) => {
+						// Through the service worker (a plain link click would leave the page).
+						e.preventDefault();
+						if (served) downloadStream(served);
+						diagnostics.count("video_downloaded");
+					}}
+					aria-label={`Download ${baseName}`}
+					title={`Download ${baseName}`}
+					class="max-sm:w-8 max-sm:px-0"
+				>
+					<DownloadIcon />
+					<span class="max-sm:sr-only">Download</span>
+				</Button>
+			{:else}
+				<DownloadButton name={baseName} size={file.size} open={downloadBytes} />
+			{/if}
 		{/if}
 		<Button
 			variant="outline"
@@ -217,7 +315,20 @@
 		</p>
 	</div>
 
-	<VideoPlayer source={engine.stream} name={baseName} {available} {subtitles} onEvent={(e) => recorder.playback(e)} />
+	{#if playerReady}
+		<VideoPlayer
+			source={engine.stream}
+			url={nativeUrl}
+			name={baseName}
+			{available}
+			{subtitles}
+			startMs={resumeMs}
+			{onTime}
+			onEvent={onPlayerEvent}
+		/>
+	{:else}
+		<div class="aspect-video w-full rounded-lg bg-black"></div>
+	{/if}
 
 	<div class="mx-auto flex w-full max-w-3xl flex-col gap-5">
 		{#if busy}
@@ -279,11 +390,19 @@
 					seeds · {snapshot.peers.known || seeders} known{#if snapshot.peers.backedOff > 0}&nbsp;· {snapshot.peers.backedOff}
 						resting{/if}{#if snapshot.peers.banned > 0}&nbsp;· {snapshot.peers.banned} banned{/if}
 				</p>
+				{#if snapshot.windowBytes > 0}
+					<p data-testid="playback-window" data-window-bytes={snapshot.windowBytes} data-bitrate={snapshot.bitrate}>
+						Playback window {formatBytes(snapshot.windowBytes)}{#if snapshot.bitrate > 0}&nbsp;· video
+							{((snapshot.bitrate * 8) / 1e6).toFixed(1)} Mbit/s{:else}&nbsp;· bitrate not known yet{/if}
+					</p>
+				{/if}
 				<p>
 					{snapshot.activeRequests} requests in flight · {snapshot.requests} worker requests{#if snapshot.hashFailures > 0}&nbsp;·
-						{snapshot.hashFailures} failed checks{/if}{#if snapshot.storage === "memory"}&nbsp;· not saved (no Cache
-						Storage){/if}
+						{snapshot.hashFailures} failed checks{/if}{#if snapshot.storage === "memory" && !snapshot.storageError}&nbsp;· not saved{/if}
 				</p>
+				{#if snapshot.storageError}
+					<p class="text-destructive" data-testid="storage-error">{snapshot.storageError}</p>
+				{/if}
 				{#if snapshot.swarmError}
 					<p class="text-destructive">{snapshot.swarmError}</p>
 				{/if}

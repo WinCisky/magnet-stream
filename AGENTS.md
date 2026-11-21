@@ -2,8 +2,9 @@
 
 Magnet streaming in the browser through persistent tunnels: a full
 BitTorrent client in the page, a tunnel gateway on Cloudflare Durable
-Objects, discovery and a fallback gateway on a VPS; no database, no
-server-side storage. Design: `docs/architecture.md`. Work plan:
+Objects, discovery with peer scouting and metadata, and a fallback gateway
+on a VPS; no database, no persistent server-side storage (bounded in-memory
+caches on the VPS only, OQ-22). The browser uploads to peers (OQ-04). Design: `docs/architecture.md`. Work plan:
 `implementation-plan.json` (milestones M1…M5, one task per session).
 
 Before starting a task, read this file, `docs/architecture.md` and every
@@ -13,16 +14,16 @@ document the task cites.
 
 | path | what | origin |
 |---|---|---|
-| `apps/web` | Astro + Svelte site (player, UI, legacy recovery engine) | PoC magnet-watcher |
+| `apps/web` | Astro + Svelte site (player, UI, legacy recovery engine, streaming service worker `src/lib/stream/`) | PoC magnet-watcher |
 | `apps/gateway` | Cloudflare Worker: tunnel Durable Object (`/v1/tunnel`) | PoC magnet-worker |
-| `services/seeders` | Rust VPS service: peer discovery (trackers + DHT), metadata | PoC magnet-seeders |
+| `services/seeders` | Rust VPS service: peer discovery (trackers + DHT), scouting (probe + score), metadata; in-memory caches only | PoC magnet-seeders |
 | `packages/tunnel-protocol` | frame codec of the browser ↔ gateway tunnel (no runtime deps) | new (M1-04) |
-| `packages/engine` | browser BitTorrent engine: tunnel client, connection manager, peer-wire, metadata, peer exchange, verified download | new (M1-06) |
-| `tools/fake-peer` | deterministic test torrents + scriptable BitTorrent peer | new (M1-03) |
+| `packages/engine` | browser BitTorrent engine: tunnel client, connection manager, peer-wire, metadata, peer exchange, verified download, upload (tit-for-tat choker) | new (M1-06) |
+| `tools/fake-peer` | deterministic test torrents + scriptable BitTorrent peer (seed, partial, tit-for-tat leecher, …) | new (M1-03) |
 | `tools/harness` | test helpers: free ports, swarms, `wrangler dev` | new (M1-03) |
-| `tools/e2e` | hermetic end-to-end download through the gateway | new (M1-07) |
+| `tools/e2e` | hermetic end-to-end download through the gateway (fixtures: a small VP9 MP4) | new (M1-07) |
 | `tools/spike` | Phase 0 measurement CLI | new (M1-07) |
-| `docs/` | architecture, tunnel protocol, discovery API, spike report, measurements, operations (deploy) | |
+| `docs/` | architecture, tunnel protocol, discovery API, piece storage (OPFS) and session memory (IndexedDB), spike report, measurements, operations (deploy) | |
 
 npm workspaces (`apps/*`, `packages/*`, `tools/*`) and a Cargo workspace
 (`services/seeders`) share the root. Lockfiles (`package-lock.json`,
@@ -36,7 +37,7 @@ properties, `.ts` extensions in relative imports).
 ```sh
 npm ci                 # install every workspace
 npm run verify         # lint + typecheck + TS tests + cargo fmt --check + clippy -D warnings + cargo test
-npm run e2e            # tunnel e2e (fake peer → wrangler dev → engine), gateway integration + legacy e2e
+npm run e2e            # tunnel e2e (fake peer → wrangler dev → engine), scout-guided dial, corrupting peer (v1 + v2), gateway integration (incl. a peer that does not read) + legacy e2e, browser (upload to a tit-for-tat leecher, "Share with peers" off), file-list lookup (VPS info line, forged line, retry in the same session, diagnostics report), OPFS + resume after a reload (session memory), native MP4 playback through the streaming service worker, MKV through libmedia (start/rebuffer thresholds, bitrate → picker window)
 npm run build          # apps/web build, apps/gateway typecheck
 npm run lint | typecheck | test
 npm run fake-peer -- --port 6881 --size 8MiB --seed 1

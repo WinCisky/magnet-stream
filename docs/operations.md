@@ -36,6 +36,8 @@ The site is then served at `https://<project-name>.pages.dev` (or at a
 custom domain added to the project). It is served from the root path `/`.
 Response headers (cross-origin isolation for the player) come from
 `apps/web/public/_headers`, which the build copies to `dist/_headers`.
+The build also writes `dist/stream-sw.js`, the streaming service worker,
+which must stay at the root (its scope is `/`).
 
 ### 2. API token
 
@@ -82,6 +84,24 @@ add the site's origin (the `SITE_URL` origin) to `ALLOWED_ORIGINS` in
 *magnet-stream* so it can run next to the PoC's magnet-seeders (files in
 `services/seeders/deploy/magnet-stream.*` and `nginx-magnet-stream.conf`).
 
+The VPS scouts the peers it streams (docs/discovery-api.md › Scouting,
+decisions OQ-21, OQ-22): it keeps scores and discovery results **in memory
+only**, weighed in bytes. Defaults: `SCOUT_CACHE_MB=16`, `PEERS_CACHE_MB=16`
+(twice: streamed and legacy caches), `PROBE_CONCURRENCY=256` sockets,
+`SCOUT_PER_STREAM=64`, `MAX_PROBE_PEERS=1000` probes per info-hash per
+`SCOUT_REPROBE_SECS=600` window (an address probed more recently is answered
+from memory), `SCOUT_MAX_ADDRS=1000` addresses kept per info-hash, scores
+fading toward 0.2 with `SCOUT_HALF_LIFE_SECS=1800` and forgotten after
+`SCOUT_IDLE_SECS=7200` without use. Probe timings:
+`PROBE_CONNECT_TIMEOUT_MS=2500`, `PROBE_UNCHOKE_WAIT_MS=2500`,
+`PROBE_TIMEOUT_MS=5000` in all. Info dicts (`/peers` `info` line and
+`GET /metadata?ih=`): `METADATA_CACHE_MB=32`, entries over
+`METADATA_CACHE_MAX_ENTRY_MB=4` not cached, `METADATA_FETCHES=4` fetches in
+flight (buffers bounded to 4 × 8 MiB), `METADATA_DEADLINE_MS=15000`. All are
+listed in `services/seeders/README.md` › Configuration. Check the service's
+memory with `ps -o rss= -p $(systemctl show -p MainPID --value magnet-stream)`
+after some use, and lower the budgets on a small host.
+
 ## Configuration the deploy sets
 
 - **Gateway `ALLOWED_ORIGINS`.** `wrangler.jsonc` lists only
@@ -102,6 +122,7 @@ add the site's origin (the `SITE_URL` origin) to `ALLOWED_ORIGINS` in
 - `curl -i https://<gateway>/health` → `200 ok`; `curl -i https://<gateway>/v1/blocks` → `404`.
 - `curl -sI https://<site>/ | grep -i cross-origin` → COOP `same-origin`,
   COEP `require-corp`.
+- `curl -sI https://<site>/stream-sw.js` → `200`, a JavaScript type.
 - Open the site, paste a magnet: the file list appears; DevTools › Network
   shows one `/peers` request and 1–3 WebSockets to the gateway.
 

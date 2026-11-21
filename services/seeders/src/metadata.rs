@@ -1,18 +1,27 @@
 //! Fetching a torrent's info dict from peers with the ut_metadata extension
-//! (BEP 9). A result is only accepted if its SHA-1 equals the info-hash, so
-//! a lying peer can't poison the cache (and the browser checks again).
+//! (BEP 9). A result is only accepted if it hashes to the info-hash (SHA-1
+//! for v1 and hybrid torrents, SHA-256 truncated to 20 bytes for v2-only
+//! ones), so a lying peer can't poison the cache (and the browser checks
+//! again). The size a peer announces is checked before anything is
+//! allocated, and allocations can be drawn from a shared memory budget.
 
 use crate::bencode::{self, Value};
 use crate::peerwire::{self, ExtensionHandshake, Message, PeerConn, WireError};
 use bytes::Bytes;
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 const BLOCK: usize = 16 * 1024;
-const MAX_METADATA_SIZE: usize = 8 * 1024 * 1024;
+/// Largest info dict accepted from a peer.
+pub const MAX_METADATA_SIZE: usize = 8 * 1024 * 1024;
+/// Unit of the memory budget's permits.
+pub const MEMORY_UNIT: usize = 1024;
 
 #[derive(Debug, Error, Clone)]
 pub enum MetadataError {
@@ -32,37 +41,57 @@ pub enum MetadataError {
     InvalidInfo,
     #[error("timed out fetching metadata")]
     Timeout,
+    #[error("too many metadata fetches in flight")]
+    Busy,
     #[error("every candidate peer failed ({0} tried)")]
     AllFailed(usize),
     #[error(transparent)]
     Wire(#[from] WireError),
 }
 
+/// Whether `bytes` is the info dict of `info_hash`: its SHA-1 (v1, hybrid)
+/// or its SHA-256 truncated to 20 bytes (v2-only, as in the handshake).
+pub fn matches_info_hash(bytes: &[u8], info_hash: &[u8; 20]) -> bool {
+    Sha1::digest(bytes).as_slice() == info_hash || Sha256::digest(bytes)[..20] == info_hash[..]
+}
+
 /// A verified info dict, as served by `/metadata`.
 #[derive(Debug)]
 pub struct InfoDict {
     pub bytes: Bytes,
+    /// v1 piece hashes (0 for a v2-only torrent).
     pub num_pieces: u32,
 }
 
 impl InfoDict {
     /// `bytes` must already be verified against the info-hash; this only
-    /// checks it's a dict with a sane `pieces` string.
+    /// checks it's a dict with a sane `pieces` string (v1, hybrid) or a
+    /// `file tree` with `meta version` 2 (v2-only).
     pub fn parse(bytes: Vec<u8>) -> Result<Self, MetadataError> {
         let value = bencode::parse(&bytes).map_err(|_| MetadataError::InvalidInfo)?;
-        let pieces = value
-            .get("pieces")
-            .and_then(Value::as_bytes)
-            .ok_or(MetadataError::InvalidInfo)?;
         let piece_length = value
             .get("piece length")
             .and_then(Value::as_int)
             .unwrap_or(0);
-        if pieces.is_empty() || pieces.len() % 20 != 0 || piece_length <= 0 {
+        if piece_length <= 0 {
             return Err(MetadataError::InvalidInfo);
         }
-        let num_pieces =
-            u32::try_from(pieces.len() / 20).map_err(|_| MetadataError::InvalidInfo)?;
+        let num_pieces = match value.get("pieces").and_then(Value::as_bytes) {
+            Some(pieces) => {
+                if pieces.is_empty() || pieces.len() % 20 != 0 {
+                    return Err(MetadataError::InvalidInfo);
+                }
+                u32::try_from(pieces.len() / 20).map_err(|_| MetadataError::InvalidInfo)?
+            }
+            None => {
+                let v2 = value.get("meta version").and_then(Value::as_int) == Some(2);
+                let tree = matches!(value.get("file tree"), Some(Value::Dict(_)));
+                if !v2 || !tree {
+                    return Err(MetadataError::InvalidInfo);
+                }
+                0
+            }
+        };
         Ok(Self {
             bytes: Bytes::from(bytes),
             num_pieces,
@@ -71,11 +100,14 @@ impl InfoDict {
 }
 
 /// Fetch the metadata from one peer; it must be complete before `deadline`.
+/// With `memory`, the buffer is only allocated once its size (in
+/// [`MEMORY_UNIT`]s) is granted from that budget, and given back after.
 pub async fn fetch_from_peer(
     addr: SocketAddr,
     info_hash: [u8; 20],
     connect_timeout: Duration,
     deadline: Instant,
+    memory: Option<Arc<Semaphore>>,
 ) -> Result<Vec<u8>, MetadataError> {
     let mut conn = PeerConn::open(addr, info_hash, connect_timeout, deadline).await?;
     if !conn.handshake.supports_extensions() {
@@ -100,7 +132,22 @@ pub async fn fetch_from_peer(
         return Err(MetadataError::BadSize(size));
     }
     let size = size as usize;
+    if size == 0 {
+        return Err(MetadataError::BadSize(0));
+    }
     let blocks = size.div_ceil(BLOCK);
+    let _reserved = match memory {
+        Some(budget) => {
+            let units = u32::try_from(size.div_ceil(MEMORY_UNIT))
+                .map_err(|_| MetadataError::BadSize(size as u32))?;
+            match tokio::time::timeout_at(deadline.into(), budget.acquire_many_owned(units)).await {
+                Ok(Ok(permit)) => Some(permit),
+                Ok(Err(_)) => return Err(MetadataError::Busy),
+                Err(_) => return Err(MetadataError::Timeout),
+            }
+        }
+        None => None,
+    };
 
     let mut requests = Vec::new();
     for piece in 0..blocks {
@@ -145,14 +192,16 @@ pub async fn fetch_from_peer(
         }
     }
 
-    if Sha1::digest(&data).as_slice() != info_hash {
+    if !matches_info_hash(&data, &info_hash) {
         return Err(MetadataError::HashMismatch);
     }
     Ok(data)
 }
 
 /// Try `candidates` in order, `parallel` at a time; the first verified
-/// result wins and the other attempts are cancelled.
+/// result wins and the other attempts are cancelled. (The service in
+/// `info.rs` does this with single-flight and shared limits.)
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn fetch_from_any(
     candidates: Vec<SocketAddr>,
     info_hash: [u8; 20],
@@ -167,7 +216,13 @@ pub async fn fetch_from_any(
     let mut attempts = JoinSet::new();
     let mut spawn_next = |attempts: &mut JoinSet<_>| {
         if let Some(addr) = pending.next() {
-            attempts.spawn(fetch_from_peer(addr, info_hash, connect_timeout, deadline));
+            attempts.spawn(fetch_from_peer(
+                addr,
+                info_hash,
+                connect_timeout,
+                deadline,
+                None,
+            ));
         }
     };
     for _ in 0..parallel.max(1) {
@@ -219,9 +274,15 @@ mod tests {
         let info_hash: [u8; 20] = Sha1::digest(&info).into();
         let addr = testpeer::spawn(FakePeer::seed_with_metadata(info_hash, info.clone())).await;
 
-        let fetched = fetch_from_peer(addr, info_hash, Duration::from_millis(500), deadline())
-            .await
-            .unwrap();
+        let fetched = fetch_from_peer(
+            addr,
+            info_hash,
+            Duration::from_millis(500),
+            deadline(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(fetched, info);
 
         let parsed = InfoDict::parse(fetched).unwrap();
@@ -237,9 +298,15 @@ mod tests {
             ..FakePeer::seed_with_metadata(info_hash, info)
         };
         let addr = testpeer::spawn(peer).await;
-        let err = fetch_from_peer(addr, info_hash, Duration::from_millis(500), deadline())
-            .await
-            .unwrap_err();
+        let err = fetch_from_peer(
+            addr,
+            info_hash,
+            Duration::from_millis(500),
+            deadline(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, MetadataError::HashMismatch), "{err:?}");
     }
 
@@ -276,8 +343,75 @@ mod tests {
     }
 
     #[test]
-    fn info_dict_requires_piece_hashes() {
+    fn info_dict_requires_piece_hashes_or_a_v2_file_tree() {
         assert!(InfoDict::parse(b"d4:name1:xe".to_vec()).is_err());
         assert!(InfoDict::parse(b"d12:piece lengthi16384e6:pieces3:abce".to_vec()).is_err());
+        let v2 = testpeer::fake_v2_info_dict();
+        assert_eq!(InfoDict::parse(v2).unwrap().num_pieces, 0);
+        // No file tree, or not version 2: rejected.
+        assert!(InfoDict::parse(b"d12:meta versioni2e12:piece lengthi16384ee".to_vec()).is_err());
+        assert!(InfoDict::parse(
+            b"d9:file treede12:meta versioni1e12:piece lengthi16384ee".to_vec()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn verifies_v1_and_v2_info_hashes() {
+        let v1 = testpeer::fake_info_dict(3);
+        let sha1: [u8; 20] = Sha1::digest(&v1).into();
+        assert!(matches_info_hash(&v1, &sha1));
+        let v2 = testpeer::fake_v2_info_dict();
+        let sha256 = Sha256::digest(&v2);
+        let truncated: [u8; 20] = sha256[..20].try_into().unwrap();
+        assert!(matches_info_hash(&v2, &truncated));
+        let mut wrong = truncated;
+        wrong[0] ^= 1;
+        assert!(!matches_info_hash(&v2, &wrong));
+        assert!(!matches_info_hash(&v1, &truncated));
+    }
+
+    #[tokio::test]
+    async fn a_v2_only_info_dict_is_fetched_against_its_truncated_sha256() {
+        let info = testpeer::fake_v2_info_dict();
+        let ih: [u8; 20] = Sha256::digest(&info)[..20].try_into().unwrap();
+        let addr = testpeer::spawn(FakePeer::seed_with_metadata(ih, info.clone())).await;
+        let got = fetch_from_peer(addr, ih, Duration::from_millis(500), deadline(), None)
+            .await
+            .unwrap();
+        assert_eq!(got, info);
+    }
+
+    #[tokio::test]
+    async fn waits_for_its_share_of_the_memory_budget() {
+        let info = testpeer::fake_info_dict(1000); // ~20 KiB
+        let ih: [u8; 20] = Sha1::digest(&info).into();
+        let addr = testpeer::spawn(FakePeer::seed_with_metadata(ih, info.clone())).await;
+        // 8 KiB of budget: never enough, the fetch gives up at the deadline.
+        let small = Arc::new(Semaphore::new(8));
+        let soon = Instant::now() + Duration::from_millis(300);
+        let err = fetch_from_peer(
+            addr,
+            ih,
+            Duration::from_millis(500),
+            soon,
+            Some(small.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, MetadataError::Timeout), "{err:?}");
+        let enough = Arc::new(Semaphore::new(64));
+        let got = fetch_from_peer(
+            addr,
+            ih,
+            Duration::from_millis(500),
+            deadline(),
+            Some(enough.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, info);
+        // Given back after.
+        assert_eq!(enough.available_permits(), 64);
     }
 }

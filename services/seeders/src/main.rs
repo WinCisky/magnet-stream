@@ -4,6 +4,7 @@ mod config;
 mod dht;
 mod discovery;
 mod files;
+mod info;
 mod lookup;
 mod magnet;
 mod metadata;
@@ -13,6 +14,7 @@ mod peers_stream_tests;
 mod peerwire;
 mod probe;
 mod resolver;
+mod scout;
 mod swarm;
 #[cfg(test)]
 mod testpeer;
@@ -48,6 +50,10 @@ struct AppState {
     stream_cache: Arc<PeerCache>,
     limiter: Arc<discovery::Limiter>,
     swarm: Arc<SwarmService>,
+    /// Probes, scores and remembers the addresses `/peers` streams.
+    scout: Arc<scout::Scout>,
+    /// Verified info dicts: single-flight fetches and a byte-weighted cache.
+    info: Arc<info::InfoService>,
 }
 
 #[tokio::main]
@@ -72,12 +78,22 @@ async fn main() {
         .expect("failed to build HTTP client");
 
     let lookup = Arc::new(Lookup::new(http_client, dht));
-    let cache = Arc::new(PeerCache::new(cfg.max_cache_entries));
-    let swarm = SwarmService::new(cfg.clone(), lookup.clone(), cache.clone());
+    let cache = Arc::new(PeerCache::new(cfg.peers_cache_bytes));
+    // One pool of probes for the scout and /swarm (PROBE_CONCURRENCY).
+    let probe_permits = Arc::new(tokio::sync::Semaphore::new(cfg.probe_concurrency));
+    let info = info::InfoService::new(cfg.info_settings());
+    let swarm = SwarmService::new(
+        cfg.clone(),
+        lookup.clone(),
+        cache.clone(),
+        probe_permits.clone(),
+        info.clone(),
+    );
     swarm.spawn_refresher();
 
     let state = AppState {
-        stream_cache: Arc::new(PeerCache::new(cfg.max_cache_entries)),
+        scout: scout::Scout::new(cfg.scout_settings(), scout::real_prober(), probe_permits),
+        stream_cache: Arc::new(PeerCache::new(cfg.peers_cache_bytes)),
         limiter: discovery::Limiter::new(discovery::StreamLimits {
             per_ip_per_minute: cfg.peers_per_ip_per_minute,
             per_ip_streams: cfg.peers_streams_per_ip,
@@ -87,6 +103,7 @@ async fn main() {
         lookup,
         cache,
         swarm,
+        info,
     };
 
     let app = router(state);
@@ -123,8 +140,7 @@ fn router(state: AppState) -> Router {
         )
         .route(
             "/metadata",
-            get(metadata_handler)
-                .layer(timeout_layer(cfg.deadline + cfg.metadata_deadline + slack)),
+            get(metadata_handler).layer(timeout_layer(cfg.peers_stream_deadline + slack)),
         )
         .route(
             "/files",
@@ -267,44 +283,11 @@ async fn peers_handler(
         Ok(v) => v,
         Err(e) => return bad_request(e),
     };
-    let ip = discovery::client_ip(
-        extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0),
-        headers
-            .get(state.config.client_ip_header.as_str())
-            .and_then(|v| v.to_str().ok()),
-    );
-    let permit = match state.limiter.try_acquire(ip, Instant::now()) {
+    let permit = match admit(&state, &headers, &extensions) {
         Ok(p) => p,
-        Err(refusal) => {
-            tracing::info!(why = refusal.code(), "peers stream refused");
-            let mut response = (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(ErrorBody {
-                    error: refusal.code().to_string(),
-                }),
-            )
-                .into_response();
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
-            return response;
-        }
+        Err(refusal) => return refused(refusal),
     };
-
-    let body = match state.stream_cache.get(&info_hash).await {
-        Some(cached) => {
-            drop(permit);
-            Body::from(discovery::cached_body(&cached))
-        }
-        None => Body::from_stream(discovery::live(
-            state.lookup.clone(),
-            state.stream_cache.clone(),
-            state.config.clone(),
-            info_hash,
-            trackers,
-            permit,
-        )),
-    };
+    let body = Body::from_stream(discovery_stream(&state, info_hash, trackers, permit).await);
     (
         [
             (
@@ -321,6 +304,63 @@ async fn peers_handler(
         body,
     )
         .into_response()
+}
+
+/// The per-IP and total limits of `/peers` (OQ-14), also applied to `/metadata`.
+fn admit(
+    state: &AppState,
+    headers: &HeaderMap,
+    extensions: &Extensions,
+) -> Result<discovery::Permit, discovery::Refusal> {
+    let ip = discovery::client_ip(
+        extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0),
+        headers
+            .get(state.config.client_ip_header.as_str())
+            .and_then(|v| v.to_str().ok()),
+    );
+    state.limiter.try_acquire(ip, Instant::now())
+}
+
+/// 429 with the limit's code and `Retry-After: 30`.
+fn refused(refusal: discovery::Refusal) -> Response {
+    tracing::info!(why = refusal.code(), "request refused");
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ErrorBody {
+            error: refusal.code().to_string(),
+        }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+    response
+}
+
+/// A discovery stream: replayed from the 5-minute cache, or a new lookup.
+async fn discovery_stream(
+    state: &AppState,
+    info_hash: [u8; 20],
+    trackers: Vec<String>,
+    permit: discovery::Permit,
+) -> impl futures_lite::Stream<Item = Result<bytes::Bytes, std::convert::Infallible>> + Send + 'static
+{
+    let source = match state.stream_cache.get(&info_hash).await {
+        Some(cached) => discovery::Source::Cached(cached),
+        None => discovery::Source::Lookup {
+            lookup: state.lookup.clone(),
+            cache: state.stream_cache.clone(),
+            trackers,
+        },
+    };
+    discovery::stream(
+        state.scout.clone(),
+        state.info.clone(),
+        state.config.clone(),
+        info_hash,
+        source,
+        permit,
+    )
 }
 
 /// `ih` names the info-hash; `magnet` adds its `tr=` trackers (and names the
@@ -405,33 +445,96 @@ async fn swarm_handler(State(state): State<AppState>, Query(query): Query<PeersQ
     response
 }
 
+/// `GET /metadata?ih=` (also `hash=` or `magnet=`): the raw verified info
+/// dict. From the cache without contacting any peer; otherwise a discovery
+/// runs (as for `/peers`, under the same per-IP limits, its lines unread)
+/// and the first live peers offering `ut_metadata` are asked. 404 when no
+/// peer offers a verified one, 504 at the deadline.
 async fn metadata_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    extensions: Extensions,
     Query(query): Query<PeersQuery>,
 ) -> Response {
-    let (info_hash, magnet_trackers) = match resolve_query(query) {
+    let resolved = if query.ih.is_some() || query.magnet.is_some() {
+        resolve_stream_query(&query)
+    } else {
+        resolve_query(query)
+    };
+    let (info_hash, trackers) = match resolved {
         Ok(v) => v,
         Err(e) => return bad_request(e),
     };
-
-    match state.swarm.metadata(info_hash, magnet_trackers).await {
-        Ok(info) => (
-            [
-                (
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/octet-stream"),
-                ),
-                // Content-addressed by the info-hash: it can never change.
-                (
-                    header::CACHE_CONTROL,
-                    HeaderValue::from_static("public, max-age=31536000, immutable"),
-                ),
-            ],
-            info.bytes.clone(),
-        )
-            .into_response(),
-        Err(e) => metadata_error(&e),
+    let permit = match admit(&state, &headers, &extensions) {
+        Ok(p) => p,
+        Err(refusal) => return refused(refusal),
+    };
+    if let Some(info) = state.info.cached(&info_hash).await {
+        return info_response(&info);
     }
+    let deadline = tokio::time::Instant::now() + state.config.peers_stream_deadline;
+    // The discovery feeds the metadata fetcher; nobody reads its lines.
+    let mut lines = Box::pin(discovery_stream(&state, info_hash, trackers, permit).await);
+    let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+    let drain = tokio::spawn(async move {
+        use futures_lite::StreamExt;
+        while lines.next().await.is_some() {}
+        let _ = done_tx.send(true);
+    });
+    let _drain = AbortOnDrop(drain);
+    loop {
+        if let Some(info) = state.info.cached(&info_hash).await {
+            return info_response(&info);
+        }
+        let discovering = !*done_rx.borrow();
+        if let Some(mut flight) = state.info.watch(&info_hash) {
+            let waited = tokio::time::timeout_at(deadline, flight.wait_for(Option::is_some)).await;
+            match waited {
+                Err(_) => return metadata_error(&metadata::MetadataError::Timeout),
+                Ok(Ok(outcome)) => match outcome.clone() {
+                    // Larger than the cache takes: served from the flight.
+                    Some(Ok(info)) => return info_response(&info),
+                    Some(Err(e)) if !discovering => return metadata_error(&e),
+                    // Failed, but the discovery may still find another peer.
+                    _ => {}
+                },
+                Ok(Err(_)) => {}
+            }
+        } else if !discovering {
+            return metadata_error(&metadata::MetadataError::NoPeers);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return metadata_error(&metadata::MetadataError::Timeout);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Aborts a task when dropped (the request went away).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn info_response(info: &metadata::InfoDict) -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            ),
+            // Content-addressed by the info-hash: it can never change.
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            ),
+        ],
+        info.bytes.clone(),
+    )
+        .into_response()
 }
 
 /// The magnet's files, read from its info dict (fetched from peers first
@@ -467,10 +570,13 @@ async fn files_handler(State(state): State<AppState>, Query(query): Query<PeersQ
     }
 }
 
+/// 504 at the deadline, 503 with every fetch slot busy, else 404: no peer
+/// offered an info dict that hashes to the info-hash.
 fn metadata_error(e: &metadata::MetadataError) -> Response {
     let status = match e {
         metadata::MetadataError::Timeout => StatusCode::GATEWAY_TIMEOUT,
-        _ => StatusCode::BAD_GATEWAY,
+        metadata::MetadataError::Busy => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::NOT_FOUND,
     };
     let mut response = (
         status,

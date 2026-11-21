@@ -6,7 +6,10 @@
 // the candidates and the next one is asked.
 //
 // The fetcher does not own connections: the session forwards each
-// connection's `extensions`, `metadata` and `close` events to it.
+// connection's `extensions`, `metadata` and `close` events to it. An info
+// dict that arrives from elsewhere (the VPS's `/peers` stream, a cache) is
+// handed to `offerBytes` and goes through the same hash check: the first
+// verified one, from wherever, ends the search.
 
 import { METADATA_PIECE_SIZE, encodeMetadataRequest, type MetadataMessage } from "./extension.ts";
 import { MetainfoError, parseInfoDict, type ExpectedHashes, type Metainfo, type MetainfoLimits } from "./metainfo.ts";
@@ -18,19 +21,23 @@ export interface MetadataOptions {
 	expected: ExpectedHashes;
 	/** Largest `metadata_size` accepted (default 16 MiB). */
 	maxSize?: number;
-	/** Give up on a peer after this long without a piece (default 10 s). */
+	/** Give up on a peer after this long without a piece (default 5 s). */
 	pieceTimeoutMs?: number;
-	/** Peers asked at once (default 2). */
+	/** Peers asked at once (default 4). */
 	parallel?: number;
 	limits?: MetainfoLimits;
 }
 
-export type MetadataFailure = "too_large" | "reject" | "timeout" | "closed" | "bad_data" | "hash_mismatch";
+export type MetadataFailure = "too_large" | "reject" | "timeout" | "closed" | "bad_data" | "hash_mismatch" | "external_mismatch";
+
+/** Where the verified info dict came from: a peer (BEP 9) or `offerBytes`. */
+export type MetadataSource = "peer" | "external";
 
 export interface MetadataResult {
 	meta: Metainfo;
 	/** The verified info dict. */
 	bytes: Uint8Array;
+	source: MetadataSource;
 }
 
 interface Attempt {
@@ -43,7 +50,7 @@ interface Attempt {
 
 export class MetadataFetcher {
 	readonly done: Promise<MetadataResult>;
-	readonly failures: Record<MetadataFailure, number> = { too_large: 0, reject: 0, timeout: 0, closed: 0, bad_data: 0, hash_mismatch: 0 };
+	readonly failures: Record<MetadataFailure, number> = { too_large: 0, reject: 0, timeout: 0, closed: 0, bad_data: 0, hash_mismatch: 0, external_mismatch: 0 };
 	private readonly opts: Required<Omit<MetadataOptions, "limits">> & Pick<MetadataOptions, "limits">;
 	private readonly candidates: PeerConnection[] = [];
 	private readonly attempts = new Map<PeerConnection, Attempt>();
@@ -53,7 +60,7 @@ export class MetadataFetcher {
 	private finished = false;
 
 	constructor(options: MetadataOptions) {
-		this.opts = { maxSize: DEFAULT_MAX_METADATA_SIZE, pieceTimeoutMs: 10_000, parallel: 2, ...options };
+		this.opts = { maxSize: DEFAULT_MAX_METADATA_SIZE, pieceTimeoutMs: 5_000, parallel: 4, ...options };
 		this.done = new Promise((resolve, reject) => {
 			this.resolve = resolve;
 			this.reject = reject;
@@ -64,6 +71,11 @@ export class MetadataFetcher {
 
 	get isDone(): boolean {
 		return this.finished;
+	}
+
+	/** Peers offering the metadata still to ask, or being asked now (0 once done). */
+	get pending(): number {
+		return this.finished ? 0 : this.candidates.length + this.attempts.size;
 	}
 
 	/** A connection's extended handshake arrived: a candidate if it offers the metadata. */
@@ -78,6 +90,28 @@ export class MetadataFetcher {
 		}
 		this.candidates.push(conn);
 		this.next();
+	}
+
+	/**
+	 * An info dict from outside the swarm (the VPS's `info` line, a cache).
+	 * Checked like one from a peer; true if it was accepted and ended the
+	 * search. A wrong one is counted and dropped, and the peers carry on.
+	 */
+	async offerBytes(bytes: Uint8Array): Promise<boolean> {
+		if (this.finished) return false;
+		if (!(bytes instanceof Uint8Array) || bytes.length === 0 || bytes.length > this.opts.maxSize) {
+			this.failures.external_mismatch++;
+			return false;
+		}
+		const copy = bytes.slice();
+		let meta: Metainfo;
+		try {
+			meta = await parseInfoDict(copy, this.opts.expected, this.opts.limits);
+		} catch {
+			this.failures.external_mismatch++;
+			return false;
+		}
+		return this.succeed(meta, copy, "external");
 	}
 
 	/** A ut_metadata message from `conn`. */
@@ -146,10 +180,16 @@ export class MetadataFetcher {
 			if (!(e instanceof MetainfoError)) throw e;
 			return this.fail(a, "hash_mismatch");
 		}
-		if (this.finished) return;
+		this.succeed(meta, a.buffer, "peer");
+	}
+
+	private succeed(meta: Metainfo, bytes: Uint8Array, source: MetadataSource): boolean {
+		if (this.finished) return false;
 		this.finished = true;
 		for (const other of this.attempts.values()) clearTimeout(other.timer);
 		this.attempts.clear();
-		this.resolve({ meta, bytes: a.buffer });
+		this.candidates.length = 0;
+		this.resolve({ meta, bytes, source });
+		return true;
 	}
 }

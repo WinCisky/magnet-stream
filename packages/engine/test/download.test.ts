@@ -47,7 +47,7 @@ describe("download from one peer", () => {
 		for (const [p, data] of delivered) {
 			expect(Buffer.from(data).equals(Buffer.from(torrent.data.subarray(p * torrent.pieceLength, (p + 1) * torrent.pieceLength)))).toBe(true);
 		}
-		// Fast on both sides: have-none first; never unchoke, bitfield, have or piece (no upload).
+		// Fast on both sides: have-none first; no uploader, so never unchoke, bitfield, have or piece (as M1-06).
 		const ids = sentIds(transport);
 		expect(ids[0]).toBe(MSG.HAVE_NONE);
 		expect(ids.filter((id) => [MSG.UNCHOKE, MSG.PIECE, MSG.BITFIELD, MSG.HAVE, MSG.HAVE_ALL].includes(id as 1))).toEqual([]);

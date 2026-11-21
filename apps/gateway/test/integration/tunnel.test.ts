@@ -1,7 +1,8 @@
 // wrangler dev + fake peers: open/data/close, failed (refused, timeout,
 // not BitTorrent, info-hash mismatch, forbidden address), the 6-connection
 // limit, Origin and subprotocol checks, several WebSockets per session,
-// idle and session timeouts, socket cleanup, the per-IP upgrade limit.
+// idle and session timeouts, socket cleanup, the per-IP upgrade limit, a
+// peer that does not read (closed past the pending-write bound, M3-12).
 
 import { randomBytes } from "node:crypto";
 import http from "node:http";
@@ -55,7 +56,7 @@ const vars = { ALLOWED_ORIGINS: "http://localhost:4321", TUNNEL_HANDSHAKE_TIMEOU
 
 beforeAll(async () => {
 	const started = await Promise.allSettled([
-		startWranglerDev({ vars: { ...vars, ALLOW_PRIVATE_PEERS: "1", TUNNEL_UPGRADES_PER_MINUTE: "600" } }),
+		startWranglerDev({ vars: { ...vars, ALLOW_PRIVATE_PEERS: "1", TUNNEL_UPGRADES_PER_MINUTE: "600", TUNNEL_MAX_PENDING_WRITE_BYTES: "1048576" } }),
 		startWranglerDev({ vars: { ...vars, ALLOW_PRIVATE_PEERS: "0", TUNNEL_UPGRADES_PER_MINUTE: "3" } }),
 		startWranglerDev({
 			vars: { ...vars, ALLOW_PRIVATE_PEERS: "1", TUNNEL_UPGRADES_PER_MINUTE: "600", TUNNEL_IDLE_TIMEOUT_MS: "2000", TUNNEL_SESSION_TIMEOUT_S: "6" },
@@ -129,6 +130,31 @@ describe("tunnel through wrangler dev", () => {
 		expect(t.frames.every((f) => f.type === "failed")).toBe(true);
 		t.close();
 	});
+
+	it("closes a peer that does not read once the bytes held for it pass the bound, and only that connection", async () => {
+		const stuck = await peer({ noRead: true });
+		const seed = await peer();
+		const t = await openTunnel(dev.url);
+		t.send(open(1, stuck.port), open(2, seed.port));
+		await t.waitFor((f) => f.type === "opened" && f.conn === 1);
+		await t.waitFor((f) => f.type === "opened" && f.conn === 2);
+		// Far more than the kernel's socket buffers can absorb plus the 1 MiB bound.
+		const chunk = new Uint8Array(256 * 1024);
+		for (let i = 0; i < 256 && !t.frames.some((f) => f.type === "close" && f.conn === 1); i++) {
+			t.send({ type: "data", conn: 1, payload: chunk }, { type: "data", conn: 1, payload: chunk });
+			if (i % 16 === 15) await new Promise((r) => setTimeout(r, 20));
+		}
+		const close = await t.waitFor((f) => f.type === "close" && f.conn === 1, 20_000);
+		expect(close).toEqual({ type: "close", conn: 1, reason: CloseReason.WRITE_OVERFLOW });
+		await waitUntil(() => dev.output().includes('"reason":"write_overflow"'), 5_000);
+		// The other connection of the socket still works.
+		t.send({ type: "data", conn: 2, payload: Buffer.concat([message(0x0f), message(2)]) });
+		await t.waitFor(() => wireMessages(t.frames, 2).some((m) => m.id === 1));
+		t.send({ type: "data", conn: 2, payload: message(6, [...u32(0), ...u32(0), ...u32(16384)]) });
+		await t.waitFor(() => wireMessages(t.frames, 2).some((m) => m.id === 7));
+		expect(t.frames.some((f) => f.type === "close" && f.conn === 2)).toBe(false);
+		t.close();
+	}, 60_000);
 
 	it("refuses the 7th connection on a socket", async () => {
 		const seed = await peer();

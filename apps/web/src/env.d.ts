@@ -3,6 +3,8 @@ interface ImportMetaEnv {
 	readonly PUBLIC_SEEDERS_URL?: string;
 	/** magnet-worker base URL (defaults to production). */
 	readonly PUBLIC_WORKER_URL?: string;
+	/** Hard cap on one file-list lookup, seconds (default 120). */
+	readonly PUBLIC_LOOKUP_CAP_SECONDS?: string;
 }
 
 /** When this build was made (set in astro.config.mjs); diagnostics report it. */

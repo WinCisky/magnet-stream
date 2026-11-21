@@ -31,6 +31,9 @@ if (problems.length === 0) {
 	}
 	check(existsSync(`${dist}_astro`) && readdirSync(`${dist}_astro`).some((f) => f.endsWith(".js")), "dist/_astro has no scripts");
 	check(existsSync(`${dist}libmedia`), "dist/libmedia (player codecs) is missing");
+	// The streaming service worker at the root (its scope is its folder), and no other.
+	check(existsSync(`${dist}stream-sw.js`), "dist/stream-sw.js (streaming service worker) is missing");
+	check(!existsSync(`${dist}coi-sw.js`), "dist/coi-sw.js is back: isolation comes from _headers");
 }
 
 if (problems.length > 0) {

@@ -56,6 +56,23 @@ describe("FileStream", () => {
 		expect(await stream.size()).toBe(1_000);
 	});
 
+	it("counts the verified bytes in one run from an offset", () => {
+		// File bytes [0, 1000) are torrent bytes [100, 1100): piece 0 holds file bytes 0–155.
+		const { stream, verify } = setup({ verified: [0, 1, 3] });
+		expect(stream.available(0)).toBe(412); // pieces 0 and 1: up to torrent byte 512
+		expect(stream.available(200)).toBe(212);
+		expect(stream.available(500)).toBe(0); // piece 2 is missing
+		expect(stream.available(700)).toBe(224); // piece 3 only: torrent bytes 800–1023
+		expect(stream.available(0, 10)).toBe(156); // stops at the piece holding the limit
+		verify(2);
+		verify(4);
+		expect(stream.available(0)).toBe(1_000); // to the end of the file, not of the piece
+		expect(stream.available(999)).toBe(1);
+		for (const bad of [1_000, -1, Number.NaN]) expect(stream.available(bad)).toBe(0);
+		stream.close();
+		expect(stream.available(0)).toBe(0);
+	});
+
 	it("waits for a missing piece, asks for it, and wakes when it's verified", async () => {
 		const { stream, calls, verify, expected } = setup({ verified: [0] });
 		const into = new Uint8Array(100);

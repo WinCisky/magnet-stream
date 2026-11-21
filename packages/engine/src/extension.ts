@@ -29,9 +29,11 @@ export interface ExtensionHandshake {
 
 export class ExtensionError extends Error {}
 
-/** Our extended handshake: what we accept, no metadata to offer (we never upload). */
-export function encodeOurHandshake(options: { reqq?: number } = {}): Uint8Array {
-	return encodeBencode({ m: { ...LOCAL_EXTENSIONS }, reqq: options.reqq ?? 250, v: CLIENT });
+/** Our extended handshake: what we accept, and the size of the verified info dict we serve (if any). */
+export function encodeOurHandshake(options: { reqq?: number; metadataSize?: number } = {}): Uint8Array {
+	const size = options.metadataSize;
+	const withSize = size !== undefined && Number.isInteger(size) && size > 0 ? { metadata_size: size } : {};
+	return encodeBencode({ m: { ...LOCAL_EXTENSIONS }, reqq: options.reqq ?? 250, v: CLIENT, ...withSize });
 }
 
 export function decodeHandshake(payload: Uint8Array): ExtensionHandshake {
@@ -65,6 +67,15 @@ export type MetadataMessage =
 
 export function encodeMetadataRequest(piece: number): Uint8Array {
 	return encodeBencode({ msg_type: 0, piece });
+}
+
+/** BEP 9 data message: the dict, then the piece's bytes. */
+export function encodeMetadataData(piece: number, totalSize: number, data: Uint8Array): Uint8Array {
+	const head = encodeBencode({ msg_type: 1, piece, total_size: totalSize });
+	const out = new Uint8Array(head.length + data.length);
+	out.set(head);
+	out.set(data, head.length);
+	return out;
 }
 
 export function encodeMetadataReject(piece: number): Uint8Array {

@@ -2,27 +2,38 @@
 	import { onMount } from "svelte";
 	import ArrowUpIcon from "@lucide/svelte/icons/arrow-up";
 	import LoaderCircleIcon from "@lucide/svelte/icons/loader-circle";
+	import RotateCwIcon from "@lucide/svelte/icons/rotate-cw";
 	import { Button } from "$lib/components/ui/button/index.js";
+	import type { LookupProgress } from "$lib/torrent/lookup-wait";
 
 	let {
 		value = $bindable(""),
 		verifying = false,
 		phase = null,
 		error = null,
+		progress = null,
 		onSubmit,
+		onRetry = undefined,
 	}: {
 		value: string;
 		verifying?: boolean;
 		phase?: "metadata" | "seeders" | null;
 		error?: string | null;
+		/** What the lookup has tried so far (no addresses). */
+		progress?: LookupProgress | null;
 		onSubmit: () => void;
+		/** Shown with the error: look again in the same session. */
+		onRetry?: () => void;
 	} = $props();
 
 	let inputEl: HTMLTextAreaElement | null = $state(null);
 
+	const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 	const phaseLabel = $derived(
 		phase === "metadata"
-			? "Fetching torrent metadata…"
+			? progress && (progress.found > 0 || progress.elapsedMs >= 1_000)
+				? `Looking for the file list… ${plural(progress.found, "peer", "peers")} found · ${progress.tried} tried · ${progress.connected} connected`
+				: "Fetching torrent metadata…"
 			: phase === "seeders"
 				? "Looking for seeders…"
 				: ""
@@ -66,7 +77,7 @@
 		></textarea>
 
 		<div class="flex items-center gap-2">
-			<p class="text-muted-foreground min-w-0 flex-1 truncate px-1 text-xs" aria-live="polite">
+			<p class="text-muted-foreground min-w-0 flex-1 truncate px-1 text-xs" aria-live="polite" data-testid="lookup-progress">
 				{#if verifying && phaseLabel}
 					{phaseLabel}
 				{:else}
@@ -91,6 +102,14 @@
 	</div>
 
 	{#if error}
-		<p class="text-destructive px-1 text-center text-sm">{error}</p>
+		<div class="flex flex-col items-center gap-2 px-1">
+			<p class="text-destructive text-center text-sm" data-testid="lookup-error">{error}</p>
+			{#if onRetry}
+				<Button type="button" variant="outline" size="sm" onclick={onRetry} disabled={verifying}>
+					<RotateCwIcon />
+					Retry
+				</Button>
+			{/if}
+		</div>
 	{/if}
 </form>

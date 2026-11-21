@@ -13,25 +13,42 @@
 	import LoaderCircleIcon from "@lucide/svelte/icons/loader-circle";
 	import CircleAlertIcon from "@lucide/svelte/icons/circle-alert";
 	import * as DropdownMenu from "$lib/components/ui/dropdown-menu/index.js";
-	import { VideoPlayer, type PlayerEvent, type PlayerState } from "./player";
+	import { VideoPlayer, type MediaPlayer, type PlayerEvent, type PlayerState } from "./player";
+	import { NativePlayer, nativeCandidate } from "./native";
+	import { extensionOf, nativePlayable, type MediaCodecs } from "./codecs";
+	import { probeCodecs } from "./probe";
 	import type { ByteSource, SubtitleSource } from "./source";
 	import { formatTime } from "./time";
 
 	let {
 		source,
+		url = null,
 		name,
 		available = [],
 		subtitles = [],
+		startMs = 0,
 		onEvent,
+		onTime,
 	}: {
 		source: ByteSource;
+		/**
+		 * Where the file is served with range requests: an MP4 or WebM whose
+		 * codecs the browser decodes (read from the file's index first) plays
+		 * in its own player, falling back to libmedia (over `source`) if it
+		 * can't decode it after all. Null: libmedia.
+		 */
+		url?: string | null;
 		/** File name: its extension picks the demuxer. */
 		name: string;
 		/** Parts of the file already in, as [start, end] fractions of its bytes. */
 		available?: readonly (readonly [number, number])[];
 		/** Subtitle files besides the video's own, fetched when picked. */
 		subtitles?: SubtitleSource[];
+		/** Where the first play starts (a remembered position), 0: the start. */
+		startMs?: number;
 		onEvent?: (event: PlayerEvent) => void;
+		/** Playback position, while playing, paused or ended. */
+		onTime?: (ms: number, durationMs: number) => void;
 	} = $props();
 
 	const SKIP_MS = 10_000;
@@ -39,7 +56,7 @@
 
 	let frame: HTMLDivElement | undefined = $state();
 	let stage: HTMLDivElement | undefined = $state();
-	let player: VideoPlayer | null = null;
+	let player: MediaPlayer | null = null;
 	let s: PlayerState | null = $state.raw(null);
 	let pressed = $state(false);
 	let fullscreen = $state(false);
@@ -52,27 +69,98 @@
 	let hover: number | null = $state(null);
 	let bar: HTMLDivElement | undefined = $state();
 	let hideTimer: ReturnType<typeof setTimeout> | undefined;
+	/** Which player plays (null: still reading the codecs), for diagnostics and tests. */
+	let chosen: "native" | "libmedia" | null = $state(null);
+	/** Holds let go so far ("start:10.2", "resume:5.0", "start:end"), for diagnostics and tests. */
+	let holds: string[] = $state([]);
 	let lastPointer = "mouse";
 
 	const duration = $derived(s?.durationMs ?? 0);
 	const shown = $derived(dragging ?? (duration > 0 ? (s?.currentMs ?? 0) / duration : 0));
 	const playing = $derived(s?.status === "playing");
 	const busy = $derived(
-		(s?.status === "loading" && pressed) || (playing && s?.waiting) || (pressed && s?.status === "ready"),
+		(pressed && !s) || (s?.status === "loading" && pressed) || (playing && s?.waiting) || (pressed && s?.status === "ready"),
 	);
 	const showControls = $derived(!playing || active || overControls || menuOpen || dragging !== null);
 
 	onMount(() => {
-		if (!stage) return;
-		player = new VideoPlayer({ container: stage, source, name, subtitles, onChange: (next) => (s = next), onEvent });
+		const container = stage;
+		if (!container) return;
+		const probing = new AbortController();
+		void choose(probing.signal).then(
+			({ native, codecs }) => {
+				if (probing.signal.aborted) return;
+				player = makePlayer(container, native ? url : null, codecs);
+				if (startMs > 0) player.resumeAt(startMs);
+				if (pressed) void player.play();
+			},
+			() => {},
+		);
 		const onFullscreen = () => (fullscreen = document.fullscreenElement === frame);
 		document.addEventListener("fullscreenchange", onFullscreen);
 		return () => {
+			probing.abort();
 			clearTimeout(hideTimer);
 			document.removeEventListener("fullscreenchange", onFullscreen);
 			void player?.destroy();
 			player = null;
 		};
+	});
+
+	/**
+	 * The browser's own player for an MP4 or WebM whose codecs it decodes,
+	 * read from the file's index (its head, or its tail for an MP4 with the
+	 * index last: the recovery fetches both first). Anything else, or a file
+	 * whose index can't be read, plays through libmedia.
+	 */
+	async function choose(signal: AbortSignal): Promise<{ native: boolean; codecs: MediaCodecs | null }> {
+		if (!url || !nativeCandidate(name)) return { native: false, codecs: null };
+		const codecs = await probeCodecs(source, extensionOf(name), signal).catch(() => null);
+		if (!codecs) return { native: false, codecs: null };
+		const canPlay = (type: string) => document.createElement("video").canPlayType(type);
+		return { native: nativePlayable(codecs, canPlay).native, codecs };
+	}
+
+	function report(event: PlayerEvent) {
+		if (event.type === "buffered") holds = [...holds.slice(-19), `${event.kind}:${event.toEnd ? "end" : (event.aheadMs / 1000).toFixed(1)}`];
+		onEvent?.(event);
+	}
+
+	function onChange(next: PlayerState) {
+		s = next;
+		if (next.status === "playing" || next.status === "paused" || next.status === "ended") onTime?.(next.currentMs, next.durationMs);
+	}
+
+	function makePlayer(container: HTMLDivElement, nativeUrl: string | null, codecs: MediaCodecs | null = null): MediaPlayer {
+		chosen = nativeUrl ? "native" : "libmedia";
+		if (!nativeUrl) return new VideoPlayer({ container, source, name, subtitles, onChange, onEvent: report });
+		const native: NativePlayer = new NativePlayer({
+			container,
+			url: nativeUrl,
+			source,
+			name,
+			subtitles,
+			codecs: codecs ? { video: codecs.video[0] ?? null, audio: codecs.audio[0] ?? null } : undefined,
+			onChange,
+			onEvent: report,
+			// The browser can't decode it after all: libmedia plays it from the same bytes.
+			onUnsupported: () => {
+				if (player !== native) return;
+				const at = native.current.currentMs;
+				void native.destroy();
+				const next = makePlayer(container, null);
+				player = next;
+				if (at > 0 || startMs > 0) next.resumeAt(at > 0 ? at : startMs);
+				if (pressed) void next.play();
+			},
+		});
+		return native;
+	}
+
+	// The remembered position may arrive after the player was made.
+	$effect(() => {
+		const at = startMs;
+		if (at > 0) player?.resumeAt(at);
 	});
 
 	function play() {
@@ -175,6 +263,8 @@
 	class:cursor-none={!showControls}
 	role="region"
 	aria-label="Video player"
+	data-player={chosen}
+	data-buffered={holds.join(" ")}
 	onpointermove={poke}
 	onpointerdown={(e) => {
 		lastPointer = e.pointerType;

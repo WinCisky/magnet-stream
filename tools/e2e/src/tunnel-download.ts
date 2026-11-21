@@ -53,7 +53,7 @@ async function main(): Promise<void> {
 		check(result.corrupt.length === 0 && result.missing.length === 0, "no corrupt or missing pieces");
 		// Requests go out in batches: far fewer upstream messages than blocks.
 		check(client.stats.messagesSent <= Math.ceil(blocks / 16) + 8, `upstream messages ${client.stats.messagesSent} not batched`);
-		check(peer.stats.unexpected.length === 0, "the engine never uploads (no unchoke/piece sent to the peer)");
+		check(peer.stats.unexpected.length === 0, "without a piece source the engine uploads nothing (no unchoke/piece sent to the peer)");
 		if (dev) {
 			// Log hygiene: neither the info-hash nor the peer's address appear in the gateway's logs.
 			const logs = dev.output();

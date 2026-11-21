@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import net from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { bdecode, bencode, hashAnswer, makeTorrent, parseSize, pexMessage, startFakePeer, type FakePeer, type PeerBehaviour } from "../src/index.ts";
+import { MSG, bdecode, bencode, hashAnswer, makeTorrent, parseSize, pexMessage, startFakePeer, type FakePeer, type PeerBehaviour } from "../src/index.ts";
 import { download } from "./client.ts";
 
 const torrent = makeTorrent({ seed: 7, size: 600_000, pieceLength: 64 * 1024 });
@@ -15,6 +15,77 @@ afterEach(async () => {
 	await Promise.all(peers.splice(0).map((p) => p.close()));
 });
 
+/**
+ * A peer that holds the pieces `holds` says, unchokes the other side, serves
+ * what it asks, and asks for piece 0 once unchoked.
+ */
+function trader(port: number, holds: (piece: number) => boolean): Promise<{ leecherAsked: number; unchoked: boolean; gotGood: boolean }> {
+	const out = { leecherAsked: 0, unchoked: false, gotGood: false };
+	return new Promise((resolve) => {
+		const socket = net.connect({ port, host: "127.0.0.1" });
+		const done = () => {
+			clearTimeout(timer);
+			socket.destroy();
+			resolve(out);
+		};
+		const timer = setTimeout(done, 3_000);
+		socket.on("error", () => {});
+		const send = (id: number, payload: Uint8Array = new Uint8Array(0)) => {
+			const b = Buffer.alloc(5 + payload.length);
+			b.writeUInt32BE(1 + payload.length);
+			b[4] = id;
+			b.set(payload, 5);
+			socket.write(b);
+		};
+		let buf = Buffer.alloc(0);
+		let handshaken = false;
+		socket.on("connect", () => {
+			const hs = Buffer.alloc(68);
+			hs[0] = 19;
+			hs.write("BitTorrent protocol", 1, "latin1");
+			hs[27] = 0x04;
+			Buffer.from(torrent.infoHash).copy(hs, 28);
+			Buffer.from("-TT0001-000000000000").copy(hs, 48);
+			socket.write(hs);
+		});
+		socket.on("data", (chunk) => {
+			buf = Buffer.concat([buf, chunk]);
+			if (!handshaken) {
+				if (buf.length < 68) return;
+				handshaken = true;
+				buf = buf.subarray(68);
+				const bits = Buffer.alloc(Math.ceil(torrent.pieceCount / 8));
+				for (let p = 0; p < torrent.pieceCount; p++) if (holds(p)) bits[p >> 3] |= 0x80 >> (p & 7);
+				send(MSG.BITFIELD, bits);
+				send(MSG.INTERESTED);
+			}
+			while (buf.length >= 4 && buf.length >= 4 + buf.readUInt32BE(0)) {
+				const len = buf.readUInt32BE(0);
+				const id = len ? buf[4] : -1;
+				const p = buf.subarray(5, 4 + len);
+				buf = buf.subarray(4 + len);
+				if (id === MSG.INTERESTED) send(MSG.UNCHOKE);
+				else if (id === MSG.REQUEST) {
+					out.leecherAsked++;
+					const piece = p.readUInt32BE(0);
+					const begin = p.readUInt32BE(4);
+					const length = p.readUInt32BE(8);
+					const start = piece * torrent.pieceLength + begin;
+					send(MSG.PIECE, Buffer.concat([p.subarray(0, 8), torrent.data.subarray(start, start + length)]));
+				} else if (id === MSG.UNCHOKE) {
+					out.unchoked = true;
+					const r = Buffer.alloc(12);
+					r.writeUInt32BE(16384, 8);
+					send(MSG.REQUEST, r);
+				} else if (id === MSG.PIECE) {
+					out.gotGood = Buffer.from(p.subarray(8)).equals(Buffer.from(torrent.data.subarray(0, 16384)));
+					done();
+				}
+			}
+		});
+	});
+}
+
 describe("makeTorrent", () => {
 	it("is deterministic per seed", () => {
 		const a = makeTorrent({ seed: 1, size: 100_000, pieceLength: 16384 });
@@ -25,6 +96,15 @@ describe("makeTorrent", () => {
 		expect(c.infoHashHex).not.toBe(a.infoHashHex);
 		// A fixed vector, so a change to the generator is noticed.
 		expect(makeTorrent({ seed: 1, size: 8 * 1024 * 1024 }).infoHashHex).toMatchInlineSnapshot(`"aed25b198b720409b5b1e88fb9fd73ffa537e631"`);
+	});
+
+	it("carries given bytes instead of noise", () => {
+		const content = new Uint8Array(40_000).map((_, i) => i % 251);
+		const t = makeTorrent({ content, name: "clip.mp4", pieceLength: 16384 });
+		expect(t.totalLength).toBe(40_000);
+		expect(t.data).toEqual(content);
+		expect(t.pieceCount).toBe(3);
+		expect(() => makeTorrent({ content, files: [{ path: ["a"], length: 1 }] })).toThrow(RangeError);
 	});
 
 	it("produces a real info dict whose SHA-1 is the info-hash", () => {
@@ -109,6 +189,25 @@ describe("fake peer over TCP", () => {
 		const r = await download(torrent, { port: p.port, timeoutMs: 400 });
 		expect(r.unchoked).toBe(false);
 		expect(r.pieces.size).toBe(0);
+	});
+
+	it("tit-for-tat leecher: unchokes only a peer that uploads to it", async () => {
+		const mine = [0, 1, 2, 3];
+		const p = await peer({ titForTat: true, have: mine });
+		// Interest alone gets nothing.
+		const idle = await download(torrent, { port: p.port, timeoutMs: 400 });
+		expect(idle.unchoked).toBe(false);
+		expect(p.stats.titForTatUnchokes).toBe(0);
+		// A peer that has the other pieces and serves them gets unchoked, then served.
+		const r = await trader(p.port, (piece) => !mine.includes(piece));
+		expect(r.leecherAsked).toBeGreaterThan(0);
+		expect(r.unchoked).toBe(true);
+		expect(r.gotGood).toBe(true);
+		expect(p.stats.titForTatUnchokes).toBe(1);
+		expect(p.stats.received.unchoke).toBe(1);
+		expect(p.stats.received.bitfield).toBe(1);
+		expect(p.stats.received.bytes).toBeGreaterThanOrEqual(16 * 1024);
+		expect(p.stats.received.badBlocks).toBe(0);
 	});
 
 	it("chokes midway and rejects the rest", async () => {

@@ -26,4 +26,9 @@ describe("session end reason", () => {
 		expect(CloseReason.IDLE).toBe(6);
 		expect(CloseReason.SESSION_TIMEOUT).toBe(7);
 	});
+
+	it("has a close reason for a peer that does not read", () => {
+		expect(CloseReason.WRITE_OVERFLOW).toBe(8);
+		expect(new Set(Object.values(CloseReason)).size).toBe(Object.keys(CloseReason).length);
+	});
 });

@@ -12,7 +12,7 @@ export interface Environment {
 	/** Network Information API ("4g", "3g"…), where available. */
 	connection: string | null;
 	downlinkMbps: number | null;
-	/** Cross-origin isolated (public/coi-sw.js): the player's threads and subtitles need it. */
+	/** Cross-origin isolated (COOP/COEP from public/_headers): the player's threads and subtitles need it. */
 	isolated?: boolean;
 }
 

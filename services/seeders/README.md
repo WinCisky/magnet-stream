@@ -35,10 +35,12 @@ piece recovery, three more endpoints go further:
   same info dict, as JSON: what the page shows to pick a video.
 
 > **Monorepo note:** the browser engine uses the **streamed**
-> `GET /peers?ih=…` (NDJSON, addresses written as found, closed after
-> ~30 s, per-IP limits): see `docs/discovery-api.md`. The JSON form below
-> (`?hash=`), `/swarm`, `/metadata` and `/files` are the PoC's and are
-> removed in M5-01.
+> `GET /peers?ih=…` (NDJSON, closed after ~30 s, per-IP limits): every
+> address is probed, scored 0..1 and written with what the probe learned,
+> live peers first, with scores remembered in memory (`src/scout.rs`): see
+> `docs/discovery-api.md`. The JSON form below (`?hash=`), `/swarm` and
+> `/files` are the PoC's and are removed in M5-01; probing and `/metadata`
+> stay (decision OQ-21).
 
 ## Running
 
@@ -120,17 +122,18 @@ polling.
 - **Caching.** Sent with `Cache-Control: no-store`, because tokens are
   minted per response.
 
-### `GET /metadata?magnet=…` or `?hash=…`
+### `GET /metadata?ih=…` (or `?magnet=…`, `?hash=…`)
 
-The raw bencoded info dict (`application/octet-stream`), whose SHA-1 is the
-info-hash, so clients can check it themselves. It is content-addressed and
-therefore sent with `Cache-Control: public, max-age=31536000, immutable`.
+The raw bencoded info dict (`application/octet-stream`), whose SHA-1 (v1,
+hybrid) or truncated SHA-256 (v2-only) is the info-hash, so clients can
+check it themselves. Sent with `Cache-Control: public, max-age=31536000,
+immutable`. Answered from the in-memory cache when it is there; otherwise a
+scouted discovery runs and live peers offering the metadata are asked.
+Details, errors and limits: docs/discovery-api.md › `GET /metadata?ih=`.
 
-Errors:
-- `504` if no peer delivered the metadata before `METADATA_DEADLINE_MS`
-- `502` if every candidate failed
-
-Failures aren't cached, so retrying later works.
+Errors: `404` no peer offered a verified info dict, `504` deadline, `503`
+every fetch slot busy, `429` over the per-IP limits of `/peers`. Failures
+aren't cached, so retrying later works.
 
 ### `GET /files?magnet=…` or `?hash=…`
 
@@ -182,20 +185,28 @@ never a hard crash).
 | `ALLOWED_ORIGINS` | *(none)* | Comma-separated list of origins allowed to call this API from a browser (CORS), or `*` for any origin. If unset, no CORS headers are sent — only non-browser clients can use the API |
 | `DEFAULT_TRACKERS` | a built-in list of ~8 public trackers | Comma-separated list overriding the built-in defaults |
 | `MAX_TRACKERS` | `20` | Cap on how many trackers are queried per request (magnet's own + defaults, deduplicated) |
-| `MAX_CACHE_ENTRIES` | `50000` | Max number of distinct info-hashes held in the cache at once |
+| `PEERS_CACHE_MB` | `16` | Memory for cached discovery results, weighed in bytes (each of the two caches: streamed `/peers` and the legacy one) |
 | `DHT_PORT` | `6881` | UDP port for the DHT node |
-| `PROBE_CONCURRENCY` | `256` | Max peer probes (TCP connections) in flight across all swarms |
-| `MAX_PROBE_PEERS` | `1000` | Max peers probed per swarm build (peers reachable last time come first, peers that failed last time last) |
+| `PROBE_CONCURRENCY` | `256` | Max peer probes (TCP connections) in flight in total, scout and `/swarm` together |
+| `MAX_PROBE_PEERS` | `1000` | Max peers probed per swarm build, and per info-hash per `SCOUT_REPROBE_SECS` window by the scout (beyond it, `/peers` sends addresses unprobed) |
 | `PROBE_CONNECT_TIMEOUT_MS` | `2500` | TCP connect timeout for a probe or metadata fetch |
 | `PROBE_TIMEOUT_MS` | `5000` | Hard cap on one probe |
 | `PROBE_UNCHOKE_WAIT_MS` | `2500` | How long a probe waits for an unchoke after saying it's interested |
 | `REFRESH_INTERVAL_SECS` | `300` | Active swarms are re-announced and re-probed this often |
 | `ACTIVE_TTL_SECS` | `1800` | A swarm stops being refreshed (and is forgotten) this long after its last `/swarm` request |
-| `METADATA_DEADLINE_MS` | `12000` | Time budget for fetching an info dict from peers |
-| `METADATA_CACHE_MB` | `256` | Memory for cached info dicts |
+| `METADATA_DEADLINE_MS` | `15000` | Time budget for fetching an info dict from peers |
+| `METADATA_CACHE_MB` | `32` | Memory for cached info dicts, weighed in bytes (shared by `/peers`, `/metadata`, `/files`, `/swarm`) |
+| `METADATA_CACHE_MAX_ENTRY_MB` | `4` | Larger info dicts are served but not cached |
+| `METADATA_FETCHES` | `4` | Info dict fetches in flight in total (each asks up to 3 peers; buffers bounded to this × 8 MiB) |
 | `WORKER_TOKEN_SECRET` | *(none)* | Secret shared with magnet-worker. If unset, `/swarm` issues no tokens |
 | `TOKEN_TTL_SECS` | `900` | Lifetime of the tokens in a `/swarm` response |
-| `ALLOW_PRIVATE_PEERS` | `false` | Probe loopback/private peer addresses. Only for local testing |
+| `SCOUT_PER_STREAM` | `64` | Scout: probes in flight per `/peers` stream |
+| `SCOUT_REPROBE_SECS` | `600` | Scout: an address probed more recently is answered from memory, not probed again |
+| `SCOUT_HALF_LIFE_SECS` | `1800` | Scout: remembered scores fade toward 0.2 (unknown) with this half-life |
+| `SCOUT_IDLE_SECS` | `7200` | Scout: an info-hash nobody asked about for this long is forgotten |
+| `SCOUT_CACHE_MB` | `16` | Scout: memory for remembered scores (about 96 bytes per address) |
+| `SCOUT_MAX_ADDRS` | `1000` | Scout: addresses remembered per info-hash (oldest dead dropped first) |
+| `ALLOW_PRIVATE_PEERS` | `false` | Stream and probe loopback/private peer addresses. Only for local testing |
 | `PEERS_STREAM_SECS` | `30` | Streamed `/peers?ih=`: the response closes after this long (1–120) |
 | `PEERS_PER_IP_PER_MINUTE` | `30` | Streamed `/peers`: requests per minute per client IP, then 429 |
 | `PEERS_STREAMS_PER_IP` | `4` | Streamed `/peers`: concurrent streams per client IP, then 429 |

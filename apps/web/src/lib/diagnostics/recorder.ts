@@ -5,10 +5,10 @@
 // visit record is written at most every 15 s, when the browser is idle,
 // and when the page is hidden.
 
-import type { SwarmSnapshot } from "$lib/magnet/api";
 import type { EngineObserver, EngineSnapshot } from "$lib/torrent/engine";
 import type { FileRange, Metainfo } from "@magnet-stream/engine/metainfo";
-import type { BatchReport } from "$lib/torrent/scheduler";
+import type { LookupFailure, LookupProgress } from "$lib/torrent/lookup-wait";
+import type { MetadataOrigin, SessionDiag } from "$lib/torrent/session-protocol";
 import type { PlayerEvent } from "$lib/player/player";
 import { allVisits, clearVisits, countVisits, pruneVisits, putVisit } from "./db";
 import { detectEnvironment } from "./env";
@@ -17,18 +17,21 @@ import {
 	newId,
 	newPlayback,
 	newRecovery,
+	newSession,
 	newVisit,
 	type Milestone,
 	type RecoveryRecord,
+	type SessionRecord,
 	type Timed,
 	type VisitRecord,
 } from "./records";
-import { MS_BOUNDS, RATE_BOUNDS, add, bump, coarse, hist, scrub } from "./stats";
+import { MS_BOUNDS, RATE_BOUNDS, add, bump, coarse, hist, scrub, type Counts } from "./stats";
 
 const FLUSH_MS = 15_000;
 const KEEP_VISITS = 300;
 const KEEP_DAYS = 90;
 const MAX_RECOVERIES_PER_VISIT = 40;
+const MAX_SESSIONS_PER_VISIT = 40;
 const MAX_ERRORS_PER_VISIT = 20;
 /** Browser notices that aren't bugs. */
 const HARMLESS_ERRORS = /ResizeObserver loop/;
@@ -50,6 +53,8 @@ export class Diagnostics {
 	private identity: { installId: string; salt: string } | null = null;
 	/** Recoveries still open: closing the page ends them. */
 	private readonly live = new Set<RecoveryRecorder>();
+	/** Sessions still open: closing the page ends them. */
+	private readonly liveSessions = new Set<SessionRecorder>();
 	/** The last successful lookup's time, for the next recovery (time from paste to first piece). */
 	private lastLookupMs: number | null = null;
 
@@ -66,6 +71,7 @@ export class Diagnostics {
 		});
 		window.addEventListener("pagehide", () => {
 			for (const recorder of [...this.live]) recorder.end();
+			for (const recorder of [...this.liveSessions]) recorder.end();
 			void this.flush();
 		});
 		setTimeout(
@@ -82,11 +88,23 @@ export class Diagnostics {
 		this.touch();
 	}
 
-	/** One seeder count check (magnet-seeders' /peers). */
-	seedersCount(ms: number, error: string | null): void {
-		if (!this.visit) return;
-		note(this.visit.seedersCount, ms, error);
-		this.touch();
+	/** Diagnostics for one torrent session (a magnet pasted): feed it the session's counters. */
+	session(): SessionRecorder {
+		const record = newSession();
+		if (this.visit) {
+			const sessions = (this.visit.sessions ??= []);
+			if (sessions.length < MAX_SESSIONS_PER_VISIT) sessions.push(record);
+		}
+		const recorder = new SessionRecorder(
+			record,
+			() => this.touch(),
+			() => {
+				this.liveSessions.delete(recorder);
+				void this.flush();
+			},
+		);
+		this.liveSessions.add(recorder);
+		return recorder;
 	}
 
 	/** Something the user did ("magnet_submitted", "file_picked"…). */
@@ -185,6 +203,17 @@ export class Diagnostics {
 		return { metrics: phaseMetrics(recoveries), lastRow: last ? measurementRow(last, BUILD) : null };
 	}
 
+	/** What the latest torrent session uploaded (null: none recorded). */
+	async lastUpload(): Promise<NonNullable<SessionRecord["tunnel"]["upload"]> | null> {
+		await this.flush();
+		let visits = await allVisits().catch(() => [] as VisitRecord[]);
+		const current = this.visit;
+		if (current && this.active) visits = [...visits.filter((v) => v.id !== current.id), current];
+		const sessions = visits.sort((a, b) => a.startedAt - b.startedAt).flatMap((v) => v.sessions ?? []);
+		const last = sessions.sort((a, b) => a.startedAt - b.startedAt).findLast((s) => s.tunnel.upload !== undefined);
+		return last?.tunnel.upload ? { ...last.tunnel.upload } : null;
+	}
+
 	async clear(): Promise<void> {
 		await clearVisits().catch(() => {});
 		if (this.visit) this.visit = newVisit(this.visit.env, BUILD);
@@ -261,36 +290,6 @@ export class RecoveryRecorder implements EngineObserver {
 		this.lastBytesAt = this.started;
 	}
 
-	infoDict(ms: number, error: string | null): void {
-		if (this.ended) return;
-		note(this.record.infoDict, ms, error);
-		if (error === null) this.mark("infoDict");
-		this.changed();
-	}
-
-	swarm(ms: number, snapshot: SwarmSnapshot | null, error: string | null): void {
-		if (this.ended) return;
-		const swarm = this.record.swarm;
-		note(swarm, ms, error);
-		if (snapshot) {
-			this.mark("peers");
-			if (snapshot.complete === false) swarm.partial++;
-			const c = snapshot.counts;
-			swarm.known = Math.max(swarm.known, c.known);
-			swarm.reachable = Math.max(swarm.reachable, c.reachable);
-			swarm.seeds = Math.max(swarm.seeds, c.seeds);
-			swarm.unchoked = Math.max(swarm.unchoked, c.unchoked);
-		}
-		this.changed();
-	}
-
-	workerInfo(maxCandidates: number, ms: number): void {
-		if (this.ended) return;
-		this.record.worker.maxCandidates = maxCandidates;
-		this.record.worker.infoMs = Math.round(ms);
-		this.changed();
-	}
-
 	ready(meta: Metainfo, range: FileRange, verifiedPieces: number): void {
 		if (this.ended) return;
 		const traits = this.record.traits;
@@ -298,22 +297,6 @@ export class RecoveryRecorder implements EngineObserver {
 		traits.torrentSize = coarse(meta.totalLength);
 		traits.files = meta.files.length;
 		traits.resumed = Math.round((100 * verifiedPieces) / (range.lastPiece - range.firstPiece + 1)) / 100;
-		this.changed();
-	}
-
-	batch(report: BatchReport): void {
-		if (this.ended) return;
-		const w = this.record.worker;
-		bump(w.ends, report.kind);
-		if (report.unchokeMs !== null) add(w.unchokeMs, MS_BOUNDS, report.unchokeMs);
-		if (report.urgent) w.urgent++;
-		if (report.hedge) w.hedges++;
-		if (report.fallbackWon) w.fallbackWins++;
-		if (report.stolen) w.stolen++;
-		for (const other of report.others) bump(w.candidates, other.err ?? "unknown", 1, 16);
-		if (report.message) bump(w.messages, scrub(report.message, 120), 1, 10);
-		if (report.winnerClient && report.bytes > 0) bump(w.clients, clientFamily(report.winnerClient));
-		w.bytes += report.bytes;
 		this.changed();
 	}
 
@@ -417,7 +400,6 @@ export class RecoveryRecorder implements EngineObserver {
 		}
 	}
 
-	/** The view closed. */
 	/** What the player reported: no per-frame hooks, a handful of events per video. */
 	playback(event: PlayerEvent): void {
 		// The player closes after the recovery has ended (it unmounts last):
@@ -499,6 +481,97 @@ export class RecoveryRecorder implements EngineObserver {
 	}
 }
 
+/**
+ * One torrent session: the lookup's outcome (and retries), and the
+ * session worker's counters (dials by class and outcome, peers, metadata
+ * source, the scout's stream) as it reports them every few seconds.
+ */
+export class SessionRecorder {
+	private ended = false;
+	private readonly started: number;
+
+	constructor(
+		readonly record: SessionRecord,
+		private readonly changed: () => void,
+		private readonly finished: () => void = () => {},
+		private readonly clock: () => number = () => performance.now(),
+	) {
+		this.started = clock();
+	}
+
+	/** The file list arrived (from the cache, the VPS or a peer). */
+	listed(source: MetadataOrigin): void {
+		if (this.ended || this.record.lookup === "listed") return;
+		this.record.lookup = "listed";
+		this.record.lookupMs = Math.round(this.clock() - this.started);
+		this.record.metadata ??= { source, ms: this.record.lookupMs };
+		this.changed();
+	}
+
+	/** The lookup gave up (the session stays for a retry). */
+	failed(reason: LookupFailure, progress: LookupProgress): void {
+		if (this.ended) return;
+		this.record.lookup = "failed";
+		bump(this.record.failures, reason, 1, 8);
+		this.progress(progress);
+		this.changed();
+	}
+
+	retried(): void {
+		if (this.ended) return;
+		this.record.retries++;
+		this.record.lookup = "running";
+		this.changed();
+	}
+
+	progress(p: LookupProgress): void {
+		const r = this.record.progress;
+		r.found = Math.max(r.found, p.found);
+		r.tried = Math.max(r.tried, p.tried);
+		r.connected = Math.max(r.connected, p.connected);
+	}
+
+	/** The session worker's counters (running totals; peers at once: the most seen). */
+	update(d: SessionDiag): void {
+		if (this.ended) return;
+		const t = this.record.tunnel;
+		t.dials = { scout: copyDials(d.dials.scout), untried: copyDials(d.dials.untried), known: copyDials(d.dials.known) };
+		t.connected = Math.max(t.connected, d.connected);
+		t.unchoked = Math.max(t.unchoked, d.unchoked);
+		t.delivering = Math.max(t.delivering, d.delivering);
+		t.seeds = Math.max(t.seeds, d.seeds);
+		t.firstUnchokeMs ??= d.firstUnchokeMs;
+		t.sockets = Math.max(t.sockets, d.sockets);
+		t.upgrades = Math.max(t.upgrades, d.upgrades);
+		t.messages = Math.max(t.messages, d.messages);
+		t.recycles = Math.max(t.recycles, d.recycles);
+		t.untestedHighWater = Math.max(t.untestedHighWater, d.untestedHighWater);
+		const u = (t.upload ??= { enabled: false, bytes: 0, unchoked: 0, messages: 0 });
+		u.enabled = d.upload.enabled;
+		u.bytes = Math.max(u.bytes, d.upload.bytes);
+		u.unchoked = Math.max(u.unchoked, d.upload.unchoked);
+		u.messages = Math.max(u.messages, d.upload.messages);
+		if (d.metadata) this.record.metadata = { ...d.metadata };
+		this.record.scout = { ...d.scout };
+		this.changed();
+	}
+
+	/** The session closed (another magnet, the page left, inactivity). */
+	end(): void {
+		if (this.ended) return;
+		if (this.record.lookup === "running") this.record.lookup = "left";
+		this.ended = true;
+		this.changed();
+		this.finished();
+	}
+}
+
+function copyDials(d: SessionDiag["dials"]["scout"]): SessionDiag["dials"]["scout"] {
+	const failed: Counts = {};
+	for (const [k, v] of Object.entries(d.failed).slice(0, 16)) failed[scrub(k, 32)] = v;
+	return { attempted: d.attempted, succeeded: d.succeeded, failed };
+}
+
 const HEIGHTS = [240, 360, 480, 576, 720, 1080, 1440, 2160, 4320];
 
 /** 800 (a cropped 1080p) → 1080: common steps only. */
@@ -516,11 +589,6 @@ function note(t: Timed, ms: number, error: string | null): void {
 		t.fail++;
 		bump(t.errors, scrub(error, 120), 1, 10);
 	}
-}
-
-/** "qBittorrent 4.6.2" → "qBittorrent". */
-export function clientFamily(client: string): string {
-	return scrub(client.trim().split(/[\s/(]/)[0] || "unknown", 24);
 }
 
 function extensionOf(path: string): string {

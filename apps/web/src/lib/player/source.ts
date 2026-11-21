@@ -10,6 +10,12 @@ export interface ByteSource {
 	 * Resolves with the count copied (0 past the end); rejects on abort.
 	 */
 	read(offset: number, into: Uint8Array, signal?: AbortSignal): Promise<number>;
+	/**
+	 * Bytes readable at `offset` without waiting, counting no further than
+	 * `limit` (start and rebuffer thresholds, buffering.ts). Absent: every
+	 * byte is (a local file), and playback never waits for a buffer.
+	 */
+	available?(offset: number, limit?: number): number;
 }
 
 /**

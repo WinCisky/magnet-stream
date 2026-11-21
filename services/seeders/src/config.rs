@@ -16,11 +16,13 @@ pub struct Config {
     pub allowed_origins: AllowedOrigins,
     pub default_trackers: Vec<String>,
     pub max_trackers: usize,
-    pub max_cache_entries: u64,
+    /// Byte budget of each discovery result cache (`PEERS_CACHE_MB`).
+    pub peers_cache_bytes: u64,
     pub dht_port: u16,
     /// Max peer probes in flight across all swarms.
     pub probe_concurrency: usize,
-    /// Max peers probed per swarm refresh.
+    /// Max peers probed per swarm refresh, and per info-hash per
+    /// `scout_reprobe` window by the scout.
     pub max_probe_peers: usize,
     pub probe_connect_timeout: Duration,
     /// Hard cap on one probe (connect + handshake + first messages).
@@ -31,12 +33,30 @@ pub struct Config {
     pub refresh_interval: Duration,
     /// A swarm stays active this long after the last client request for it.
     pub active_ttl: Duration,
+    /// A metadata fetch gives up after this long (`METADATA_DEADLINE_MS`).
     pub metadata_deadline: Duration,
+    /// Byte budget of the info dict cache (`METADATA_CACHE_MB`).
     pub metadata_cache_bytes: u64,
+    /// Larger info dicts are served but not cached (`METADATA_CACHE_MAX_ENTRY_MB`).
+    pub metadata_cache_max_entry_bytes: usize,
+    /// Metadata fetches in flight in total (`METADATA_FETCHES`).
+    pub metadata_fetches: usize,
     /// Shared with magnet-worker, which only connects to peers carrying a
     /// token signed with it. Unset: no tokens are issued.
     pub worker_token_secret: Option<Secret>,
     pub token_ttl: Duration,
+    /// Scout: probes in flight per `/peers` stream.
+    pub scout_per_stream: usize,
+    /// Scout: an address probed more recently is not probed again.
+    pub scout_reprobe: Duration,
+    /// Scout: scores fade toward "unknown" with this half-life.
+    pub scout_half_life: Duration,
+    /// Scout: an info-hash nobody asked about for this long is forgotten.
+    pub scout_idle: Duration,
+    /// Scout: byte budget of the scores in memory.
+    pub scout_cache_bytes: u64,
+    /// Scout: addresses remembered per info-hash.
+    pub scout_max_addrs: usize,
     /// Allow probing loopback/private peers. Only for local testing.
     pub allow_private_peers: bool,
     /// Streamed `/peers`: the response closes after this long.
@@ -96,7 +116,38 @@ const DEFAULT_TRACKERS: &[&str] = &[
     "http://tracker.openbittorrent.com:80/announce",
 ];
 
+const MIB: u64 = 1024 * 1024;
+
 impl Config {
+    /// The scout's settings (docs/architecture.md › Scouting on the VPS).
+    pub fn scout_settings(&self) -> crate::scout::ScoutSettings {
+        crate::scout::ScoutSettings {
+            timeouts: crate::probe::ProbeTimeouts {
+                connect: self.probe_connect_timeout,
+                total: self.probe_timeout,
+                unchoke_wait: self.probe_unchoke_wait,
+            },
+            max_per_hash: self.max_probe_peers.max(1),
+            reprobe_after: self.scout_reprobe,
+            half_life: self.scout_half_life,
+            idle: self.scout_idle,
+            cache_bytes: self.scout_cache_bytes,
+            max_addrs: self.scout_max_addrs,
+        }
+    }
+
+    /// The info dict fetches and cache (docs/architecture.md › Scouting on the VPS, Metadata).
+    pub fn info_settings(&self) -> crate::info::InfoSettings {
+        crate::info::InfoSettings {
+            deadline: self.metadata_deadline,
+            cache_bytes: self.metadata_cache_bytes,
+            max_entry_bytes: self.metadata_cache_max_entry_bytes,
+            fetches: self.metadata_fetches,
+            parallel: 3,
+            connect_timeout: self.probe_connect_timeout,
+        }
+    }
+
     pub fn from_env() -> Self {
         Config {
             bind_addr: env_parse("BIND_ADDR", "0.0.0.0:8080".parse().unwrap()),
@@ -106,7 +157,7 @@ impl Config {
             allowed_origins: AllowedOrigins::from_env(),
             default_trackers: default_trackers_from_env(),
             max_trackers: env_parse("MAX_TRACKERS", 20usize),
-            max_cache_entries: env_parse("MAX_CACHE_ENTRIES", 50_000u64),
+            peers_cache_bytes: env_parse("PEERS_CACHE_MB", 16u64).max(1) * MIB,
             dht_port: env_parse("DHT_PORT", 6881u16),
             probe_concurrency: env_parse("PROBE_CONCURRENCY", 256usize).max(1),
             max_probe_peers: env_parse("MAX_PROBE_PEERS", 1000usize),
@@ -115,14 +166,23 @@ impl Config {
             probe_unchoke_wait: env_millis("PROBE_UNCHOKE_WAIT_MS", 2500),
             refresh_interval: env_secs("REFRESH_INTERVAL_SECS", 300),
             active_ttl: env_secs("ACTIVE_TTL_SECS", 1800),
-            metadata_deadline: env_millis("METADATA_DEADLINE_MS", 12_000),
-            metadata_cache_bytes: env_parse("METADATA_CACHE_MB", 256u64) * 1024 * 1024,
+            metadata_deadline: env_millis("METADATA_DEADLINE_MS", 15_000),
+            metadata_cache_bytes: env_parse("METADATA_CACHE_MB", 32u64).max(1) * MIB,
+            metadata_cache_max_entry_bytes: (env_parse("METADATA_CACHE_MAX_ENTRY_MB", 4u64).max(1)
+                * MIB) as usize,
+            metadata_fetches: env_parse("METADATA_FETCHES", 4usize).max(1),
             worker_token_secret: env::var("WORKER_TOKEN_SECRET")
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .map(Secret),
             token_ttl: env_secs("TOKEN_TTL_SECS", 900),
+            scout_per_stream: env_parse("SCOUT_PER_STREAM", 64usize).max(1),
+            scout_reprobe: env_secs("SCOUT_REPROBE_SECS", 600),
+            scout_half_life: env_secs("SCOUT_HALF_LIFE_SECS", 1800).max(Duration::from_secs(1)),
+            scout_idle: env_secs("SCOUT_IDLE_SECS", 7200).max(Duration::from_secs(1)),
+            scout_cache_bytes: env_parse("SCOUT_CACHE_MB", 16u64).max(1) * MIB,
+            scout_max_addrs: env_parse("SCOUT_MAX_ADDRS", 1000usize).max(1),
             allow_private_peers: env_parse("ALLOW_PRIVATE_PEERS", false),
             peers_stream_deadline: env_secs("PEERS_STREAM_SECS", 30)
                 .clamp(Duration::from_secs(1), Duration::from_secs(120)),

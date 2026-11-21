@@ -23,7 +23,8 @@ const { values } = parseArgs({
 
 if (values.help) {
 	console.log(`usage: fake-peer [--port N] [--host IP] [--size 8MiB] [--seed N] [--piece-length 256KiB] [--v2 | --hybrid]
-                 [--behaviour unchokeDelayMs=500] [--behaviour corrupt=true] [--behaviour have=0,2,4] ...`);
+                 [--behaviour unchokeDelayMs=500] [--behaviour corrupt=true] [--behaviour have=0,2,4]
+                 [--behaviour titForTat=true] (a leecher that unchokes only peers that upload to it) ...`);
 	process.exit(0);
 }
 

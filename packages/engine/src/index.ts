@@ -12,12 +12,14 @@ export * from "./peer-book.ts";
 export * from "./score.ts";
 export * from "./slots.ts";
 export * from "./upstream.ts";
+export * from "./picker.ts";
 export * from "./connection-manager.ts";
 export * from "./peers-stream.ts";
 export * from "./magnet.ts";
 export * from "./metadata.ts";
 export * from "./verify.ts";
 export * from "./hashes.ts";
+export * from "./attribution.ts";
 export {
 	BLOCK_SIZE,
 	MetainfoError,
@@ -49,3 +51,4 @@ export {
 	type BencodeInput,
 	type Bencoded,
 } from "./bencode.ts";
+export * from "./upload.ts";

@@ -138,6 +138,7 @@ peer-wire stream that follows them.
 | 5    | `INTERNAL_ERROR` | anything else |
 | 6    | `IDLE`           | no byte either way on this connection for the idle timeout (90 s) |
 | 7    | `SESSION_TIMEOUT`| the session reached its maximum length (2 h) |
+| 8    | `WRITE_OVERFLOW` | the peer does not read: more bytes than the gateway's bound (4 MiB) waited to be written to it (see *Rules*) |
 
 Receivers treat unknown codes as `INTERNAL_ERROR` (forward compatibility);
 the decoder accepts any byte value.
@@ -166,6 +167,16 @@ made precise here:
   gateway picks ids for `accept` in 0x8000–0xffff; 0 is the session and
   only carries `ping`. An id is reusable once its `failed`/`close` has
   been sent or received.
+- **Bytes held for a peer (gateway).** Peer-wire bytes the client sends
+  are written to the peer in order; those not written yet (the peer reads
+  slowly or not at all, the TCP window is full) are held by the gateway,
+  at most 4 MiB per connection (default, `TUNNEL_MAX_PENDING_WRITE_BYTES`
+  on the Cloudflare gateway). A `data` frame that would take a connection
+  past the bound is not written: the connection is closed with `close`
+  WRITE_OVERFLOW, and the other connections of the WebSocket go on. The
+  client keeps far below it (its upload is capped at 2 MiB/s in total,
+  docs/architecture.md §Chunk recovery › Reciprocation), so only a peer
+  that stopped reading hits it.
 - **close** is final and needs no reply. Either side may send it; the
   gateway closes the TCP socket on receipt.
 - **ping** (browser → gateway, as in the architecture) keeps the session

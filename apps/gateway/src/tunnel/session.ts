@@ -10,6 +10,9 @@
 //   - at most 6 connections per WebSocket (a slot frees once its socket closed);
 //   - only public addresses on ports >= 1024 (address-policy.ts);
 //   - a malformed frame closes the whole session;
+//   - bytes held for a peer and not yet written to it are bounded (4 MiB):
+//     a peer that does not read is closed (`close` WRITE_OVERFLOW), the
+//     other connections go on;
 //   - a connection with no traffic either way for the idle timeout (90 s)
 //     is closed (`close` IDLE), and so is a WebSocket on which the client
 //     sent nothing for that long (the client pings every 30 s when quiet);
@@ -21,6 +24,7 @@
 import {
 	CloseReason,
 	DEFAULT_IDLE_TIMEOUT_MS,
+	DEFAULT_MAX_PENDING_WRITE_BYTES,
 	FailReason,
 	MAX_CONNECTIONS_PER_SOCKET,
 	SessionCloseCode,
@@ -69,6 +73,8 @@ export interface SessionOptions {
 	idleTimeoutMs?: number;
 	/** A connect that timed out keeps its slot until this long after it started (default 20 s, OQ-03). */
 	failedConnectHoldMs?: number;
+	/** Bytes held for a peer and not yet written; past this the connection is closed (default 4 MiB). */
+	maxPendingWriteBytes?: number;
 	/** Clock for the idle checks (default Date.now). */
 	now?: () => number;
 	/** Structured log sink. Never receives addresses, info-hashes or client IPs. */
@@ -86,6 +92,8 @@ interface Conn {
 	reader?: ReadableStreamDefaultReader<Uint8Array>;
 	writer?: WritableStreamDefaultWriter<Uint8Array>;
 	writes: Promise<void>;
+	/** Bytes queued for the peer and not yet written (the TCP socket took them). */
+	pending: number;
 	/** Last byte relayed either way (or the `opened`), for the idle timeout. */
 	lastActivity: number;
 }
@@ -127,6 +135,7 @@ export class TunnelSession {
 		opened: 0,
 		failed: 0,
 		idleClosed: 0,
+		overflowClosed: 0,
 	};
 
 	constructor(io: SessionIo, options: SessionOptions) {
@@ -138,6 +147,7 @@ export class TunnelSession {
 			maxConnections: MAX_CONNECTIONS_PER_SOCKET,
 			idleTimeoutMs: DEFAULT_IDLE_TIMEOUT_MS,
 			failedConnectHoldMs: 20_000,
+			maxPendingWriteBytes: DEFAULT_MAX_PENDING_WRITE_BYTES,
 			now: Date.now,
 			...options,
 		};
@@ -260,7 +270,7 @@ export class TunnelSession {
 		if (this.slots >= this.opts.maxConnections) return this.fail(frame.conn, FailReason.TOO_MANY_CONNECTIONS);
 		if (checkAddress(frame.address, this.opts.allowPrivate) !== "ok") return this.fail(frame.conn, FailReason.FORBIDDEN_ADDRESS);
 
-		const c: Conn = { id: frame.conn, state: "opening", writes: Promise.resolve(), lastActivity: this.opts.now() };
+		const c: Conn = { id: frame.conn, state: "opening", writes: Promise.resolve(), pending: 0, lastActivity: this.opts.now() };
 		this.conns.set(c.id, c);
 		this.slots++;
 		const started = Date.now();
@@ -361,13 +371,26 @@ export class TunnelSession {
 		}
 	}
 
-	/** Client → remote, writes kept in order. */
+	/**
+	 * Client → remote, writes kept in order. What the peer has not taken yet
+	 * is bounded: a peer that does not read is closed (WRITE_OVERFLOW)
+	 * instead of growing the gateway's memory.
+	 */
 	private write(c: Conn, payload: Uint8Array): void {
+		if (c.pending + payload.length > this.opts.maxPendingWriteBytes) {
+			this.stats.overflowClosed++;
+			this.end(c, CloseReason.WRITE_OVERFLOW, true);
+			return;
+		}
 		this.stats.bytesUp += payload.length;
+		c.pending += payload.length;
 		c.lastActivity = this.opts.now();
 		const writer = c.writer!;
 		c.writes = c.writes
 			.then(() => writer.write(payload))
+			.then(() => {
+				c.pending -= payload.length;
+			})
 			.catch(() => {
 				if (c.state === "open") this.end(c, CloseReason.REMOTE_ERROR, true);
 			});

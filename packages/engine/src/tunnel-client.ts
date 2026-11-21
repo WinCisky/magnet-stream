@@ -18,7 +18,7 @@ import {
 	type PeerAddress,
 } from "@magnet-stream/tunnel-protocol";
 import { BufferedTransport, type HandshakeInfo } from "./transport.ts";
-import { UpstreamBatcher } from "./upstream.ts";
+import { UpstreamBatcher, type FlushMode } from "./upstream.ts";
 
 /** The part of the WebSocket API the client uses (browser, worker or Node). */
 export interface WebSocketLike {
@@ -51,6 +51,8 @@ export interface TunnelStats {
 	framesReceived: number;
 	bytesSent: number;
 	bytesReceived: number;
+	/** Messages that carried only lazy frames (upload, `have`s): what the upload cost in messages. */
+	lazyMessages: number;
 }
 
 export interface TunnelClientOptions {
@@ -60,6 +62,8 @@ export interface TunnelClientOptions {
 	 * so existing callers stay synchronous). The connection manager uses 400.
 	 */
 	batchMs?: number;
+	/** With batching: lazy frames (upload) alone are flushed at most this often (default 2000). */
+	lazyMs?: number;
 	/** Clock for the held slots (tests). */
 	now?: () => number;
 }
@@ -107,7 +111,7 @@ interface Pending {
 }
 
 export class TunnelClient {
-	readonly stats: TunnelStats = { messagesSent: 0, framesSent: 0, messagesReceived: 0, framesReceived: 0, bytesSent: 0, bytesReceived: 0 };
+	readonly stats: TunnelStats = { messagesSent: 0, framesSent: 0, messagesReceived: 0, framesReceived: 0, bytesSent: 0, bytesReceived: 0, lazyMessages: 0 };
 	private readonly ws: WebSocketLike;
 	private readonly pending = new Map<number, Pending>();
 	private readonly transports = new Map<number, TunnelTransport>();
@@ -133,7 +137,7 @@ export class TunnelClient {
 		this.now = options.now ?? Date.now;
 		this.maxConnections = options.maxConnections ?? MAX_CONNECTIONS_PER_SOCKET;
 		if (options.batchMs !== undefined && options.batchMs > 0) {
-			this.batcher = new UpstreamBatcher({ intervalMs: options.batchMs, send: (frames) => this.writeNow(frames) });
+			this.batcher = new UpstreamBatcher({ intervalMs: options.batchMs, lazyMs: options.lazyMs, send: (frames) => this.writeNow(frames) });
 		}
 		ws.binaryType = "arraybuffer";
 		ws.addEventListener("message", (e) => this.onMessage(e.data));
@@ -214,11 +218,13 @@ export class TunnelClient {
 		this.end();
 	}
 
-	/** @internal Queue frames. `urgent` flushes the batch immediately. */
-	send(frames: Frame[], urgent = false): void {
+	/** @internal Queue frames. `urgent` flushes the batch immediately; `lazy` waits for the next message (or 2 s). */
+	send(frames: Frame[], mode: FlushMode | boolean = "normal"): void {
 		if (this.ended || this.ws.readyState !== WS_OPEN) return;
-		if (this.batcher) this.batcher.enqueue(frames, urgent);
-		else this.writeNow(frames);
+		if (this.batcher) {
+			this.batcher.enqueue(frames, mode);
+			this.stats.lazyMessages = this.batcher.lazyMessages;
+		} else this.writeNow(frames);
 	}
 
 	/** A ping if this socket has been quiet for `interval` (no-op while a batch is waiting). */
@@ -229,6 +235,7 @@ export class TunnelClient {
 
 	private writeNow(frames: Frame[]): void {
 		if (this.ended || this.ws.readyState !== WS_OPEN || frames.length === 0) return;
+		if (this.batcher) this.stats.lazyMessages = this.batcher.lazyMessages;
 		const message = encodeFrames(frames);
 		this.stats.messagesSent++;
 		this.stats.framesSent += frames.length;
@@ -359,20 +366,24 @@ export class TunnelTransport extends BufferedTransport {
 	}
 
 	send(bytes: Uint8Array): void {
-		this.write(bytes, false);
+		this.write(bytes, "normal");
 	}
 
 	sendUrgent(bytes: Uint8Array): void {
-		this.write(bytes, true);
+		this.write(bytes, "urgent");
 	}
 
-	private write(bytes: Uint8Array, urgent: boolean): void {
+	sendLazy(bytes: Uint8Array): void {
+		this.write(bytes, "lazy");
+	}
+
+	private write(bytes: Uint8Array, mode: FlushMode): void {
 		if (this.closed) return;
 		const frames: Frame[] = [];
 		for (let at = 0; at < bytes.length; at += MAX_DATA_FRAME) {
 			frames.push({ type: "data", conn: this.conn, payload: bytes.subarray(at, at + MAX_DATA_FRAME) });
 		}
-		if (frames.length > 0) this.client.send(frames, urgent);
+		if (frames.length > 0) this.client.send(frames, mode);
 	}
 
 	close(): void {

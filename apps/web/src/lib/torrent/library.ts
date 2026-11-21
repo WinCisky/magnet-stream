@@ -1,222 +1,107 @@
-// The videos saved in this browser. Each torrent's verified pieces sit in
-// its own Cache Storage cache (see store.ts), next to a record of the files
-// opened from it, so they can be listed, reopened and deleted file by file.
-// Pieces at a file's edges may be shared with the neighbouring file: deleting
-// a file keeps the ones another saved file still needs.
+// The page's handle on the saved-videos library (library-core.ts, run in
+// library.worker.ts). Pieces live in OPFS, one torrent per sparse file; a
+// video stays saved, even partly, until the user deletes it (OQ-13).
 
-import { PIECE_CACHE_PREFIX, openPieceStore, pieceOfUrl, pieceUrl } from "./store";
 import { fileBytes } from "./download";
+import type { SavedFile, SavedFileRecord, SavedLibrary, SavedProgress, UnnamedTorrent } from "./library-core.ts";
+import { PageSession } from "./page-session";
+import { StoreError, type StoreErrorCode } from "./piece-file.ts";
+import LibraryWorker from "./library.worker.ts?worker&inline";
 
-export interface SavedFileRecord {
-	/** Index in the magnet's file listing (the page's `file` URL parameter). */
-	index: number;
-	path: string;
-	/** Byte range within the torrent, from the verified info dict. */
-	offset: number;
-	size: number;
-	openedAt: number;
-}
+export { exclusivePieces, fileProgress, pieceSpan } from "./library-core.ts";
+export type { SavedFile, SavedFileRecord, SavedLibrary, SavedProgress, UnnamedTorrent };
 
-interface TorrentRecord {
-	v: 1;
-	name: string;
-	magnet: string;
-	pieceLength: number;
-	files: SavedFileRecord[];
-}
-
-export interface SavedProgress {
-	savedBytes: number;
-	size: number;
-	complete: boolean;
-}
-
-export interface SavedFile extends SavedFileRecord, SavedProgress {
-	infoHash: string;
-	torrentName: string;
-	magnet: string;
-}
-
-/** Pieces saved before files were recorded: no name, can only be deleted. */
-export interface UnnamedTorrent {
-	infoHash: string;
-	pieces: number;
-}
-
-export interface SavedLibrary {
-	/** Most recently opened first; files with nothing saved are left out. */
-	files: SavedFile[];
-	unnamed: UnnamedTorrent[];
-}
-
-const DELETE_PARALLEL = 64;
+let worker: Worker | undefined;
+let nextReq = 1;
+const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
 
 export function libraryAvailable(): boolean {
-	return typeof caches !== "undefined";
+	return typeof navigator !== "undefined" && typeof navigator.storage?.getDirectory === "function" && typeof Worker !== "undefined";
+}
+
+function call<T>(op: string, args: Record<string, unknown> = {}): Promise<T> {
+	if (!libraryAvailable()) return Promise.reject(new StoreError("unavailable", "This browser doesn't let the page save anything"));
+	if (!worker) {
+		worker = new LibraryWorker();
+		worker.onmessage = (event: MessageEvent) => {
+			const msg = event.data as { req: number; ok: boolean; value?: unknown; code?: StoreErrorCode; message?: string };
+			const p = pending.get(msg.req);
+			if (!p) return;
+			pending.delete(msg.req);
+			if (msg.ok) p.resolve(msg.value);
+			else p.reject(new StoreError(msg.code ?? "io", msg.message ?? "storage error"));
+		};
+	}
+	const req = nextReq++;
+	return new Promise<T>((resolve, reject) => {
+		pending.set(req, { resolve: resolve as (value: unknown) => void, reject });
+		worker!.postMessage({ req, op, args });
+	});
+}
+
+/**
+ * Deletes fail while a session holds the torrent's files open: ask the
+ * sessions to let go of the files they aren't writing, then try again once.
+ */
+async function deleting(run: () => Promise<void>): Promise<void> {
+	try {
+		await run();
+	} catch (e) {
+		if (!(e instanceof StoreError) || e.code !== "busy") throw e;
+		await PageSession.releaseStores();
+		try {
+			await run();
+		} catch (again) {
+			if (again instanceof StoreError && again.code === "busy") throw new Error("This video is being recovered right now: close it, then delete it.", { cause: again });
+			throw again;
+		}
+	}
 }
 
 /** Record that a file of this torrent is being recovered (and when). */
-export async function rememberFile(
+export function rememberFile(
 	infoHash: string,
-	torrent: { name: string; magnet: string; pieceLength: number },
+	torrent: { name: string; magnet: string; pieceLength: number; totalLength: number },
 	file: Omit<SavedFileRecord, "openedAt">,
 ): Promise<void> {
-	const cache = await caches.open(PIECE_CACHE_PREFIX + infoHash);
-	const previous = await readRecord(cache, infoHash);
-	const record: TorrentRecord = {
-		v: 1,
-		...torrent,
-		files: [
-			...(previous?.files.filter((f) => f.index !== file.index) ?? []),
-			{ ...file, openedAt: Date.now() },
-		],
-	};
-	await writeRecord(cache, infoHash, record);
+	return call("remember", { infoHash, torrent, file });
 }
 
 export async function listSaved(): Promise<SavedLibrary> {
-	const library: SavedLibrary = { files: [], unnamed: [] };
-	if (!libraryAvailable()) return library;
-	for (const name of await caches.keys()) {
-		if (!name.startsWith(PIECE_CACHE_PREFIX)) continue;
-		const infoHash = name.slice(PIECE_CACHE_PREFIX.length);
-		const cache = await caches.open(name);
-		const [record, stored] = await Promise.all([readRecord(cache, infoHash), storedPieces(cache)]);
-		if (!record) {
-			if (stored.size > 0) library.unnamed.push({ infoHash, pieces: stored.size });
-			continue;
-		}
-		for (const file of record.files) {
-			const progress = fileProgress(file, record.pieceLength, stored);
-			if (progress.savedBytes === 0) continue;
-			library.files.push({ ...file, ...progress, infoHash, torrentName: record.name, magnet: record.magnet });
-		}
-	}
-	library.files.sort((a, b) => b.openedAt - a.openedAt);
-	return library;
+	if (!libraryAvailable()) return { files: [], unnamed: [] };
+	return call("list");
 }
 
 /** How much of each recorded file of one torrent is saved, by file index. */
 export async function savedProgress(infoHash: string): Promise<Map<number, SavedProgress>> {
-	const progress = new Map<number, SavedProgress>();
-	if (!libraryAvailable() || !(await caches.has(PIECE_CACHE_PREFIX + infoHash))) return progress;
-	const cache = await caches.open(PIECE_CACHE_PREFIX + infoHash);
-	const [record, stored] = await Promise.all([readRecord(cache, infoHash), storedPieces(cache)]);
-	for (const file of record?.files ?? []) {
-		const p = fileProgress(file, record!.pieceLength, stored);
-		if (p.savedBytes > 0) progress.set(file.index, p);
-	}
-	return progress;
+	if (!libraryAvailable()) return new Map();
+	return call("progress", { infoHash });
 }
 
-/** A saved file's bytes, for a download (every piece must be saved). */
+/** Verified pieces saved for this torrent (from any session). */
+export async function storedPieces(infoHash: string): Promise<number[]> {
+	if (!libraryAvailable()) return [];
+	return call("pieces", { infoHash });
+}
+
+/** A saved file's bytes, for a download (every piece must be saved), read a piece at a time. */
 export async function savedFileBytes(infoHash: string, index: number): Promise<ReadableStream<Uint8Array>> {
-	const cache = await caches.open(PIECE_CACHE_PREFIX + infoHash);
-	const record = await readRecord(cache, infoHash);
-	const file = record?.files.find((f) => f.index === index);
-	if (!record || !file) throw new Error("This video isn't saved anymore");
-	const store = await openPieceStore(infoHash);
-	return fileBytes((piece) => store.get(piece), file, record.pieceLength);
+	const { file, pieceLength } = await call<{ file: SavedFileRecord; pieceLength: number }>("file", { infoHash, index });
+	const load = (piece: number) => call<Uint8Array>("read", { infoHash, start: piece * pieceLength, end: (piece + 1) * pieceLength, pieceLength }).then((b) => (b.length > 0 ? b : undefined));
+	return fileBytes(load, file, pieceLength);
 }
 
 /** Delete one file's pieces, keeping those another saved file still covers. */
-export async function deleteSavedFile(infoHash: string, index: number): Promise<void> {
-	const name = PIECE_CACHE_PREFIX + infoHash;
-	const cache = await caches.open(name);
-	const record = await readRecord(cache, infoHash);
-	const target = record?.files.find((f) => f.index === index);
-	if (!record || !target) return;
-	const others = record.files.filter((f) => f !== target);
-	const stored = await storedPieces(cache);
-	if (others.every((f) => fileProgress(f, record.pieceLength, stored).savedBytes === 0)) {
-		await caches.delete(name);
-		return;
-	}
-	// Forget the file first: an interrupted delete leaves orphan pieces, not
-	// a listed file with holes in it.
-	await writeRecord(cache, infoHash, { ...record, files: others });
-	const doomed = exclusivePieces(target, others, record.pieceLength).filter((p) => stored.has(p));
-	for (let i = 0; i < doomed.length; i += DELETE_PARALLEL) {
-		await Promise.all(doomed.slice(i, i + DELETE_PARALLEL).map((p) => cache.delete(pieceUrl(infoHash, p))));
-	}
+export function deleteSavedFile(infoHash: string, index: number): Promise<void> {
+	return deleting(() => call("delete-file", { infoHash, index }));
 }
 
-export async function deleteSavedTorrent(infoHash: string): Promise<void> {
-	await caches.delete(PIECE_CACHE_PREFIX + infoHash);
+export function deleteSavedTorrent(infoHash: string): Promise<void> {
+	return deleting(() => call("delete-torrent", { infoHash }));
 }
 
-export async function deleteAllSaved(): Promise<void> {
-	if (!libraryAvailable()) return;
-	const names = (await caches.keys()).filter((n) => n.startsWith(PIECE_CACHE_PREFIX));
-	await Promise.all(names.map((n) => caches.delete(n)));
-}
-
-/** First and last piece holding bytes of a file. */
-export function pieceSpan(file: { offset: number; size: number }, pieceLength: number): [number, number] {
-	const first = Math.floor(file.offset / pieceLength);
-	return [first, Math.max(first, Math.floor((file.offset + Math.max(file.size, 1) - 1) / pieceLength))];
-}
-
-export function fileProgress(
-	file: { offset: number; size: number },
-	pieceLength: number,
-	stored: Set<number>,
-): SavedProgress {
-	const [first, last] = pieceSpan(file, pieceLength);
-	const end = file.offset + file.size;
-	let savedBytes = 0;
-	let complete = true;
-	for (let p = first; p <= last; p++) {
-		if (!stored.has(p)) {
-			complete = false;
-			continue;
-		}
-		savedBytes += Math.min((p + 1) * pieceLength, end) - Math.max(p * pieceLength, file.offset);
-	}
-	return { savedBytes: Math.max(0, savedBytes), size: file.size, complete };
-}
-
-/** A file's pieces that none of the other files overlaps. */
-export function exclusivePieces(
-	target: { offset: number; size: number },
-	others: { offset: number; size: number }[],
-	pieceLength: number,
-): number[] {
-	const spans = others.map((f) => pieceSpan(f, pieceLength));
-	const [first, last] = pieceSpan(target, pieceLength);
-	const pieces: number[] = [];
-	for (let p = first; p <= last; p++) {
-		if (!spans.some(([a, b]) => p >= a && p <= b)) pieces.push(p);
-	}
-	return pieces;
-}
-
-function recordUrl(infoHash: string): string {
-	return `https://magnet-watcher.pieces/${infoHash}/files`;
-}
-
-async function readRecord(cache: Cache, infoHash: string): Promise<TorrentRecord | null> {
-	try {
-		const res = await cache.match(recordUrl(infoHash));
-		const record = res ? ((await res.json()) as TorrentRecord) : null;
-		return record?.v === 1 && Array.isArray(record.files) && record.pieceLength > 0 ? record : null;
-	} catch {
-		return null;
-	}
-}
-
-async function writeRecord(cache: Cache, infoHash: string, record: TorrentRecord): Promise<void> {
-	await cache.put(
-		recordUrl(infoHash),
-		new Response(JSON.stringify(record), { headers: { "content-type": "application/json" } }),
-	);
-}
-
-async function storedPieces(cache: Cache): Promise<Set<number>> {
-	const pieces = new Set<number>();
-	for (const req of await cache.keys()) {
-		const piece = pieceOfUrl(req.url);
-		if (piece !== null) pieces.add(piece);
-	}
-	return pieces;
+/** Everything saved in this browser, in one action. */
+export function deleteAllSaved(): Promise<void> {
+	if (!libraryAvailable()) return Promise.resolve();
+	return deleting(() => call("delete-all"));
 }

@@ -26,6 +26,11 @@ export interface Transport {
 	send(bytes: Uint8Array): void;
 	/** Skip upstream batching (a cancel after a seek). Optional: direct transports have nothing to skip. */
 	sendUrgent?(bytes: Uint8Array): void;
+	/**
+	 * Upload traffic (pieces, `have`s, choke/unchoke, rejects): may wait for
+	 * the next upstream message, or up to 2 s. Optional: direct transports send at once.
+	 */
+	sendLazy?(bytes: Uint8Array): void;
 	/** Close the stream (idempotent). */
 	close(): void;
 	/** Start receiving. Bytes that arrived earlier are delivered first. */

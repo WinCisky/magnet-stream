@@ -4,6 +4,7 @@ import { defineConfig } from 'astro/config';
 import svelte from '@astrojs/svelte';
 import tailwindcss from '@tailwindcss/vite';
 import { libmediaChunks } from './scripts/vite-libmedia.mjs';
+import { streamWorker } from './scripts/stream-sw.mjs';
 
 // https://astro.build/config
 export default defineConfig({
@@ -11,12 +12,15 @@ export default defineConfig({
   // SITE_URL is the public address, set by the deploy workflow; unset in dev.
   site: process.env.SITE_URL || undefined,
   base: '/',
-  integrations: [svelte()],
+  // streamWorker: /stream-sw.js, the range-serving service worker (M3-05).
+  integrations: [svelte(), streamWorker()],
 
   vite: {
     server: {
-      // Dev has no _headers file. Without CORP the isolated page cannot
-      // load the session worker (ERR_BLOCKED_BY_RESPONSE).
+      // Dev has no _headers file (public/_headers is what Pages sends):
+      // the same isolation headers, so the page is crossOriginIsolated in
+      // dev too. Without CORP the isolated page cannot load the session
+      // worker (ERR_BLOCKED_BY_RESPONSE).
       headers: {
         "Cross-Origin-Opener-Policy": "same-origin",
         "Cross-Origin-Embedder-Policy": "require-corp",
