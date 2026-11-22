@@ -44,7 +44,10 @@ never unchoke, 3 dead addresses; from M3-12 also a tit-for-tat leecher
 (second half) that the page uploads to ("Share with peers" on, the
 default), so the counted requests include the upload's flushes. The run
 also checks that with the setting off the leecher gets no bitfield, have,
-unchoke or piece. Everything runs locally (fake peers,
+unchoke or piece. From M3-07 one fast seed is paced (2 ms per block): with
+fast peers kept 4 MiB deep, 128 MiB took ~5 s, too short for the
+tit-for-tat exchange (upload alone is flushed every 2 s). Everything runs
+locally (fake peers,
 `wrangler dev`, `astro dev`, Chromium), so only number 3 says much about
 production; 1 and 2 catch regressions.
 
@@ -52,6 +55,7 @@ production; 1 and 2 catch regressions.
 |---|---|---|---|---|---|---|---|---|
 | 2026-11-18 | M2 (M2-09) | working tree, local run | 128 MiB | 1.2 | 6.6 | 28.3 | 28.3 (1 WebSocket, 56 messages) | 40 |
 | 2026-11-21 | M3 (M3-12) | working tree, local run | 128 MiB | 1.4 | 16.6 | 34.9 | 34.6 (3 WebSockets; 0.39 MB uploaded, 5 upload-only messages) | 40 |
+| 2026-11-22 | M3 (M3-07) | working tree, local run | 128 MiB | 1.4 | 17.9 | 34.8 | 34.6 (3 WebSockets, 33 messages; 0.26 MB uploaded, 4 upload-only messages) | 40 |
 
 ## Real-world
 
@@ -74,8 +78,19 @@ and where it ran (production, or local stack against real peers).
 | 2026-11-18 | 2026-11-18T22:48Z | 1000 MB | 49 / 1 | 24.7 | 5.5 | 23.1 | left | M2 | many seeders | local stack, real peers |
 | 2026-11-18 | 2026-11-18T22:48Z | 740 MB | 56 / 2 | 35.2 | 2.0 | 56.9 | left | M2 | few seeders | local stack, real peers |
 | 2026-11-18 | 2026-11-18T22:48Z | 1900 MB | 406 / 2 | 4.2 | 4.4 | 22.6 | left | M2 | many seeders | local stack, real peers |
+| 2026-11-22 | 2026-11-22T14:04Z | 740 MB | 62 / 2 | 1.8 | 4.1 | 14.1 | left | M3 | few seeders | local stack, real peers |
+| 2026-11-22 | 2026-11-22T14:04Z | 2600 MB | 48 / 0 | n/a | 0.0 | n/a | left | M3 | few seeders (1 alive, stopped serving) | local stack, real peers |
+| 2026-11-22 | 2026-11-22T14:04Z | 1000 MB | 36 / 2 | 2.0 | 9.3 | 14.3 | left | M3 | many seeders | local stack, real peers |
+| 2026-11-22 | 2026-11-22T14:04Z | 1900 MB | 436 / 12 | 9.0 | 8.1 | 19.0 | left | M3 | many seeders | local stack, real peers |
+| 2026-11-22 | 2026-11-22T14:04Z | 2600 MB | 48 / 0 | n/a | 0.0 | n/a | left | M3 | few seeders (1 alive, stopped serving) | local stack, real peers |
+| 2026-11-22 | 2026-11-22T14:36Z | 88000 MB | 2104 / 11 | 25.9 | 9.4 | 20.4 | left | M3 | many seeders | local stack, real peers |
+| 2026-11-22 | 2026-11-22T14:36Z | 4700 MB | 2576 / 17 | 13.9 | 8.9 | 20.9 | left | M3 | many seeders | local stack, real peers |
+| 2026-11-22 | 2026-11-22T14:36Z | 3400 MB | 3000 / 20 | 3.9 | 10.5 | 16.7 | complete | M3 | many seeders | local stack, real peers |
+| 2026-11-22 | 2026-11-22T14:36Z | 4400 MB | 61 / 3 | 12.8 | 8.5 | 17.9 | left | M3 | few seeders | local stack, real peers |
+| 2026-11-22 | 2026-11-22T14:36Z | 9200 MB | 3000 / 11 | 15.0 | 9.1 | 20.3 | running (from the report) | M3 | many leechers, no seed connected | local stack, real peers |
+| 2026-11-22 | 2026-11-22T14:36Z | 6100 MB | 3 / 1 | 45.9 | 0.07 | 436 | running (from the report) | M3 | one slow seed | local stack, real peers |
 
-### M2 review notes (2026-11-18, the four rows above)
+### M2 review notes (2026-11-18, the first series of rows above)
 
 Totals of the second series (3 videos): first piece median 51.6 s, 1.23 MB/s,
 75.2 billed requests per GB (58.4 requests for 776 MB): **over the budget**.
@@ -158,7 +173,111 @@ the budget stays 40/GB for every swarm (decision of 2026-11-18).
   at once. `npm run e2e:scout -w tools/e2e` (part of `npm run e2e`) prints
   the dials by class and outcome and the upstream messages.
 
-To do: a fourth series on the current build, rows here.
+### Fourth series (builds 2026-11-22T14:04Z and 14:36Z, M3 review M3-07)
+
+M3 build (scout, VPS `info` line, deadline picker, OPFS + IndexedDB, upload
+on), local stack against real peers, Chrome 158 on Linux, two diagnostics
+reports: the four M2 torrents again (7 sessions), then six new torrents
+(10 sessions), from 48 to 3,000 known peers. The last two rows above are
+computed from the exported report with the definitions of this page (their
+recoveries were still running, so the menu did not offer a row).
+
+Totals of the second report (8 recoveries, 12.1 GB): first piece median
+**13.9 s** (p90 45.9 s), **5.9 MB/s**, **20.8 billed requests per GB** (252
+requests: 23 upgrades, 4,576 messages); first report: 2.0 s, 5.35 MB/s,
+19.7/GB. No time without data for 98% of the recovering time.
+
+| Torrent | M2, third series (known / delivered, MB/s, req/GB) | M3 |
+|---|---|---|
+| 740 MB, few seeders | 56 / 2, 2.0, 56.9 | 62 / 2, 4.1, 14.1 |
+| 1000 MB, many seeders | 49 / 1, 5.5, 23.1 | 36 / 2, 9.3, 14.3 |
+| 1900 MB, many seeders | 406 / 2, 4.4, 22.6 | 436 / 12, 8.1, 19.0 |
+| 2600 MB, few seeders | 48 / 2, 1.7, 41.1 | 48 / 0 (9.9 MB, then the only seed left) |
+
+Against the 2026-11-19 diagnostics that motivated OQ-21 (4400 MB, 1,582
+known / 2 delivered, 0.07 MB/s): the large swarms now have 11–20 peers
+delivering out of 2,104–3,000 known, at 8.9–10.5 MB/s; a 4400 MB few-seeder
+swarm (61 known) ran at 8.5 MB/s with 3 delivering. 0.07 MB/s is now only
+seen on a swarm with a single slow seed (6100 MB, 3 known).
+
+- **Scout.** 15 of 15 `/peers` streams answered. Dials to scout-alive
+  addresses connected 86% of the time (154/180), to remembered ones 85%
+  (112/132), to untried ones 3% (6/201): the scout is what makes the
+  dials work. Median on the second report: 1,963 peers known, 30 alive,
+  17 connected, 8 delivering.
+- **File list (12 distinct magnets, 17 lookups).** Listed for 10 of 12
+  magnets (15 of 17 lookups). Sources: IndexedDB cache 5 (≤ 1 ms), VPS
+  `info` line 9 (4 ms – 7.5 s, median 1.5 s), peers (BEP 9) 1 (4.5 s,
+  the VPS had no `info` line for that swarm of 3). The two failures were
+  swarms without a seed: one stopped at the 120 s cap after 163 untried
+  dials (scout: 3,112 addresses, 0 alive, 1,313 unknown, first line after
+  29 s); the other ended "exhausted" with 3 alive partial peers that never
+  gave the info dict (2 retries, no reopened sockets).
+- **Upload.** On the leecher swarm (9200 MB, no seed connected) the page
+  uploaded 1.67 MB in 3 sessions to up to 4 unchoked peers, with 53
+  messages counted for the upload alone; healthy swarms stayed at 17–21
+  requests/GB with upload on. No upload when every peer is a seed, as
+  expected. The setting off was checked by the e2e only.
+- **Resume.** The 9200 MB video, reopened twice: file list from the cache
+  (≤ 1 ms), 4 MiB ready at once, remembered peers dialled first (85%
+  connected), recovery picked up at 17% and 22%.
+- **Integrity.** 2 failed piece checks in 11.5 GB, nobody excluded (one
+  failure each: the rule needs two).
+- **2600 MB torrent.** One live seed among 48; it served 9.9 MB, then
+  closed every connection. Effectively dead; the page waited 130 s without
+  saying so.
+- **VPS.** 58 MiB RSS after hours of use; systemd reported a 53.4 MiB peak
+  over 1 day 16 h (budget ~150 MiB, OQ-22). Logs: no peer addresses,
+  info-hashes or magnets.
+
+Problems found:
+
+1. **Thin swarms break the 40/GB budget** (*fixed in the review*, see
+   below). The 6100 MB session (one seed,
+   0.07 MB/s) cost ~436 requests/GB: the socket that delivered sent a
+   message every ~2 s, and two more WebSockets stayed open for 14 minutes
+   with no connection, ~28 keep-alive messages each (gateway log:
+   `opens 0`, `messagesIn 28`, 858 s). Idle extra sockets are not closed,
+   and at low rates the request refill (the picker's 4 s of the peer's
+   rate, refilled at half) produces messages per unit of time, not per
+   byte. *Fixed:* the fastest peers are kept at least 4 MiB deep (at most
+   60 s of their rate), so a refill asks for 2 MiB; a window block held by
+   a peer that is no longer among the fastest is asked of a fast one at
+   once. In the picker simulation a lone 70 KB/s peer now costs 31
+   messages for 64 MiB instead of 453 (~25 billed requests per GB instead
+   of ~350). The low-rate rule adds a WebSocket only while candidates
+   outnumber the free slots, and a surplus WebSocket left without any
+   connection for 25 s is closed (never the last one).
+2. **`astro dev` pages are not cross-origin isolated.** The page's HTML in
+   dev has no COOP/COEP (`curl -I http://localhost:4321/`): `server.headers`
+   in `astro.config.mjs` reaches Vite's assets, not Astro's pages. 8 of 9
+   visits reported `isolated: false`. libmedia then runs without
+   threads: the likely cause of the HEVC numbers (7.9 decoder stutters
+   per minute, 38 s to first picture on the 88 GB HEVC/DTS file). The e2e
+   serves the built site with `_headers`, so production is not affected;
+   the local measurement stack is.
+3. **Startup milestones are lost** (*fixed in the review*).
+   `ready1MiB/4MiB/16MiB` were only marked while the recovery had had no
+   seek, and reading a container index at the end of the file (MKV cues,
+   AVI idx1) moves the cursor there and back, counted as a seek (e.g.
+   4400 MB, 9200 MB: 1 recovery seek, 0 player seeks). *Fixed:* they are
+   marked while the cursor is within 16 MiB of the file's start.
+4. **The DHT library's log prints the host's own public address**
+   (`mainline::rpc` at INFO, on the VPS too), and `DHT bootstrap complete`
+   is logged right after `Could not bootstrap the routing table`; the VPS
+   logs that error again every few hours.
+5. **Quota.** Usage 110 GB: an 88 GB MKV with its index at the end reserves
+   88 GB (sparse files, see docs/storage.md › Quota).
+
+M3-07 criteria: large and thin swarms measured ✅; file list 10 of 12
+magnets (83%) ❌ against 95%, accepted at the review: both failures are
+swarms without a seed (no live address, or live partial peers that never
+gave the info dict), every magnet with a reachable seed was listed; on
+large swarms more than 2 peers deliver and data is missing 2% of the time
+✅; upload observed ✅, setting off verified by the e2e; 17–21/GB on
+healthy swarms ✅, the single-slow-seed swarm fixed in the review (problem
+1, not re-measured on that swarm); VPS memory ✅; automatic save, resume
+and deletion from *Saved* ✅. Problems 2, 4 and 5 stay open for M4.
 
 ## How to take real-world measurements
 

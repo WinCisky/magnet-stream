@@ -133,7 +133,7 @@ Requests are assigned per 16 KiB block, by deadline:
 
 1. **Container index.** Head and tail of the file first (MP4 `moov`, Matroska cues).
 2. **Playback window.** The next 20 to 30 s of video, strictly in order, from the fastest peers only. A block that is late is requested again from a second peer.
-3. **Read-ahead.** Sequential past the window, spread over all unchoked peers, each kept 2 to 4 s of requests deep.
+3. **Read-ahead.** Sequential past the window, spread over all unchoked peers, each kept 2 to 4 s of requests deep. The fastest peers are kept at least 4 MiB deep (at most 60 s of their rate): on a slow swarm, 4 s of a 70 KB/s peer meant a refill message every 2 s, about 440 billed requests per GB (M3-07). A window block held by a peer that is no longer among the fastest is asked of a fast one at once.
 4. **Scarce pieces.** When the buffer is comfortably ahead, fetch pieces that only one or two peers hold. They may not be there later.
 5. **Back-fill.** Gaps before the playback position, last.
 
@@ -187,7 +187,7 @@ Binary WebSocket messages, each a sequence of frames `[type u8][conn u16][length
 - **Handshake gate.** The gateway itself writes the 68-byte BitTorrent handshake and forwards nothing until the remote answers with a valid one for the same info-hash. The tunnel can therefore only reach things that speak BitTorrent for that torrent. This replaces the signed peer tokens, which could not cover peers learned by exchange.
 - **Batch upstream.** On the Durable Object, 20 incoming messages cost 1 request. The browser coalesces all frames for a socket into one message at most every 300 to 500 ms, and refills each peer's request queue several seconds at a time. Urgent frames (a cancel after a seek) skip the timer. Upload data and `have`s join these messages; alone they are flushed at most every 2 s.
 - **Flow control by request.** Peers only send what was requested, so the browser bounds in-flight data (16 MiB per socket) and the gateway never buffers more than that. No extra credit scheme is needed. In the other direction the browser caps its upload, and the gateway closes a connection whose unwritten bytes exceed a bound (a peer that does not read).
-- **Six connections per socket.** One WebSocket is one invocation and therefore 6 outbound sockets (a Cloudflare limit). Wider sessions open a second and third WebSocket to the same object.
+- **Six connections per socket.** One WebSocket is one invocation and therefore 6 outbound sockets (a Cloudflare limit). Wider sessions open a second and third WebSocket to the same object, only while there are candidates the open sockets have no room for; a surplus socket left without any connection for 25 s is closed (an idle one still pings every 30 s).
 - **Abuse limits.** Origin allow-list, no private or reserved addresses, no ports below 1024, idle timeout of 90 s per connection, a cap on session length, a per-IP rate limit rule. A Turnstile check can be added in front of session creation if the endpoint is abused.
 - **Reconnect is normal.** Gateways restart on deploys. The browser reopens the socket, redials its best peers from memory and re-requests unfinished blocks.
 

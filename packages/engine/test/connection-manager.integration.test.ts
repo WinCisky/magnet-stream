@@ -215,7 +215,9 @@ describe("connection manager through the gateway", () => {
 		const torrent = makeTorrent({ seed: 76, size: 4 * 1024 * 1024, pieceLength: 64 * 1024 });
 		const meta = await parseInfoDict(torrent.info, torrent.infoHashHex);
 		const peer = await startFakePeer({ torrent, blockGapMs: 100, reqq: 8 });
-		peers.push(peer);
+		// Silent peers: more candidates than one socket's slots, so width is worth its cost.
+		const silent = await Promise.all(Array.from({ length: 20 }, () => startFakePeer({ torrent, silent: true })));
+		peers.push(peer, ...silent);
 		const sockets: WebSocket[] = [];
 		const mgr = new ConnectionManager({
 			gatewayUrl: dev.url,
@@ -230,7 +232,7 @@ describe("connection manager through the gateway", () => {
 				return ws as never;
 			},
 		});
-		mgr.addPeers([peer.addr]);
+		mgr.addPeers([peer.addr, ...silent.map((p) => p.addr)]);
 		const pending = mgr.download(meta);
 		await until(() => mgr.socketsOpen === 3, 20_000);
 		mgr.stop();

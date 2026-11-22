@@ -41,6 +41,13 @@ const WINDOW_MS = 10_000;
 const MiB = 1024 * 1024;
 /** A seek is over once this much is ready past it (as the startup's 4 MiB). */
 const SEEK_READY_BYTES = 4 * MiB;
+/**
+ * Startup milestones count while the cursor is this close to the file's
+ * start. Not "until the first seek": reading a container index at the end
+ * (MKV cues, AVI idx1) moves the cursor there and back, and counted as a
+ * seek it dropped the startup of most videos (M3-07 measurements).
+ */
+const START_REGION_BYTES = 16 * MiB;
 
 export const BUILD: string = typeof __MW_BUILD__ === "string" ? __MW_BUILD__ : "dev";
 
@@ -393,10 +400,13 @@ export class RecoveryRecorder implements EngineObserver {
 			add(r.seeks.readyMs, MS_BOUNDS, now - this.seekFrom);
 			this.seekFrom = null;
 		}
-		if (r.seeks.count === 0) {
-			if (ahead >= MiB) this.mark("ready1MiB", at);
-			if (ahead >= 4 * MiB) this.mark("ready4MiB", at);
-			if (ahead >= 16 * MiB) this.mark("ready16MiB", at);
+		// Startup: verified from the cursor while it is at the start (after a
+		// wrap too: the front counts from the start then, not "everything in").
+		if ((s.cursor - s.firstPiece) * s.pieceLength < START_REGION_BYTES) {
+			const fromStart = s.front > last ? Infinity : (s.front - s.cursor) * s.pieceLength;
+			if (fromStart >= MiB) this.mark("ready1MiB", at);
+			if (fromStart >= 4 * MiB) this.mark("ready4MiB", at);
+			if (fromStart >= 16 * MiB) this.mark("ready16MiB", at);
 		}
 	}
 

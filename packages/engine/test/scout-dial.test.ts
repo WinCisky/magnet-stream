@@ -264,6 +264,63 @@ describe("dead connects kept off the sockets that carry data", () => {
 });
 
 /** Untried dials still waiting for an answer (not failed yet). */
+describe("width that nothing uses is not paid for (M3-07: thin swarms)", () => {
+	it("closes the surplus WebSockets left without any connection, keeping one", async () => {
+		const { mgr, sockets } = manager(new Map(), { maxRecycles: 0 });
+		mgr.addPeers(addresses(30), "discovery");
+		await start(mgr);
+		await vi.advanceTimersByTimeAsync(200);
+		expect(mgr.socketsOpen).toBe(3);
+		// Every address tried and backed off (5 min), held slots released, then IDLE_SOCKET_MS.
+		await vi.advanceTimersByTimeAsync(160_000);
+		expect(mgr.socketsOpen).toBe(1);
+		expect(mgr.upgrades).toBe(3);
+		expect(sockets.filter((s) => s.readyState === 3)).toHaveLength(2);
+		// Nothing reopened them, and the last one stays.
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(mgr.socketsOpen).toBe(1);
+		expect(mgr.upgrades).toBe(3);
+		mgr.stop();
+	});
+
+	it("keeps a socket that carries a connection, however long", async () => {
+		const live = addresses(2, 50);
+		const { mgr } = manager(new Map(live.map((a) => [a, "unchoke" as const])));
+		mgr.addPeers(addresses(30), "discovery");
+		await start(mgr);
+		await vi.advanceTimersByTimeAsync(200);
+		mgr.addPeers(live, "discovery", [ALIVE_SEED, ALIVE_SEED]);
+		await vi.advanceTimersByTimeAsync(300_000);
+		expect(mgr.liveCount).toBe(2);
+		expect(mgr.diagnostics().connected).toBe(2);
+		expect(mgr.socketsOpen).toBeGreaterThanOrEqual(1);
+		mgr.stop();
+	});
+
+	it("does not add a WebSocket for a low rate when nobody is left to dial", async () => {
+		const live = "9.9.9.1:6881";
+		const { mgr } = manager(new Map([[live, "unchoke" as const]]), { rateThreshold: 1e12, rateWindowMs: 1_000 });
+		mgr.addPeers([live], "discovery", [ALIVE_SEED]);
+		await start(mgr);
+		await vi.advanceTimersByTimeAsync(120_000);
+		expect(mgr.liveCount).toBe(1);
+		expect(mgr.upgrades).toBe(1);
+		expect(mgr.socketsOpen).toBe(1);
+		mgr.stop();
+	});
+
+	it("still adds one for a low rate when candidates outnumber the free slots", async () => {
+		const live = "9.9.9.1:6881";
+		const { mgr } = manager(new Map([[live, "unchoke" as const]]), { rateThreshold: 1e12, rateWindowMs: 1_000, earlyWidth: false });
+		mgr.addPeers([live], "discovery", [ALIVE_SEED]);
+		mgr.addPeers(addresses(30), "discovery");
+		await start(mgr);
+		await vi.advanceTimersByTimeAsync(5_000);
+		expect(mgr.upgrades).toBeGreaterThan(1);
+		mgr.stop();
+	});
+});
+
 function inFlight(mgr: ConnectionManager): number {
 	let n = 0;
 	for (const p of mgr.book.entries()) if (p.state === "connecting") n++;

@@ -20,6 +20,8 @@ const config: Partial<PickerConfig> = {
 	scarceAheadSeconds: 6,
 	headBytes: PL,
 	tailBytes: PL,
+	// Time depth only (the byte floor of fast peers has its own tests).
+	minQueueBytes: 0,
 };
 
 function peer(id: string, opts: { rate?: number; reqq?: number; has?: (p: number) => boolean; unchoked?: boolean } = {}): PickerPeer {
@@ -291,6 +293,73 @@ describe("picker queue depth", () => {
 			spent: (_, bytes) => (left -= bytes),
 		});
 		expect([...plan.values()].flat()).toHaveLength(5);
+	});
+});
+
+describe("picker queue floor of the fast peers (billed messages on slow swarms)", () => {
+	const floored: Partial<PickerConfig> = { ...config, minQueueBytes: 4 * 1024 * KiB, maxQueueSeconds: 60 };
+
+	it("keeps a fast peer at least minQueueBytes deep, within reqq and maxQueueSeconds of its rate", () => {
+		const picker = new Picker(geometry(4), floored);
+		const floor = (4 * 1024 * KiB) / BLOCK_SIZE; // 256 blocks
+		expect(picker.depth({ rate: 70_000, reqq: 500 }, true)).toBe(floor);
+		expect(picker.depth({ rate: 70_000, reqq: 250 }, true)).toBe(250);
+		// 2 KB/s: 60 s of it is 7 blocks.
+		expect(picker.depth({ rate: 2_000, reqq: 500 }, true)).toBe(7);
+		// Not among the fast peers: the time depth (4 s).
+		expect(picker.depth({ rate: 70_000, reqq: 500 }, false)).toBe(17);
+		// Fast peers already deeper than the floor keep their time depth.
+		expect(picker.depth({ rate: 2_000_000, reqq: 1000 }, true)).toBe(488);
+		// Off.
+		expect(new Picker(geometry(4), { ...floored, minQueueBytes: 0 }).depth({ rate: 70_000, reqq: 500 }, true)).toBe(17);
+	});
+
+	it("asks a lone 70 KB/s peer for 64 MiB in a few dozen messages, not one every 2 s", () => {
+		const count = (cfg: Partial<PickerConfig>) => {
+			const pieces = 1024; // 64 MiB
+			const picker = new Picker(geometry(pieces), cfg);
+			picker.addTarget({ offset: 0, size: pieces * PL });
+			const a = peer("a", { rate: 70_000, reqq: 500 });
+			const queue: PickedBlock[] = [];
+			let messages = 0;
+			let credit = 0;
+			let verified = 0;
+			for (let now = 0; verified < pieces && now < 2_000_000; now += 250) {
+				const picked = picker.plan([a], now).get("a") ?? [];
+				if (picked.length > 0) messages++;
+				queue.push(...picked);
+				credit += 70_000 / 4;
+				while (queue.length > 0 && credit >= queue[0].length) {
+					const b = queue.shift()!;
+					credit -= b.length;
+					if (deliver(picker, "a", b).complete) verified++;
+				}
+				if (queue.length === 0) credit = 0;
+			}
+			expect(verified).toBe(pieces);
+			return messages;
+		};
+		const timeOnly = count({ ...floored, minQueueBytes: 0 });
+		const withFloor = count(floored);
+		// 64 MiB in 2 MiB refills: ~32 messages (~25 billed requests per GB with
+		// the 20-messages rule); the time depth alone sends one every ~2 s.
+		expect(withFloor).toBeLessThanOrEqual(40);
+		expect(timeOnly).toBeGreaterThan(300);
+	});
+
+	it("lets a faster peer take at once the window blocks a demoted peer's deep queue holds", () => {
+		const picker = new Picker(geometry(64), { ...floored, windowSeconds: 8 });
+		picker.addTarget({ offset: 0, size: 64 * PL });
+		const slow = peer("slow", { rate: 20_000, reqq: 500 });
+		const first = picker.plan([slow], 0).get("slow")!;
+		// Alone, it is the fastest: 60 s of 20 KB/s.
+		expect(first.length).toBe(Math.floor((20_000 * 60) / BLOCK_SIZE));
+		const fast = peer("fast", { rate: 2_000_000, reqq: 500 });
+		// Long before the slow peer's requests are due.
+		const plan = picker.plan([slow, fast], 1_000).get("fast") ?? [];
+		const hedges = plan.filter((b) => b.hedge && b.level <= PickLevel.Window);
+		expect(hedges.length).toBeGreaterThan(0);
+		for (const h of hedges) expect(picker.isRequested("slow", h.piece, h.begin)).toBe(true);
 	});
 });
 

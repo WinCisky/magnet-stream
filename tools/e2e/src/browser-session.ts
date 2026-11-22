@@ -5,7 +5,7 @@
 //
 //   chromium (system or CHROMIUM_PATH) + fake peers + /peers stub + wrangler dev + the site's production build
 //
-// The swarm: 2 fast seeds, 1 slow seed, 1 partial peer (first half), 2 peers
+// The swarm: 2 fast seeds (one paced), 1 slow seed, 1 partial peer (first half), 2 peers
 // that never unchoke, 1 tit-for-tat leecher (second half), 3 dead addresses.
 // With "Share with peers" on (the default) the page uploads to the leecher
 // and the diagnostics menu shows the bytes; turned off, a second session
@@ -44,7 +44,10 @@ async function main(): Promise<void> {
 	const torrent = makeTorrent({ seed: 90, name: "clip.mkv", size: FILE_BYTES, pieceLength: 256 * 1024 });
 	const half = Array.from({ length: Math.floor(torrent.pieceCount / 2) }, (_, i) => i);
 	const live = await Promise.all([
-		startFakePeer({ torrent }),
+		// One fast seed paced: the session must last a few lazy upload flushes
+		// (2 s each) for the tit-for-tat exchange to happen; with both unpaced,
+		// 128 MiB took ~5 s once fast peers were kept 4 MiB deep (M3-07).
+		startFakePeer({ torrent, blockGapMs: 2 }),
 		startFakePeer({ torrent }),
 		startFakePeer({ torrent, blockGapMs: 20 }),
 		startFakePeer({ torrent, have: half }),
@@ -218,7 +221,7 @@ async function main(): Promise<void> {
 
 		const result = {
 			kind: "synthetic",
-			swarm: "2 fast seeds, 1 slow seed, 1 partial (half), 2 never unchoke, 1 tit-for-tat leecher (other half), 3 dead; local wrangler dev",
+			swarm: "2 fast seeds (one paced, 2 ms per block), 1 slow seed, 1 partial (half), 2 never unchoke, 1 tit-for-tat leecher (other half), 3 dead; local wrangler dev",
 			date: new Date().toISOString(),
 			commit: process.env.GITHUB_SHA ?? null,
 			fileBytes: torrent.totalLength,

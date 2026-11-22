@@ -8,7 +8,8 @@
 //      peers only. A block that is late is asked of a second peer, and the
 //      copy that arrives second is discarded (its request is cancelled).
 //   3. Read-ahead: sequential past the window, on every unchoked peer, each
-//      kept `readAheadSeconds` (4 s) of its own rate deep, within its `reqq`.
+//      kept `readAheadSeconds` (4 s) of its own rate deep, within its `reqq`;
+//      the fastest peers at least `minQueueBytes` deep (see below).
 //      It runs up to `scarceAheadBytes` (120 s of video) past the position.
 //   4. Scarce pieces: once everything up to there is verified (the buffer is
 //      comfortably ahead), pieces that only one or two connected peers hold,
@@ -81,6 +82,18 @@ export interface PickerConfig {
 	minDepth: number;
 	/** A peer's queue is refilled once at most this share of it is left (default 0.5). */
 	refillAt: number;
+	/**
+	 * Least queue of a fast peer (rate at least `fastRatio` of the best),
+	 * in bytes, within its `reqq` and `maxQueueSeconds` of its rate
+	 * (default 4 MiB). Each refill is an upstream message (billed): on a
+	 * slow swarm, `readAheadSeconds` of a 70 KB/s peer is a message every
+	 * 2 s, about 440 billed requests per GB. With 4 MiB a refill asks for
+	 * 2 MiB, so refills stay under ~25 per GB (budget 40,
+	 * docs/measurements.md). Slower peers keep the time depth. 0 disables.
+	 */
+	minQueueBytes: number;
+	/** The `minQueueBytes` floor never exceeds this many seconds of the peer's rate (default 60). */
+	maxQueueSeconds: number;
 	/** A piece a peer rejected is not asked of it again for this long (default 30 s). */
 	refusedMs: number;
 }
@@ -101,6 +114,8 @@ export const DEFAULT_PICKER_CONFIG: Readonly<PickerConfig> = {
 	minDepth: 2,
 	refillAt: 0.5,
 	refusedMs: 30_000,
+	minQueueBytes: 4 * 1024 * 1024,
+	maxQueueSeconds: 60,
 };
 
 /** Hard cap on requests per block: the original and one duplicate. */
@@ -486,12 +501,17 @@ export class Picker {
 		return this.byPeer.get(peer)?.has(this.key(piece, begin / BLOCK_SIZE)) === true;
 	}
 
-	/** Queue depth of a peer, in blocks: `readAheadSeconds` of its rate, within its `reqq`. */
-	depth(peer: Pick<PickerPeer, "rate" | "reqq">): number {
+	/**
+	 * Queue depth of a peer, in blocks: `readAheadSeconds` of its rate, at
+	 * least `minQueueBytes` if it is among the fast peers, within its `reqq`.
+	 */
+	depth(peer: Pick<PickerPeer, "rate" | "reqq">, fast = false): number {
 		const cap = Math.max(1, Math.floor(peer.reqq));
 		if (!(peer.rate > 0)) return Math.min(this.config.initialDepth, cap);
 		const byTime = Math.floor((peer.rate * this.config.readAheadSeconds) / BLOCK_SIZE);
-		return Math.min(cap, Math.max(Math.min(this.config.minDepth, cap), byTime));
+		const floorBytes = Math.min(Math.max(0, this.config.minQueueBytes), peer.rate * Math.max(0, this.config.maxQueueSeconds));
+		const floor = fast ? Math.floor(floorBytes / BLOCK_SIZE) : 0;
+		return Math.min(cap, Math.max(Math.min(this.config.minDepth, cap), byTime, floor));
 	}
 
 	/**
@@ -507,7 +527,7 @@ export class Picker {
 		const ctx = this.context(peers, now);
 		const order = peers.filter((p) => p.unchoked).sort((a, b) => b.rate - a.rate || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 		for (const peer of order) {
-			const depth = this.depth(peer);
+			const depth = this.depth(peer, ctx.fastIds.has(peer.id));
 			const queued = this.outstanding(peer.id);
 			let room = depth - queued;
 			const budget = opts.budget?.(peer.id);
@@ -774,7 +794,10 @@ export class Picker {
 			const first = reqs[0];
 			if (first.peer === peer.id) continue;
 			const holder = ctx.byId.get(first.peer);
-			const late = !holder || !holder.unchoked || ctx.now >= first.due + this.config.hedgeGraceMs;
+			// A window block held by a peer that is no longer among the fast
+			// ones (a fast peer's deep queue, minQueueBytes) is late for a fast peer.
+			const demoted = level <= PickLevel.Window && !ctx.fastIds.has(first.peer) && ctx.fastIds.has(peer.id);
+			const late = !holder || !holder.unchoked || demoted || ctx.now >= first.due + this.config.hedgeGraceMs;
 			if (!late) continue;
 			this.link(key, peer, ctx.now, true);
 			this.hedgesSent++;

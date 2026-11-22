@@ -29,6 +29,11 @@
 // upgrade); and once enough peers deliver fast enough, untried addresses
 // are not dialled at all.
 //
+// Width costs while nothing uses it: a WebSocket with no connection still
+// pings every 30 s. The rate rule adds a socket only when candidates
+// outnumber the free slots, and a surplus socket left without any
+// connection for IDLE_SOCKET_MS is closed (never the last one).
+//
 // Verification (§Chunk recovery › Verification, M3-02): a piece reaches
 // `onPiece` (store, player) only after its hash check. Every kept block is
 // attributed to the peer that sent it (attribution.ts); a failed piece is
@@ -121,6 +126,13 @@ const ORPHAN_CACHE_BYTES = 32 * 1024 * 1024;
 const USELESS_GRACE_MS = 3_000;
 /** Recycle an exploring socket only if its held slots would stay taken at least this long. */
 const RECYCLE_MIN_GAIN_MS = 5_000;
+/**
+ * A surplus WebSocket without any connection (nor slot held) for this long
+ * is closed: shorter than the 30 s ping, so it costs no message. On a thin
+ * swarm two idle sockets otherwise sent a ping every 30 s for the whole
+ * session (M3-07 measurements).
+ */
+export const IDLE_SOCKET_MS = 25_000;
 
 export interface ConnectionManagerOptions {
 	/** `http://host:port` or `ws://host:port/v1/tunnel`. */
@@ -281,6 +293,8 @@ interface Sock {
 	untested: number;
 	/** Until when the slots of untried dials that timed out stay taken (OQ-03). */
 	untestedHeld: number[];
+	/** Since when it has had no connection, no open in flight and no held slot. */
+	emptySince: number;
 }
 
 export interface DialCounts {
@@ -980,7 +994,7 @@ export class ConnectionManager {
 				client.close();
 				return;
 			}
-			const sock: Sock = { client, untested: 0, untestedHeld: [] };
+			const sock: Sock = { client, untested: 0, untestedHeld: [], emptySince: this.now() };
 			client.onClose = () => this.onSocketClosed(sock);
 			this.sockets.push(sock);
 			if (this.sockets.length > this.peakSockets) this.peakSockets = this.sockets.length;
@@ -1033,6 +1047,7 @@ export class ConnectionManager {
 		for (const sock of this.sockets) sock.client.pingIfIdle(now, this.opts.pingIntervalMs);
 		this.noteRate(now);
 		this.recycle(now);
+		this.closeIdleSockets(now);
 		this.uploadTick(now);
 		const quiet = this.sockets.length > 0 ? now - this.lastProgress : this.disconnectedAt > 0 ? now - this.disconnectedAt : 0;
 		// A download can stall. Waiting on the file list must not close the tunnel.
@@ -1069,7 +1084,12 @@ export class ConnectionManager {
 		while (this.samples.length > 0 && this.samples[0].at < cutoff) this.samples.shift();
 		const threshold = this.opts.rateThreshold;
 		if (threshold === undefined) return;
-		if (shouldAddSocket(this.samples, now, this.opts.rateWindowMs, threshold, this.wantedSockets, this.opts.maxSockets)) {
+		// Slow, and someone to dial that the open sockets have no room for.
+		if (
+			shouldAddSocket(this.samples, now, this.opts.rateWindowMs, threshold, this.wantedSockets, this.opts.maxSockets) &&
+			this.sockets.length >= this.wantedSockets &&
+			this.candidatesExceedSlots()
+		) {
 			this.wantedSockets++;
 			void this.openSocket().catch(() => this.scheduleReconnect());
 		}
@@ -1169,15 +1189,38 @@ export class ConnectionManager {
 			if (!this.book.candidates(Infinity).some((p) => this.book.dialClass(p) === "untried")) return;
 			this.recycles++;
 			this.lastRecycleAt = now;
-			const i = this.sockets.indexOf(sock);
-			if (i >= 0) this.sockets.splice(i, 1);
-			this.sentBefore += sock.client.stats.messagesSent;
-			this.lazyBefore += sock.client.stats.lazyMessages;
-			sock.client.onClose = undefined;
-			sock.client.close();
+			this.retire(sock);
 			void this.openSocket().catch(() => this.scheduleReconnect());
 			return;
 		}
+	}
+
+	/**
+	 * Close the surplus sockets that have had no connection for
+	 * IDLE_SOCKET_MS: fill() dials into any socket with room every sweep, so
+	 * one left empty that long had nobody to dial. The session keeps one.
+	 */
+	private closeIdleSockets(now: number): void {
+		for (const sock of [...this.sockets]) {
+			if (sock.client.closed) continue;
+			if (sock.client.connections > 0) {
+				sock.emptySince = now;
+				continue;
+			}
+			if (this.sockets.length <= 1 || this.opening || now - sock.emptySince < IDLE_SOCKET_MS) continue;
+			this.retire(sock);
+			this.wantedSockets = Math.max(1, Math.min(this.wantedSockets, this.sockets.length));
+		}
+	}
+
+	/** Take a socket out of the session and close it, without the reconnect of an unexpected close. */
+	private retire(sock: Sock): void {
+		const i = this.sockets.indexOf(sock);
+		if (i >= 0) this.sockets.splice(i, 1);
+		this.sentBefore += sock.client.stats.messagesSent;
+		this.lazyBefore += sock.client.stats.lazyMessages;
+		sock.client.onClose = undefined;
+		sock.client.close();
 	}
 
 	/** Untried dials in flight on `sock`, counting the slots their timed-out connects still hold. */

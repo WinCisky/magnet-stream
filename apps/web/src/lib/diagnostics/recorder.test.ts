@@ -120,8 +120,22 @@ describe("RecoveryRecorder", () => {
 		expect(record.seeks).toMatchObject({ count: 2, abandoned: 1 });
 		expect(record.seeks.readyMs.n).toBe(1);
 		expect(quantile(record.seeks.readyMs, MS_BOUNDS, 0.5)).toBe(2_000);
-		// Startup milestones stop at the first seek.
+		// Away from the start, nothing counts as startup.
 		expect(record.milestones.ready4MiB).toBeNull();
+	});
+
+	it("keeps the startup milestones through a read of the container index at the end", () => {
+		const { record, at } = setup();
+		at(0, { phase: "recovering" });
+		// The player reads the cues at the end: the cursor goes there (a jump, counted as a seek)...
+		at(500, { cursor: 99, front: 99, seeks: 1 });
+		// ...the last piece is in: the front wraps to the start, where playback begins.
+		at(900, { cursor: 0, front: 0, seeks: 1, wrapped: true, verifiedPieces: 1 });
+		expect(record.milestones.ready1MiB).toBeNull();
+		at(2_000, { cursor: 0, front: 2, seeks: 1, wrapped: true, verifiedPieces: 3 });
+		at(3_000, { cursor: 0, front: 5, seeks: 1, wrapped: true, verifiedPieces: 6 });
+		expect(record.milestones).toMatchObject({ ready1MiB: 2_000, ready4MiB: 3_000, ready16MiB: null });
+		expect(record.seeks.count).toBe(1);
 	});
 
 	it("ignores seeks once everything is in", () => {
