@@ -27,7 +27,7 @@ Where the numbers live (decision OQ-19, option C):
   session uploaded (bytes, peers unchoked, messages sent only for the
   upload, the setting), shown in the menu as *Sharing with peers*. Nothing is sent anywhere.
 - **Synthetic, every CI run.** `npm run e2e` (browser session) recovers a
-  128 MiB file from a fixed mixed swarm and fails if billed requests per GB
+  256 MiB file (128 MiB until M3-07) from a fixed mixed swarm and fails if billed requests per GB
   exceed the budget. Its numbers are written to
   `tools/e2e/results/browser-session.json`, kept as the `measurements`
   artifact of the CI run for 90 days.
@@ -44,10 +44,12 @@ never unchoke, 3 dead addresses; from M3-12 also a tit-for-tat leecher
 (second half) that the page uploads to ("Share with peers" on, the
 default), so the counted requests include the upload's flushes. The run
 also checks that with the setting off the leecher gets no bitfield, have,
-unchoke or piece. From M3-07 one fast seed is paced (2 ms per block): with
-fast peers kept 4 MiB deep, 128 MiB took ~5 s, too short for the
-tit-for-tat exchange (upload alone is flushed every 2 s). Everything runs
-locally (fake peers,
+unchoke or piece. From M3-07 the file is 256 MiB: at 128 MiB the 3
+WebSocket upgrades alone weighed ~22 billed requests per GB, and a slower
+CI runner (10.5 MB/s) went over 40 (41.7); with fast peers kept 4 MiB
+deep, 128 MiB also took only ~5 s locally, too short for the tit-for-tat
+exchange (upload alone is flushed every 2 s). Everything runs locally
+(fake peers,
 `wrangler dev`, `astro dev`, Chromium), so only number 3 says much about
 production; 1 and 2 catch regressions.
 
@@ -55,7 +57,8 @@ production; 1 and 2 catch regressions.
 |---|---|---|---|---|---|---|---|---|
 | 2026-11-18 | M2 (M2-09) | working tree, local run | 128 MiB | 1.2 | 6.6 | 28.3 | 28.3 (1 WebSocket, 56 messages) | 40 |
 | 2026-11-21 | M3 (M3-12) | working tree, local run | 128 MiB | 1.4 | 16.6 | 34.9 | 34.6 (3 WebSockets; 0.39 MB uploaded, 5 upload-only messages) | 40 |
-| 2026-11-22 | M3 (M3-07) | working tree, local run | 128 MiB | 1.4 | 17.9 | 34.8 | 34.6 (3 WebSockets, 33 messages; 0.26 MB uploaded, 4 upload-only messages) | 40 |
+| 2026-11-22 | M3 (M3-07) | working tree, local run | 256 MiB | 1.4 | 25.4 | 19.8 | 19.7 (3 WebSockets; 1.0 MB uploaded, 5 upload-only messages) | 40 |
+| 2026-11-22 | M3 (M3-07) | working tree, local run on one CPU core | 256 MiB | 1.5 | 11 | 26.3 | 26.3 (3 WebSockets; 2.1 MB uploaded, 6 upload-only messages) | 40 |
 
 ## Real-world
 

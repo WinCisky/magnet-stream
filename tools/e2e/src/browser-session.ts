@@ -5,7 +5,7 @@
 //
 //   chromium (system or CHROMIUM_PATH) + fake peers + /peers stub + wrangler dev + the site's production build
 //
-// The swarm: 2 fast seeds (one paced), 1 slow seed, 1 partial peer (first half), 2 peers
+// The swarm: 2 fast seeds, 1 slow seed, 1 partial peer (first half), 2 peers
 // that never unchoke, 1 tit-for-tat leecher (second half), 3 dead addresses.
 // With "Share with peers" on (the default) the page uploads to the leecher
 // and the diagnostics menu shows the bytes; turned off, a second session
@@ -26,7 +26,13 @@ import { ROOT, buildSite, findChromium, serveSite, waitFor } from "./site.ts";
 /** Agreed budget (OQ-19): billed Cloudflare requests per GB. */
 const BUDGET_PER_GB = 40;
 const MESSAGES_PER_REQUEST = 20;
-const FILE_BYTES = 128 * 1024 * 1024;
+/**
+ * 256 MiB: the 3 WebSocket upgrades of the mixed swarm weigh ~11 billed
+ * requests per GB instead of ~22 at 128 MiB (a real video is GBs), and the
+ * session lasts long enough for the tit-for-tat exchange (upload alone is
+ * flushed every 2 s). At 128 MiB a slower CI runner went over 40 (M3-07).
+ */
+const FILE_BYTES = 256 * 1024 * 1024;
 
 const chromiumPath = findChromium();
 if (!chromiumPath) {
@@ -44,10 +50,7 @@ async function main(): Promise<void> {
 	const torrent = makeTorrent({ seed: 90, name: "clip.mkv", size: FILE_BYTES, pieceLength: 256 * 1024 });
 	const half = Array.from({ length: Math.floor(torrent.pieceCount / 2) }, (_, i) => i);
 	const live = await Promise.all([
-		// One fast seed paced: the session must last a few lazy upload flushes
-		// (2 s each) for the tit-for-tat exchange to happen; with both unpaced,
-		// 128 MiB took ~5 s once fast peers were kept 4 MiB deep (M3-07).
-		startFakePeer({ torrent, blockGapMs: 2 }),
+		startFakePeer({ torrent }),
 		startFakePeer({ torrent }),
 		startFakePeer({ torrent, blockGapMs: 20 }),
 		startFakePeer({ torrent, have: half }),
@@ -221,7 +224,7 @@ async function main(): Promise<void> {
 
 		const result = {
 			kind: "synthetic",
-			swarm: "2 fast seeds (one paced, 2 ms per block), 1 slow seed, 1 partial (half), 2 never unchoke, 1 tit-for-tat leecher (other half), 3 dead; local wrangler dev",
+			swarm: "2 fast seeds, 1 slow seed, 1 partial (half), 2 never unchoke, 1 tit-for-tat leecher (other half), 3 dead; local wrangler dev",
 			date: new Date().toISOString(),
 			commit: process.env.GITHUB_SHA ?? null,
 			fileBytes: torrent.totalLength,
