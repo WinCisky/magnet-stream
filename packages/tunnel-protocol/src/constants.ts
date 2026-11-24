@@ -18,6 +18,9 @@ export const FrameType = {
 	CLOSE: 0x05,
 	ACCEPT: 0x06,
 	PING: 0x07,
+	ANNOUNCE: 0x08,
+	ANNOUNCED: 0x09,
+	WITHDRAW: 0x0a,
 } as const;
 export type FrameTypeCode = (typeof FrameType)[keyof typeof FrameType];
 
@@ -29,9 +32,12 @@ export const FRAME_TYPE_NAMES: Readonly<Record<number, string>> = {
 	[FrameType.CLOSE]: "close",
 	[FrameType.ACCEPT]: "accept",
 	[FrameType.PING]: "ping",
+	[FrameType.ANNOUNCE]: "announce",
+	[FrameType.ANNOUNCED]: "announced",
+	[FrameType.WITHDRAW]: "withdraw",
 };
 
-/** `conn` 0 is the session itself: only `ping` uses it. */
+/** `conn` 0 is the session itself: `ping`, `announce`, `announced` and `withdraw` use it. */
 export const SESSION_CONN = 0;
 /** Connections opened by the client (`open`) use 1..0x7fff. */
 export const CLIENT_CONN_MIN = 0x0001;
@@ -63,8 +69,27 @@ export const FailReason = {
 	REMOTE_CLOSED: 8,
 	/** Anything else (gateway bug, runtime limit). */
 	INTERNAL_ERROR: 9,
+	/**
+	 * The gateway cannot carry the `open`'s transport (uTP on the Cloudflare
+	 * gateway, or on the VPS gateway while the session does not announce the
+	 * info-hash, or an unknown transport); no connection attempted.
+	 */
+	UNSUPPORTED_TRANSPORT: 10,
 } as const;
 export type FailReasonCode = (typeof FailReason)[keyof typeof FailReason];
+
+/**
+ * Transport of an `open` or an `accept` (docs/tunnel-protocol.md › Peer
+ * fields): TCP is encoded by leaving the byte out, every other transport by
+ * a trailing byte.
+ */
+export const Transport = {
+	/** TCP (the default: no transport byte on the wire). */
+	TCP: 0,
+	/** uTP, BEP 29 (VPS gateway only). */
+	UTP: 1,
+} as const;
+export type TransportCode = (typeof Transport)[keyof typeof Transport];
 
 /** Why a connection ended. */
 export const CloseReason = {
@@ -91,6 +116,28 @@ export const CloseReason = {
 	WRITE_OVERFLOW: 8,
 } as const;
 export type CloseReasonCode = (typeof CloseReason)[keyof typeof CloseReason];
+
+/**
+ * State of a session's announce for one info-hash (`announced`, VPS gateway,
+ * docs/tunnel-protocol.md › Announce and inbound connections).
+ */
+export const AnnounceStatus = {
+	/** The gateway announces its port for the info-hash and accepts inbound peers for it. */
+	ACTIVE: 0,
+	/** The announce ended (after a `withdraw`). */
+	STOPPED: 1,
+	/** This gateway does not accept inbound peers (the Cloudflare gateway, or a VPS without a listener). */
+	UNSUPPORTED: 2,
+	/** Too many info-hashes announced on this WebSocket or on the gateway. */
+	LIMIT_REACHED: 3,
+	/** Anything else (the listener could not be opened). */
+	INTERNAL_ERROR: 4,
+} as const;
+export type AnnounceStatusCode = (typeof AnnounceStatus)[keyof typeof AnnounceStatus];
+
+/** Tracker URLs an `announce` may carry, and the longest one (printable ASCII bytes). */
+export const MAX_ANNOUNCE_TRACKERS = 16;
+export const MAX_TRACKER_URL_LENGTH = 512;
 
 export const INFO_HASH_LENGTH = 20;
 export const PEER_ID_LENGTH = 20;

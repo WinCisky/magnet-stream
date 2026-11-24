@@ -13,8 +13,8 @@ import type { Server } from "node:http";
 import { join } from "node:path";
 import { chromium, type Page } from "playwright-core";
 import { makeTorrent, startFakePeer } from "@magnet-stream/fake-peer";
-import { closedPort, freePort, startPeersStub, startWranglerDev, type WranglerDev } from "@magnet-stream/harness";
-import { ROOT, buildSite, findChromium, serveSite, waitFor } from "./site.ts";
+import { closedPort, freePort, startPeersStub } from "@magnet-stream/harness";
+import { ROOT, buildSite, findChromium, serveSite, startSiteGateway, waitFor, type SiteGateway } from "./site.ts";
 
 const FILE_BYTES = 64 * 1024 * 1024;
 /** Reload once this much is recovered. */
@@ -28,7 +28,7 @@ if (!chromiumPath) {
 	process.exit(process.env.REQUIRE_BROWSER_E2E ? 1 : 0);
 }
 
-let dev: WranglerDev | undefined;
+let dev: SiteGateway | undefined;
 let site: Server | undefined;
 let siteDir: string | undefined;
 let failed = false;
@@ -53,10 +53,10 @@ async function main(): Promise<void> {
 	try {
 		const port = await freePort();
 		const PAGE = `http://localhost:${port}/`;
-		dev = await startWranglerDev({ vars: { ALLOW_PRIVATE_PEERS: "1", ALLOWED_ORIGINS: `http://localhost:${port}` } });
+		dev = await startSiteGateway(`http://localhost:${port}`);
 		mkdirSync(join(ROOT, "tools/e2e/results"), { recursive: true });
 		siteDir = mkdtempSync(join(ROOT, "tools/e2e/results", "site-"));
-		buildSite(stub.url, dev.url, siteDir);
+		buildSite(stub.url, dev, siteDir);
 		site = await serveSite(siteDir, port);
 		await waitFor(PAGE, 30_000);
 

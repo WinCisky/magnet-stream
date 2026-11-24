@@ -24,6 +24,13 @@
 // trade with it, reading them from the OPFS store here, in this worker,
 // and only while a recovery runs. The verified info dict is served to
 // peers that ask for it. Off: nothing is announced or uploaded.
+//
+// Swarms with few seeders (M4-06): the engine waits for choked seeds, and
+// when fewer than 2 peers deliver (once the /peers stream is over and its
+// live addresses are used up) or the rate stays under the video's bitrate,
+// for 90 s in a row (build variables), it asks the VPS gateway to join the
+// swarm with the info-hash and the magnet's trackers. The page hears it
+// (`health`), and is told when the rate stays under the bitrate.
 
 import {
 	ConnectionManager,
@@ -43,7 +50,15 @@ import { LookupWait, failureMessage, type LookupFacts, type LookupFailure, type 
 import { sessionMemory } from "./memory-db.ts";
 import { openOpfsStore } from "./opfs-store.ts";
 import { toStoreError, type PieceFile, type StoreErrorCode } from "./piece-file.ts";
-import { DIAL_CLASSES, parsePageMessage, type MetadataOrigin, type ScoutStreamStats, type SessionDiag, type WorkerMessage } from "./session-protocol.ts";
+import {
+	DIAL_CLASSES,
+	parsePageMessage,
+	type EscalationStart,
+	type MetadataOrigin,
+	type ScoutStreamStats,
+	type SessionDiag,
+	type WorkerMessage,
+} from "./session-protocol.ts";
 
 const scope = self as unknown as {
 	onmessage: ((event: MessageEvent) => void) | null;
@@ -140,7 +155,7 @@ scope.onmessage = (event: MessageEvent) => {
 	}
 	if (msg.type === "start") {
 		share = msg.upload ?? true;
-		void start(msg.magnet, msg.gatewayUrl, msg.seedersUrl, msg.capMs);
+		void start(msg.magnet, msg.gatewayUrl, msg.seedersUrl, msg.capMs, msg.escalation);
 		return;
 	}
 	if (msg.type === "upload") {
@@ -198,7 +213,7 @@ function fail(message: string): void {
 	post({ type: "error", message: message.slice(0, 200) });
 }
 
-async function start(magnetUri: string, gatewayUrl: string, seedersUrl: string, capMs: number | undefined): Promise<void> {
+async function start(magnetUri: string, gatewayUrl: string, seedersUrl: string, capMs: number | undefined, escalation: EscalationStart | undefined): Promise<void> {
 	stop();
 	let magnet;
 	try {
@@ -232,6 +247,17 @@ async function start(magnetUri: string, gatewayUrl: string, seedersUrl: string, 
 		onMetadata: (conn, message) => fetcher.onMessage(conn, message),
 		onPeerClose: (conn) => fetcher.onClose(conn),
 		upload: { source: pieceSource, enabled: share },
+		// Swarms with few seeders: what the VPS gets is the info-hash and the magnet's trackers, nothing else.
+		escalation: escalation
+			? {
+					gatewayUrl: escalation.gatewayUrl ?? undefined,
+					trackers: magnet.trackers,
+					minDelivering: escalation.minDelivering,
+					escalateAfterMs: escalation.escalateAfterMs,
+					warnAfterMs: escalation.warnAfterMs,
+					withdrawAfterMs: escalation.withdrawAfterMs,
+				}
+			: undefined,
 	});
 	manager = session;
 	statsTimer ??= setInterval(postStats, STATS_EVERY_MS);
@@ -266,6 +292,8 @@ async function start(magnetUri: string, gatewayUrl: string, seedersUrl: string, 
 		const scout = l.scout;
 		scout.state = "open";
 		scout.streams++;
+		// "Fewer than 2 peers deliver" counts only once the scout's live addresses are in and used up.
+		session.setDiscovering(true);
 		void readStream(peersUrl.toString(), signal, {
 			onPeer: (address, facts) => {
 				count++;
@@ -297,11 +325,13 @@ async function start(magnetUri: string, gatewayUrl: string, seedersUrl: string, 
 			(result) => {
 				scout.rejected += result.rejected;
 				if (manager !== session) return;
+				session.setDiscovering(false);
 				scout.state = "done";
 				postStats();
 			},
 			() => {
 				if (manager !== session || signal.aborted) return;
+				session.setDiscovering(false);
 				scout.state = "failed";
 				postStats();
 			},
@@ -636,6 +666,7 @@ function postProgress(): void {
 			rateThreshold: Math.round(session.rateThreshold ?? 0),
 		});
 	}
+	if (recoveries.size > 0) post({ type: "health", health: session.swarmHealth() });
 	if (recoveries.size === 0 && progressTimer !== undefined) {
 		clearInterval(progressTimer);
 		progressTimer = undefined;
@@ -677,6 +708,17 @@ function diagOf(l: Lookup): SessionDiag {
 		untestedHighWater: d.untestedHighWater,
 		scout: { ...l.scout },
 		upload: { enabled: d.upload.enabled, bytes: d.upload.bytes, unchoked: d.upload.unchoked, messages: d.upload.messages },
+		escalation: {
+			state: d.escalation.state,
+			reason: d.escalation.reason,
+			afterMs: d.escalation.afterMs === null ? null : Math.max(0, Math.round(d.escalation.afterMs)),
+			upgrades: d.escalation.upgrades,
+			accepted: d.accepted,
+		},
+		paths: {
+			cloudflare: { ...d.paths.cloudflare },
+			vps: { ...d.paths.vps },
+		},
 	};
 }
 

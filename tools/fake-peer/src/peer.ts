@@ -1,6 +1,9 @@
 // A scriptable BitTorrent peer for tests: serves a FakeTorrent over the
 // peer-wire protocol on TCP, with configurable misbehaviour. Listens on
-// loopback and an ephemeral port unless told otherwise.
+// loopback and an ephemeral port unless told otherwise. With `listen:
+// false` it is reachable only by its own outbound connections (a peer
+// behind NAT): it dials `connectTo` and the peers an HTTP `tracker` names,
+// and starts the handshake itself.
 
 import { randomBytes } from "node:crypto";
 import net from "node:net";
@@ -95,6 +98,14 @@ export interface PeerBehaviour {
 	leechQueue?: number;
 	/** Stop reading right after answering the handshake (a peer that never reads: its TCP window fills). */
 	noRead?: boolean;
+	/** Accept inbound connections (default true). false: outbound only, like a peer behind NAT. */
+	listen?: boolean;
+	/** Dial these addresses (`ip:port`) and serve them, starting the handshake. */
+	connectTo?: readonly string[];
+	/** HTTP tracker announce URL: announce, then dial every peer it returns (once per address). */
+	tracker?: string;
+	/** Re-announce period to `tracker` (default 500 ms). */
+	announceIntervalMs?: number;
 }
 
 /** What a peer received from the other side (all connections). */
@@ -144,8 +155,9 @@ export interface PeerStats {
 
 export interface FakePeer {
 	host: string;
+	/** 0 when it does not listen. */
 	port: number;
-	/** `127.0.0.1:6881` or `[::1]:6881`. */
+	/** `127.0.0.1:6881` or `[::1]:6881`; empty when it does not listen. */
 	addr: string;
 	/** Magnet with an `x.pe` hint pointing at this peer. */
 	magnet: string;
@@ -214,7 +226,7 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 	const received = stats.received;
 	const sockets = new Set<net.Socket>();
 
-	const server = net.createServer((socket) => {
+	const handle = (socket: net.Socket, initiator: boolean) => {
 		stats.connections++;
 		sockets.add(socket);
 		socket.setNoDelay(true);
@@ -281,11 +293,7 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 			}
 		};
 
-		const answerHandshake = () => {
-			if (b.respondWith) {
-				send(b.respondWith);
-				return;
-			}
+		const writeHandshake = () => {
 			const reply = Buffer.alloc(68);
 			reply[0] = 19;
 			PROTOCOL.copy(reply, 1);
@@ -295,6 +303,9 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 			(b.wrongInfoHash ? randomBytes(20) : Buffer.from(torrent.infoHash)).copy(reply, 28);
 			Buffer.from(peerId).copy(reply, 48);
 			send(reply);
+		};
+
+		const afterHandshake = () => {
 			if (b.closeAfterHandshake) {
 				socket.end();
 				return;
@@ -302,6 +313,18 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 			sendSetup();
 			if (b.noRead) socket.pause();
 		};
+
+		const answerHandshake = () => {
+			if (b.respondWith) {
+				send(b.respondWith);
+				return;
+			}
+			writeHandshake();
+			afterHandshake();
+		};
+
+		// The initiator speaks first; the remote's handshake then completes it.
+		if (initiator) writeHandshake();
 
 		const onExtended = (payload: Buffer) => {
 			if (payload.length < 1) return;
@@ -484,8 +507,9 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 				handshaken = true;
 				stats.handshakes++;
 				buf = buf.subarray(68);
-				if (b.silent) return;
-				if (b.handshakeDelayMs) later(b.handshakeDelayMs, answerHandshake);
+				if (initiator) afterHandshake();
+				else if (b.silent) return;
+				else if (b.handshakeDelayMs) later(b.handshakeDelayMs, answerHandshake);
 				else answerHandshake();
 			}
 			while (buf.length >= 4 && !socket.writableEnded && !socket.destroyed) {
@@ -568,31 +592,83 @@ export async function startFakePeer(options: StartOptions): Promise<FakePeer> {
 				}
 			}
 		});
-	});
+	};
 
-	await new Promise<void>((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(b.port, b.host, () => {
-			server.off("error", reject);
-			resolve();
+	const listening = b.listen !== false;
+	const server = net.createServer((socket) => handle(socket, false));
+	if (listening) {
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(b.port, b.host, () => {
+				server.off("error", reject);
+				resolve();
+			});
 		});
-	});
-	const { port } = server.address() as net.AddressInfo;
-	const addr = b.host.includes(":") ? `[${b.host}]:${port}` : `${b.host}:${port}`;
+	}
+	const port = listening ? (server.address() as net.AddressInfo).port : 0;
+	const addr = !listening ? "" : b.host.includes(":") ? `[${b.host}]:${port}` : `${b.host}:${port}`;
+
+	// Outbound: one connection per address at a time.
+	let stopped = false;
+	const dialled = new Set<string>();
+	const dial = (address: string) => {
+		if (stopped || dialled.has(address)) return;
+		const m = /^(?:\[([0-9a-fA-F:.]+)\]|([^:]+)):(\d+)$/.exec(address);
+		if (!m) return;
+		dialled.add(address);
+		const socket = net.connect({ host: m[1] ?? m[2], port: Number(m[3]) });
+		sockets.add(socket);
+		socket.on("error", () => {});
+		socket.on("close", () => {
+			sockets.delete(socket);
+			dialled.delete(address);
+		});
+		socket.once("connect", () => handle(socket, true));
+	};
+	for (const a of b.connectTo ?? []) dial(a);
+	let announceTimer: ReturnType<typeof setTimeout> | undefined;
+	const announce = async () => {
+		if (stopped || !b.tracker) return;
+		try {
+			for (const a of await trackerPeers(b.tracker, torrent.infoHash, peerId, port || 1)) dial(a);
+		} catch {}
+		if (!stopped) announceTimer = setTimeout(() => void announce(), b.announceIntervalMs ?? 500);
+	};
+	void announce();
+
 	let closing: Promise<void> | undefined;
 	return {
 		host: b.host,
 		port,
 		addr,
-		magnet: `${torrent.magnet}&x.pe=${encodeURIComponent(addr)}`,
+		magnet: addr ? `${torrent.magnet}&x.pe=${encodeURIComponent(addr)}` : torrent.magnet,
 		torrent,
 		stats,
 		close: () =>
 			(closing ??= new Promise((resolve) => {
-				server.close(() => resolve());
+				stopped = true;
+				clearTimeout(announceTimer);
 				for (const s of sockets) s.destroy();
+				if (listening) server.close(() => resolve());
+				else resolve();
 			})),
 	};
+}
+
+/** One HTTP tracker announce (BEP 3, compact): the IPv4 peers it returns. */
+export async function trackerPeers(tracker: string, infoHash: Uint8Array, peerId: Uint8Array, port: number): Promise<string[]> {
+	const enc = (bytes: Uint8Array) => Array.from(bytes, (x) => `%${x.toString(16).padStart(2, "0")}`).join("");
+	const sep = tracker.includes("?") ? "&" : "?";
+	const url = `${tracker}${sep}info_hash=${enc(infoHash)}&peer_id=${enc(peerId)}&port=${port}&uploaded=0&downloaded=0&left=0&compact=1&event=started`;
+	const res = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+	const body = new Uint8Array(await res.arrayBuffer());
+	const decoded = bdecode(body);
+	if (!decoded || !(decoded.value instanceof Map)) return [];
+	const peers = decoded.value.get("peers");
+	if (!(peers instanceof Uint8Array)) return [];
+	const out: string[] = [];
+	for (let i = 0; i + 6 <= peers.length; i += 6) out.push(`${peers[i]}.${peers[i + 1]}.${peers[i + 2]}.${peers[i + 3]}:${(peers[i + 4] << 8) | peers[i + 5]}`);
+	return out;
 }
 
 /**

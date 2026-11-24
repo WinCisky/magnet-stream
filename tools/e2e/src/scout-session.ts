@@ -12,10 +12,11 @@
 //
 //   npm run e2e:scout -w tools/e2e
 //   E2E_GATEWAY_URL=http://127.0.0.1:8787 npm run e2e:scout -w tools/e2e   (a running wrangler dev with ALLOW_PRIVATE_PEERS=1)
+//   E2E_GATEWAY=vps npm run e2e:scout -w tools/e2e   (through the VPS gateway, services/seeders, instead of wrangler dev)
 
 import { ConnectionManager, MetadataFetcher, parseMagnet, readPeerStream } from "@magnet-stream/engine";
 import { makeTorrent, startFakePeer, type FakePeer } from "@magnet-stream/fake-peer";
-import { startPeersStub, startWranglerDev, type PeersStub, type StubLine, type WranglerDev } from "@magnet-stream/harness";
+import { gatewayKind, startGateway, startPeersStub, type PeersStub, type StubLine, type WranglerDev } from "@magnet-stream/harness";
 
 const MiB = 1024 * 1024;
 const DEAD = 30;
@@ -47,7 +48,7 @@ async function main(): Promise<void> {
 		{ info: torrent.info },
 	];
 	stub = await startPeersStub(lines);
-	const base = process.env.E2E_GATEWAY_URL ?? (dev = await startWranglerDev({ vars: { ALLOW_PRIVATE_PEERS: "1" } })).url;
+	const base = process.env.E2E_GATEWAY_URL ?? (dev = await startGateway({ vars: { ALLOW_PRIVATE_PEERS: "1" } })).url;
 
 	const magnet = parseMagnet(live[0].magnet);
 	const fetcher = new MetadataFetcher({ expected: { v1: magnet.v1, v2: magnet.v2, wire: magnet.infoHashHex } });
@@ -121,8 +122,8 @@ async function main(): Promise<void> {
 	check(stub.requests() === 1, "one discovery request");
 	if (dev) {
 		const logs = dev.output();
-		check(!logs.toLowerCase().includes(torrent.infoHashHex), "info-hash absent from gateway logs");
-		check(![...live, ...dead].some((p) => logs.includes(p.addr)), "peer addresses absent from gateway logs");
+		check(!logs.toLowerCase().includes(torrent.infoHashHex), `info-hash absent from ${gatewayKind()} gateway logs`);
+		check(![...live, ...dead].some((p) => logs.includes(p.addr)), `peer addresses absent from ${gatewayKind()} gateway logs`);
 	}
 	fetcher.stop();
 }

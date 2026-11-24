@@ -3,7 +3,7 @@
 // per-request logs, and nothing that names a torrent, file or person.
 
 import type { Environment } from "./env";
-import type { DialClassName, DialStats, MetadataOrigin, ScoutStreamStats } from "$lib/torrent/session-protocol";
+import { emptyPaths, type DialClassName, type DialStats, type EscalationDiag, type MetadataOrigin, type PathsDiag, type ScoutStreamStats } from "$lib/torrent/session-protocol";
 import { MS_BOUNDS, RATE_BOUNDS, hist, type Counts, type Hist } from "./stats";
 
 /** Requests to one service: outcomes, latency, and why the failures failed. */
@@ -179,6 +179,18 @@ export interface SessionRecord {
 		 * upload traffic. Absent in records from before it.
 		 */
 		upload?: { enabled: boolean; bytes: number; unchoked: number; messages: number };
+		/**
+		 * Swarms with few seeders (M4-06): the escalation to the VPS gateway
+		 * as last seen, why, ms from the session start, WebSockets opened to
+		 * it, inbound peers it handed over. Absent in records from before it.
+		 */
+		escalation?: EscalationDiag;
+		/**
+		 * Bytes by the gateway that carried them (M4-08): received and sent
+		 * through the Cloudflare gateway and through the VPS gateway, and the
+		 * connections on each. Absent in records from before it.
+		 */
+		paths?: PathsDiag;
 	};
 	/** The `/peers` stream. */
 	scout: ScoutStreamStats;
@@ -208,6 +220,8 @@ export function newSession(now = Date.now()): SessionRecord {
 			recycles: 0,
 			untestedHighWater: 0,
 			upload: { enabled: false, bytes: 0, unchoked: 0, messages: 0 },
+			escalation: { state: "idle", reason: null, afterMs: null, upgrades: 0, accepted: 0 },
+			paths: emptyPaths(),
 		},
 		scout: { state: "idle", streams: 0, peers: 0, alive: 0, seeds: 0, dead: 0, unknown: 0, rejected: 0, info: "none", firstPeerMs: null },
 	};

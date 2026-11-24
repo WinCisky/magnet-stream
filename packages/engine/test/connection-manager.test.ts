@@ -180,6 +180,18 @@ describe("replacement policy", () => {
 		expect(replacementVictim([slot({ key: "young", choked: true, openedAt: 29_000 }), useless], 30_000, 30_000)?.key).toBe("useless");
 		expect(replacementVictim([slot({ key: "d", delivering: true, useless: true })], 30_000, 30_000)).toBeUndefined();
 	});
+
+	it("waits longer for a choked seed (patience), counting from its last delivery", () => {
+		const seed = slot({ key: "seed", choked: true, patient: true, openedAt: 0 });
+		const partial = slot({ key: "partial", choked: true, openedAt: 0, score: 9 });
+		expect(replacementVictim([seed], 35_000, 30_000, 120_000)).toBeUndefined();
+		expect(replacementVictim([seed, partial], 35_000, 30_000, 120_000)?.key).toBe("partial");
+		expect(replacementVictim([seed], 120_000, 30_000, 120_000)?.key).toBe("seed");
+		// It delivered until 100 s: choked only since then.
+		expect(replacementVictim([{ ...partial, chokedSince: 100_000 }], 120_000, 30_000, 120_000)).toBeUndefined();
+		// Without a patience the grace is the same for everyone.
+		expect(replacementVictim([seed], 30_000, 30_000)?.key).toBe("seed");
+	});
 });
 
 describe("socket width and in-flight cap", () => {

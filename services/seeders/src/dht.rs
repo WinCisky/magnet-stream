@@ -16,8 +16,26 @@ pub struct DhtClient {
 impl DhtClient {
     /// Starts a DHT node listening on `port`. This does not block on
     /// bootstrapping — the routing table populates itself as needed.
+    #[cfg(test)]
     pub fn new(port: u16) -> std::io::Result<Self> {
-        let dht = Dht::builder().port(port).build()?.as_async();
+        Self::with_bootstrap(port, None)
+    }
+
+    /// As `new`, with explicit bootstrap nodes (`None`: the library's
+    /// defaults; an empty list: none, the node stays off the public DHT).
+    pub fn with_bootstrap(port: u16, bootstrap: Option<&[String]>) -> std::io::Result<Self> {
+        let mut builder = Dht::builder();
+        builder.port(port);
+        match bootstrap {
+            Some([]) => {
+                builder.no_bootstrap();
+            }
+            Some(nodes) => {
+                builder.bootstrap(nodes);
+            }
+            None => {}
+        }
+        let dht = builder.build()?.as_async();
         Ok(Self { dht })
     }
 
@@ -61,5 +79,13 @@ impl DhtClient {
         .await;
 
         found.into_iter().collect()
+    }
+
+    /// Announce `port` for `info_hash` (BEP 5 `announce_peer`), so peers
+    /// that look the info-hash up find us. Best effort: false on failure or
+    /// after `deadline`.
+    pub async fn announce(&self, info_hash: [u8; 20], port: u16, deadline: Duration) -> bool {
+        let put = self.dht.announce_peer(Id::from(info_hash), Some(port));
+        matches!(tokio::time::timeout(deadline, put).await, Ok(Ok(_)))
     }
 }

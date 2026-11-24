@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 pub const HANDSHAKE_LEN: usize = 68;
-const PROTOCOL: &[u8; 19] = b"BitTorrent protocol";
+pub const PROTOCOL: &[u8; 19] = b"BitTorrent protocol";
 
 /// Fits the bitfield of any sane torrent and a 16 KiB ut_metadata block;
 /// anything bigger is a broken or hostile peer.
@@ -89,11 +89,23 @@ impl Handshake {
 }
 
 pub fn encode_handshake(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> [u8; HANDSHAKE_LEN] {
+    let mut reserved = [0u8; 8];
+    reserved[5] |= 0x10; // extension protocol (BEP 10)
+    reserved[7] |= 0x04; // fast extension (BEP 6)
+    encode_handshake_with(&reserved, info_hash, peer_id)
+}
+
+/// A handshake with the caller's reserved bytes (the tunnel gateway writes
+/// the browser's, which knows which extensions it speaks).
+pub fn encode_handshake_with(
+    reserved: &[u8; 8],
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+) -> [u8; HANDSHAKE_LEN] {
     let mut buf = [0u8; HANDSHAKE_LEN];
     buf[0] = PROTOCOL.len() as u8;
     buf[1..20].copy_from_slice(PROTOCOL);
-    buf[20 + 5] |= 0x10; // extension protocol (BEP 10)
-    buf[20 + 7] |= 0x04; // fast extension (BEP 6)
+    buf[20..28].copy_from_slice(reserved);
     buf[28..48].copy_from_slice(info_hash);
     buf[48..68].copy_from_slice(peer_id);
     buf

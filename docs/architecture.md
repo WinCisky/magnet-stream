@@ -155,8 +155,10 @@ The engine escalates only as far as it must:
 1. **Patience on Cloudflare tunnels.** Stay connected and interested to every reachable seeder and wait out the optimistic unchoke (about 30 s per rotation). Persistent connections make this work where the proof of concept gave up after 8 s. Reciprocation helps with partial peers here: a leecher that has pieces we lack and lacks pieces we have trades with us.
 2. **Use partial peers.** Leechers with some pieces are sources too. Their bitfields and `have` messages feed the scarce-piece rule above.
 3. **Become reachable.** If fewer than 2 peers deliver, or rate stays under the bitrate, the page asks the VPS gateway to join the swarm for this info-hash: it announces its own port to trackers and DHT, accepts inbound TCP and uTP connections, and hands each one to the browser as another tunnel. NATed seeders connect to it within one announce interval.
-4. **Hole punching.** uTP with `ut_holepunch` (BEP 55) through a peer we are already connected to reaches NATed peers that do not re-announce soon.
+4. **Hole punching.** uTP with `ut_holepunch` (BEP 55) through a peer we are already connected to reaches NATed peers that do not re-announce soon. The relay must have reached the VPS gateway's announced port (an inbound or uTP peer), so that it gives the target that port; the browser sends the rendezvous, and on the relay's `connect` asks the VPS gateway for a uTP connection to the target, which takes the target's simultaneous SYN for it (`packages/engine/src/holepunch.ts`, `services/seeders/src/tunnel/punch.rs`, docs/tunnel-protocol.md › Hole punching). The browser never relays for others.
 5. **Degrade honestly.** If rate is below bitrate, the page says so and offers to keep buffering; the file still completes.
+
+Thresholds (OQ-11, configurable, deliberately demanding): step 3 starts when fewer than 2 peers deliver for 90 s in a row (counted once the scout's live addresses are used up) or the rate stays under the bitrate for 90 s in a row; step 5's notice after 30 s under the bitrate. A choked seed keeps its slot for about four optimistic rotations (120 s) before a waiting candidate may replace it. Inbound peers join the picker and the choker like any other (`packages/engine/src/escalation.ts`, `connection-manager.ts`). The session counts the bytes each gateway carried (Cloudflare, VPS), and the page's diagnostics report them, so a review can tell how much of a film needed the VPS (M4-08). The scenarios (one NATed seed, a seed late to unchoke, partial leechers that together cover the file, the VPS gateway dying mid-download) run end to end on every CI run (`tools/e2e/src/few-seeders-scenarios.ts`).
 
 ### Verification
 
@@ -175,7 +177,7 @@ Binary WebSocket messages, each a sequence of frames `[type u8][conn u16][length
 
 | Frame | Direction | Meaning |
 | --- | --- | --- |
-| `open` | Browser to gateway | Dial `ip:port` for this info-hash on connection id `conn` |
+| `open` | Browser to gateway | Dial `ip:port` for this info-hash on connection id `conn` (TCP, or uTP on the VPS gateway) |
 | `opened` / `failed` | Gateway to browser | Handshake accepted, or the reason it was not (refused, timeout, not BitTorrent) |
 | `data` | Both | Raw peer-wire bytes for `conn` |
 | `close` | Both | Connection ended, with a reason |

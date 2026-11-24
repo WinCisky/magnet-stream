@@ -7,11 +7,13 @@
 	import * as DropdownMenu from "$lib/components/ui/dropdown-menu/index.js";
 	import { diagnostics } from "$lib/diagnostics/recorder";
 	import type { PhaseMetrics } from "$lib/diagnostics/phase";
+	import type { PathsDiag } from "$lib/torrent/session-protocol";
 
 	let visits: number | null = $state(null);
 	let metrics: PhaseMetrics | null = $state(null);
 	let lastRow: string | null = $state(null);
 	let upload: { enabled: boolean; bytes: number; unchoked: number; messages: number } | null = $state(null);
+	let paths: PathsDiag | null = $state(null);
 	let copied = $state(false);
 	let busy = $state(false);
 	let error: string | null = $state(null);
@@ -25,7 +27,10 @@
 		metrics = phase?.metrics ?? null;
 		lastRow = phase?.lastRow ?? null;
 		upload = await diagnostics.lastUpload().catch(() => null);
+		paths = await diagnostics.lastPaths().catch(() => null);
 	}
+
+	const mb = (bytes: number) => (bytes / 1e6).toFixed(1);
 
 	async function copyRow() {
 		if (!lastRow) return;
@@ -107,6 +112,15 @@
 					<span data-metric="upload-messages">{upload.messages}</span>
 					<span>Setting</span>
 					<span data-metric="upload-enabled">{upload.enabled ? "on" : "off"}</span>
+				</span>
+			{/if}
+			{#if paths}
+				<span class="mt-1 font-medium">Data path (last session)</span>
+				<span class="grid grid-cols-[1fr_auto] gap-x-3 tabular-nums" data-testid="path-metrics">
+					<span>Received through Cloudflare</span>
+					<span data-metric="path-cloudflare-mb" data-bytes={paths.cloudflare.downloaded}>{mb(paths.cloudflare.downloaded)} MB</span>
+					<span>Received through the VPS</span>
+					<span data-metric="path-vps-mb" data-bytes={paths.vps.downloaded}>{mb(paths.vps.downloaded)} MB</span>
 				</span>
 			{/if}
 			{#if error}

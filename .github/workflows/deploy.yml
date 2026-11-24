@@ -54,8 +54,14 @@ jobs:
           PAGES_PROJECT: ${{ vars.PAGES_PROJECT }}
           PUBLIC_SEEDERS_URL: ${{ vars.PUBLIC_SEEDERS_URL }}
           PUBLIC_WORKER_URL: ${{ vars.PUBLIC_WORKER_URL }}
+          PUBLIC_DEFAULT_GATEWAY: ${{ vars.PUBLIC_DEFAULT_GATEWAY }}
+          PUBLIC_VPS_GATEWAY_URL: ${{ vars.PUBLIC_VPS_GATEWAY_URL }}
         run: |
           fail=0
+          # Optional: which gateway is primary (unset = cloudflare); the build rejects anything else too.
+          case "$PUBLIC_DEFAULT_GATEWAY" in ""|cloudflare|vps) ;; *) echo "::error::PUBLIC_DEFAULT_GATEWAY must be cloudflare or vps"; fail=1 ;; esac
+          # Optional: the VPS tunnel gateway, when it is not at PUBLIC_SEEDERS_URL.
+          case "$PUBLIC_VPS_GATEWAY_URL" in ""|https://*) ;; *) echo "::error::PUBLIC_VPS_GATEWAY_URL must be an https:// URL"; fail=1 ;; esac
           for name in SITE_URL PAGES_PROJECT PUBLIC_SEEDERS_URL PUBLIC_WORKER_URL; do
             if [ -z "${!name}" ]; then echo "::error::environment variable $name is not set"; fail=1; fi
           done
@@ -72,6 +78,8 @@ jobs:
           SITE_URL: ${{ vars.SITE_URL }}
           PUBLIC_SEEDERS_URL: ${{ vars.PUBLIC_SEEDERS_URL }}
           PUBLIC_WORKER_URL: ${{ vars.PUBLIC_WORKER_URL }}
+          PUBLIC_DEFAULT_GATEWAY: ${{ vars.PUBLIC_DEFAULT_GATEWAY }}
+          PUBLIC_VPS_GATEWAY_URL: ${{ vars.PUBLIC_VPS_GATEWAY_URL }}
         run: |
           npm run build -w apps/web
           npm run check:dist -w apps/web

@@ -305,6 +305,8 @@ const key = (piece: number, begin: number) => `${piece}:${begin}`;
 
 export class Uploader {
 	readonly stats: UploadStats = { bytes: 0, blocks: 0, rejected: 0, ignored: 0, refused: {}, metadataPieces: 0, metadataRejected: 0, unchokes: 0, reads: 0 };
+	/** Piece bytes just sent to peer `id` (the session counts them per gateway path). */
+	onSent: ((id: string, bytes: number) => void) | undefined;
 	private readonly opts: Required<Omit<UploadOptions, "source" | "random">> & Pick<UploadOptions, "source" | "random">;
 	private readonly now: () => number;
 	private readonly peers = new Map<string, PeerState>();
@@ -641,6 +643,7 @@ export class Uploader {
 			s.uploaded += data.length;
 			this.stats.bytes += data.length;
 			this.stats.blocks++;
+			this.onSent?.(s.id, data.length);
 		}
 		this.pump();
 	}

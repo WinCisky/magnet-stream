@@ -25,12 +25,27 @@ Where the numbers live (decision OQ-19, option C):
   dead, unknown, the `info` line accepted or rejected): the `lookup`,
   `tunnel` and `scout` sections. The tunnel section also says what the
   session uploaded (bytes, peers unchoked, messages sent only for the
-  upload, the setting), shown in the menu as *Sharing with peers*. Nothing is sent anywhere.
+  upload, the setting), shown in the menu as *Sharing with peers*, and
+  (from M4-08) the bytes by gateway path: received and sent through the
+  Cloudflare gateway and through the VPS gateway, with the connections on
+  each (`tunnel.paths`; totals and the VPS share in the `tunnel` health
+  section), shown in the menu as *Data path (last session)*. Nothing is sent anywhere.
 - **Synthetic, every CI run.** `npm run e2e` (browser session) recovers a
   256 MiB file (128 MiB until M3-07) from a fixed mixed swarm and fails if billed requests per GB
   exceed the budget. Its numbers are written to
-  `tools/e2e/results/browser-session.json`, kept as the `measurements`
-  artifact of the CI run for 90 days.
+  `tools/e2e/results/browser-session.json` (with `pathBytes`: bytes by
+  gateway path as the page reports them, all on the primary gateway), kept
+  as the `measurements` artifact of the CI run for 90 days.
+- **Few seeders, every CI run** (M4-08). `npm run e2e:few-seeders -w
+  tools/e2e` runs four scenarios on the full local stack (wrangler dev as
+  the primary gateway, the VPS gateway with an inbound port, a fake tracker,
+  fake peers; all on loopback, nothing announced to public trackers or the
+  DHT), each ending with every piece verified against the source, and checks
+  the bytes the diagnostics give for each path (table below). **Declared
+  time: 120 s** for the four scenarios once the stack is up
+  (`FEW_SEEDERS_BUDGET_S`); the run fails above it. `npm run e2e:few`
+  checks the same split in the browser (Diagnostics menu and exported
+  report).
 - **Real-world, at each manual milestone review** (M2-11, M3-07, M4-09,
   M5-05). A few real torrents are watched and their rows are added below.
 
@@ -59,6 +74,20 @@ production; 1 and 2 catch regressions.
 | 2026-11-21 | M3 (M3-12) | working tree, local run | 128 MiB | 1.4 | 16.6 | 34.9 | 34.6 (3 WebSockets; 0.39 MB uploaded, 5 upload-only messages) | 40 |
 | 2026-11-22 | M3 (M3-07) | working tree, local run | 256 MiB | 1.4 | 25.4 | 19.8 | 19.7 (3 WebSockets; 1.0 MB uploaded, 5 upload-only messages) | 40 |
 | 2026-11-22 | M3 (M3-07) | working tree, local run on one CPU core | 256 MiB | 1.5 | 11 | 26.3 | 26.3 (3 WebSockets; 2.1 MB uploaded, 6 upload-only messages) | 40 |
+
+### Few-seeders scenarios (CI e2e, M4-08)
+
+Escalation after 2 s of few peers (the page's default is 90 s). Local run,
+2026-11-24 (scenarios 1–3 run together, then 4):
+
+| Scenario | Swarm | Through Cloudflare | Through the VPS | Time |
+|---|---|---|---|---|
+| nat-seed | 1 seed behind NAT (dials out to the tracker's addresses) | 0 | 4.0 MiB (1 inbound) | 4.4 s |
+| late-unchoke | 1 reachable seed that unchokes after 20 s | 2.0 MiB (1 connection, kept) | 0 | 21.7 s |
+| partial-mix | no seed: 2 reachable leechers (½ each, overlapping) + 1 NATed leecher (second ½) | 3.0 MiB | 1.0 MiB | 11.3 s |
+| vps-crash | 1 reachable leecher (first ¼) + 1 NATed seed; VPS gateway killed at ¼ via the VPS, back 1 s later | 1.0 MiB | 3.0 MiB (2 inbound, 2 WebSockets) | 17.7 s |
+
+Total 39 s against the declared 120 s.
 
 ## Real-world
 

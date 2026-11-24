@@ -152,6 +152,28 @@ describe("buildReport", () => {
 		expect(out.overview).toMatchObject({ sessions: 3 });
 	});
 
+	it("reports the bytes that went through each gateway (M4-08), including a session whose peers only came in through the VPS", () => {
+		const mixed = session((s) => {
+			s.tunnel.paths = { cloudflare: { downloaded: 3 * MiB, uploaded: 1_000, connections: 2 }, vps: { downloaded: MiB, uploaded: 0, connections: 1 } };
+		});
+		const inboundOnly = session((s) => {
+			s.tunnel.dials.scout = { attempted: 0, succeeded: 0, failed: {} };
+			s.tunnel.dials.untried = { attempted: 0, succeeded: 0, failed: {} };
+			s.tunnel.paths = { cloudflare: { downloaded: 0, uploaded: 0, connections: 0 }, vps: { downloaded: 4 * MiB, uploaded: 0, connections: 1 } };
+		});
+		const older = session((s) => delete s.tunnel.paths);
+		const out = report([visit([recovery(healthy)], (v) => (v.sessions = [mixed, inboundOnly, older]))]);
+		expect(out.health.tunnel.details).toMatchObject({
+			sessions: 3,
+			paths: {
+				cloudflare: { downloaded: 3 * MiB, uploaded: 1_000, connections: 2, sessions: 1 },
+				vps: { downloaded: 5 * MiB, uploaded: 0, connections: 2, sessions: 2 },
+				vpsShare: 0.625,
+			},
+		});
+		expect(out.health.tunnel.summary).toContain("received 3.0 MB through Cloudflare, 5.0 MB through the VPS");
+	});
+
 	it("grades playback: quick starts are good, failures and long waits are not", () => {
 		const watched = (tune: (p: NonNullable<RecoveryRecord["playback"]>) => void) =>
 			recovery((r) => {

@@ -3,13 +3,19 @@
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
-	"description": "Hermetic end-to-end test: fake peer -> wrangler dev gateway -> engine",
+	"description": "Hermetic end-to-end tests: fake peer -> gateway (wrangler dev, or the VPS gateway with E2E_GATEWAY=vps) -> engine; uTP interop with libtorrent and Transmission (e2e:interop, Docker)",
 	"scripts": {
 		"e2e": "node src/tunnel-download.ts",
 		"e2e:scout": "node src/scout-session.ts",
 		"e2e:corrupt": "node src/corrupt-session.ts",
+		"e2e:inbound": "node src/inbound-session.ts",
+		"e2e:vps": "E2E_GATEWAY=vps node src/tunnel-download.ts && E2E_GATEWAY=vps node src/scout-session.ts && E2E_GATEWAY=vps node src/corrupt-session.ts",
 		"e2e:browser": "node src/browser-session.ts",
+		"e2e:browser:vps": "PUBLIC_DEFAULT_GATEWAY=vps node src/browser-session.ts",
 		"e2e:lookup": "node src/lookup-session.ts",
+		"e2e:few": "node src/few-seeders-session.ts",
+		"e2e:few-seeders": "node src/few-seeders-scenarios.ts",
+		"e2e:interop": "node src/utp-interop-session.ts",
 		"stack": "node src/stack.ts",
 		"typecheck": "tsc -p tsconfig.json",
 		"e2e:opfs": "node src/opfs-store.ts",
@@ -20,7 +26,8 @@
 	"dependencies": {
 		"@magnet-stream/engine": "0.1.0",
 		"@magnet-stream/fake-peer": "0.1.0",
-		"@magnet-stream/harness": "0.1.0"
+		"@magnet-stream/harness": "0.1.0",
+		"@magnet-stream/tunnel-protocol": "0.1.0"
 	},
 	"devDependencies": {
 		"@types/node": "^24.19.2",

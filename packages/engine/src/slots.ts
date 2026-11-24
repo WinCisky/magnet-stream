@@ -14,6 +14,13 @@ export interface SlotView {
 	downloaded: number;
 	score: number;
 	openedAt: number;
+	/** Since when it has been choking us without delivering (default `openedAt`). */
+	chokedSince?: number;
+	/**
+	 * A seed that chokes us: worth waiting for over several optimistic-unchoke
+	 * rotations (docs/architecture.md §Swarms with few seeders, step 1).
+	 */
+	patient?: boolean;
 }
 
 /**
@@ -23,10 +30,13 @@ export interface SlotView {
  * once: it cannot serve us whatever it does. A choked connection is
  * replaceable only after `chokeAfterMs`: an optimistic unchoke is worth
  * waiting for when nothing better is urgent, but a waiting candidate is
- * better than a peer that has not unchoked.
+ * better than a peer that has not unchoked. A choked seed (`patient`) gets
+ * `patienceMs` instead (default: `chokeAfterMs`): the optimistic slot
+ * rotates about every 30 s and may take several rotations to reach us.
  */
-export function replacementVictim(slots: readonly SlotView[], now: number, chokeAfterMs: number): SlotView | undefined {
-	const replaceable = slots.filter((s) => !s.delivering && (s.useless === true || s.slow || (s.choked && now - s.openedAt >= chokeAfterMs)));
+export function replacementVictim(slots: readonly SlotView[], now: number, chokeAfterMs: number, patienceMs = chokeAfterMs): SlotView | undefined {
+	const chokedLongEnough = (s: SlotView) => now - (s.chokedSince ?? s.openedAt) >= (s.patient === true ? Math.max(chokeAfterMs, patienceMs) : chokeAfterMs);
+	const replaceable = slots.filter((s) => !s.delivering && (s.useless === true || s.slow || (s.choked && chokedLongEnough(s))));
 	if (replaceable.length === 0) return undefined;
 	return replaceable.sort(
 		(a, b) => Number(b.useless === true) - Number(a.useless === true) || a.downloaded - b.downloaded || a.score - b.score || a.openedAt - b.openedAt,

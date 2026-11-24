@@ -10,8 +10,22 @@
 // (picker.ts): container index, playback window from the fastest peers,
 // read-ahead, scarce pieces, back-fill. Each recovery (`recover`, or
 // `download` for a whole torrent) is one picker target; a seek withdraws
-// requests with `cancel` and keeps the connections. The VPS gateway is M4-06. Nothing is logged: a peer address or an info-hash must
+// requests with `cancel` and keeps the connections. Nothing is logged: a peer address or an info-hash must
 // not reach the console. Detailed debug stays opt-in in the page (`mw-debug`).
+// Bytes are counted by the gateway that carried them (`diagnostics().paths`,
+// M4-08): the primary gateway's path (`gatewayPath`) or the VPS escalation's.
+//
+// Swarms with few seeders (§Chunk recovery › Swarms with few seeders,
+// M4-06, escalation.ts): a choked seed keeps its slot for several
+// optimistic-unchoke rotations (`seedPatienceMs`); partial peers are
+// sources like any other; when fewer than 2 peers deliver (once the scout's
+// live candidates are used up) or the rate stays under the video's bitrate,
+// for 90 s in a row, the session opens one WebSocket to the VPS gateway
+// (`escalation.gatewayUrl`) and asks it to join the swarm (`announce`: the
+// info-hash and the magnet's trackers, nothing else). Its inbound peers are
+// connections like the others (picker, choker, upload); that WebSocket
+// never dials. Without a VPS gateway the session never escalates, and
+// still reports a rate under the bitrate (`swarmHealth`).
 //
 // Dialling follows the VPS scout (revision of 2026-11-19, OQ-21, OQ-23):
 // addresses the scout saw alive may take all 6 slots of a socket, untried
@@ -28,6 +42,17 @@
 // `maxRecycles` times, one per `recycleIntervalMs`: each is a billed
 // upgrade); and once enough peers deliver fast enough, untried addresses
 // are not dialled at all.
+//
+// Hole punching (§Chunk recovery › Swarms with few seeders, step 4, M4-05,
+// holepunch.ts): once the session announces on the VPS gateway, while more
+// peers are needed, a peer behind NAT that a relay named in ut_pex (with
+// the holepunch flag) gets a BEP 55 rendezvous through that relay; on the
+// relay's `connect` the session sends a uTP `open` to it on the VPS
+// gateway, which dials from the announced port. Relays are the connections
+// that reached the gateway's announced port (inbound peers, uTP ones). An
+// error, an unanswered rendezvous or a failed open marks the target in the
+// PeerBook (`hp_<reason>`) and the session goes on; at most 2 punches are in
+// flight, each target is tried through 2 relays at most.
 //
 // Width costs while nothing uses it: a WebSocket with no connection still
 // pings every 30 s. The rate rule adds a socket only when candidates
@@ -58,12 +83,15 @@ import {
 	FailReason,
 	MAX_CONNECTIONS_PER_SOCKET,
 	PING_INTERVAL_MS,
+	Transport as TunnelTransportKind,
 	formatAddress,
 } from "@magnet-stream/tunnel-protocol";
 import { Attribution, blockDigests, type AttributionOptions, type Verdict } from "./attribution.ts";
 import type { MetadataMessage } from "./extension.ts";
 import { HashFetcher } from "./hashes.ts";
 import { bytesToHex } from "./magnet.ts";
+import { Escalation, type EscalationConfig, type EscalationReason } from "./escalation.ts";
+import { HolePuncher, type HolepunchConfig, type HolepunchMessage, type HolepunchStats } from "./holepunch.ts";
 import { BLOCK_SIZE, geometryOf, type Metainfo } from "./metainfo.ts";
 import { PeerBook, PexSource, type DialClass, type PeerEntry, type PeerOrigin } from "./peer-book.ts";
 import type { ScoutFacts } from "./peers-stream.ts";
@@ -73,7 +101,7 @@ import { Picker, type BlockCancel, type PickedBlock, type PickerConfig, type Pic
 import { connectionScore, type ScoreFacts } from "./score.ts";
 import { replacementVictim, requestAllowance, shouldAddSocket, type RateSample, type SlotView } from "./slots.ts";
 import type { Transport } from "./transport.ts";
-import { TunnelClient, TunnelOpenError, failReasonName, type WebSocketFactory } from "./tunnel-client.ts";
+import { AnnounceStatus, TunnelClient, TunnelOpenError, failReasonName, type AcceptedPeer, type WebSocketFactory } from "./tunnel-client.ts";
 import { UPLOAD_DEFAULTS, Uploader, type UploadOptions, type UploadStats } from "./upload.ts";
 import { DEFAULT_BATCH_MS } from "./upstream.ts";
 import { V2Verifier, verifierFor, type PieceVerifier } from "./verify.ts";
@@ -133,10 +161,75 @@ const RECYCLE_MIN_GAIN_MS = 5_000;
  * session (M3-07 measurements).
  */
 export const IDLE_SOCKET_MS = 25_000;
+/** "Under the bitrate" is judged on the rate over this long (1 s samples). */
+const ESCALATION_RATE_MS = 10_000;
+/** The VPS WebSocket is reopened after a failure at most this many times in a row. */
+const MAX_VPS_ATTEMPTS = 5;
+const VPS_RETRY_MS = 5_000;
+
+/** Swarms with few seeders: where to escalate and when (escalation.ts). */
+export interface EscalationOptions extends Partial<EscalationConfig> {
+	/**
+	 * The VPS gateway (`http(s)://host` or `ws(s)://host/v1/tunnel`). Unset:
+	 * escalation is off. The primary gateway's URL: the announce goes on the
+	 * session's own WebSockets.
+	 */
+	gatewayUrl?: string;
+	/** The magnet's trackers, announced to by the VPS gateway (http, https, udp; at most 16). */
+	trackers?: readonly string[];
+}
+
+/**
+ * Escalation to the VPS gateway: `off` (no VPS gateway configured), `idle`
+ * (not needed so far), `joining` (WebSocket opening or announce sent),
+ * `joined` (the gateway announces and hands over inbound peers),
+ * `left` (it was, and the session's own peers were enough again for a
+ * while: the announce was withdrawn; a thin swarm escalates again),
+ * `unavailable` (it refused or could not be reached).
+ */
+export type EscalationState = "off" | "idle" | "joining" | "joined" | "left" | "unavailable";
+
+/** The session's state on a thin swarm, for the page (no addresses). */
+export interface SwarmHealth {
+	escalation: EscalationState;
+	/** Why it escalated (null: it did not). */
+	reason: EscalationReason | null;
+	/** The rate has stayed under the video's bitrate for the warning delay. */
+	belowBitrate: boolean;
+	/** Peers connected now that the VPS gateway handed over. */
+	inbound: number;
+	/** Download rate, bytes/s, over the last seconds. */
+	rate: number;
+	/** The video's bytes/s (0: not known). */
+	bitrate: number;
+}
+
+/**
+ * Which gateway carried a connection's bytes: the Cloudflare Durable Object
+ * or the VPS (its tunnel gateway, primary or escalated to).
+ */
+export type GatewayPath = "cloudflare" | "vps";
+
+export const GATEWAY_PATHS: readonly GatewayPath[] = ["cloudflare", "vps"];
+
+/** Piece bytes that went through one gateway path this session. */
+export interface PathBytes {
+	/** Block bytes received that the session had asked for (as `downloadedBytes`). */
+	downloaded: number;
+	/** Piece bytes sent to peers (upload). */
+	uploaded: number;
+	/** Connections that came up on it (dialled or inbound). */
+	connections: number;
+}
 
 export interface ConnectionManagerOptions {
 	/** `http://host:port` or `ws://host:port/v1/tunnel`. */
 	gatewayUrl: string;
+	/**
+	 * Which gateway `gatewayUrl` is, for the per-path byte counters (default:
+	 * `vps` when it is `escalation.gatewayUrl`, else `cloudflare`).
+	 */
+	gatewayPath?: GatewayPath;
 	/** 20-byte wire info-hash. */
 	infoHash: Uint8Array;
 	peerId?: Uint8Array;
@@ -194,6 +287,16 @@ export interface ConnectionManagerOptions {
 	onBan?(): void;
 	/** Reciprocation: where verified pieces are read, the setting, the caps (upload.ts). No source: no upload. */
 	upload?: UploadOptions;
+	/**
+	 * A seed that chokes us keeps its slot this long before a waiting
+	 * candidate may replace it (default 4 × chokeReplaceAfterMs: 120 s, four
+	 * optimistic-unchoke rotations).
+	 */
+	seedPatienceMs?: number;
+	/** Swarms with few seeders: the VPS gateway and the thresholds (no gateway: no escalation). */
+	escalation?: EscalationOptions;
+	/** Hole punching through relays once the VPS gateway announces (holepunch.ts); false turns it off. */
+	holepunch?: Partial<HolepunchConfig> | false;
 }
 
 export interface RecoverOptions {
@@ -289,6 +392,8 @@ const DOWNLOAD_RETRIES = 3;
 
 interface Sock {
 	client: TunnelClient;
+	/** The gateway this WebSocket goes to. */
+	path: GatewayPath;
 	/** Untried dials in flight. */
 	untested: number;
 	/** Until when the slots of untried dials that timed out stay taken (OQ-03). */
@@ -327,6 +432,26 @@ export interface ConnectionDiagnostics {
 	recycles: number;
 	/** Reciprocation (M3-12). */
 	upload: UploadDiagnostics;
+	/** Inbound peers the VPS gateway handed over (`accept`) this session. */
+	accepted: number;
+	/** Escalation to the VPS gateway (M4-06). */
+	escalation: EscalationDiagnostics;
+	/** Hole punching (M4-05): rendezvous sent, connections made, failures by reason. */
+	holepunch: HolepunchStats;
+	/** Bytes by the gateway that carried them (M4-08): Cloudflare, VPS. */
+	paths: Record<GatewayPath, PathBytes>;
+}
+
+export interface EscalationDiagnostics {
+	state: EscalationState;
+	reason: EscalationReason | null;
+	/** Ms from the session start to the escalation (null: none). */
+	afterMs: number | null;
+	/** WebSockets opened to the VPS gateway for it (not billed by Cloudflare). */
+	upgrades: number;
+	belowBitrate: boolean;
+	/** Escalations withdrawn because the session's own peers were enough again. */
+	withdrawals: number;
 }
 
 /** What the upload did (no addresses). */
@@ -476,6 +601,37 @@ export class ConnectionManager {
 	private readonly uploader: Uploader;
 	/** Upload-only messages of sockets already closed. */
 	private lazyBefore = 0;
+	/** announce() was called: the trackers to announce with (re-sent on a new socket). */
+	private announceTrackers: string[] | undefined;
+	private acceptedCount = 0;
+	private readonly escalation: Escalation;
+	/** The VPS gateway (escalation.gatewayUrl), if any, and whether it is the primary one. */
+	private readonly vpsUrl: string | undefined;
+	private readonly vpsIsPrimary: boolean;
+	private escalationState: EscalationState;
+	private escalatedAt = 0;
+	/** The WebSocket to the VPS gateway (escalated, and not the primary gateway). */
+	private vps: Sock | undefined;
+	private vpsOpening = false;
+	private vpsAttempts = 0;
+	private vpsRetryAt = 0;
+	private vpsUpgrades = 0;
+	/** The VPS `/peers` stream is still running (its live candidates may not be in yet). */
+	private discovering = false;
+	/** BEP 55 bookkeeping (undefined: hole punching off). */
+	private readonly punch: HolePuncher | undefined;
+	/** Live connections that leave from the VPS gateway's announced port over uTP (possible relays). */
+	private readonly utpKeys = new Set<string>();
+	/** Targets whose punch came up as an inbound connection (`in:` key): their book entry is "connected". */
+	private readonly punchedIn = new Set<string>();
+	/** Targets a punch reached this session: they may be punched again (a TCP dial to them fails). */
+	private readonly punched = new Set<string>();
+	/** Where the session's own WebSockets go (the VPS escalation WebSocket is always `vps`). */
+	private readonly primaryPath: GatewayPath;
+	private readonly pathBytes: Record<GatewayPath, PathBytes> = {
+		cloudflare: { downloaded: 0, uploaded: 0, connections: 0 },
+		vps: { downloaded: 0, uploaded: 0, connections: 0 },
+	};
 
 	constructor(options: ConnectionManagerOptions) {
 		if (options.infoHash.length !== 20) throw new RangeError("info-hash must be 20 bytes");
@@ -507,6 +663,16 @@ export class ConnectionManager {
 		this.peerId = options.peerId ?? ourPeerId();
 		this.attribution = new Attribution(options.attribution);
 		this.uploader = new Uploader(options.upload, () => this.now());
+		this.escalation = new Escalation(options.escalation);
+		this.vpsUrl = validGatewayUrl(options.escalation?.gatewayUrl);
+		this.vpsIsPrimary = this.vpsUrl !== undefined && sameGateway(this.vpsUrl, options.gatewayUrl);
+		this.escalationState = this.vpsUrl ? "idle" : "off";
+		this.primaryPath = options.gatewayPath === "vps" || options.gatewayPath === "cloudflare" ? options.gatewayPath : this.vpsIsPrimary ? "vps" : "cloudflare";
+		this.uploader.onSent = (key, bytes) => {
+			const live = this.lives.get(key);
+			if (live) this.pathBytes[live.sock.path].uploaded += bytes;
+		};
+		this.punch = options.holepunch === false ? undefined : new HolePuncher(options.holepunch);
 	}
 
 	get liveCount(): number {
@@ -589,6 +755,17 @@ export class ConnectionManager {
 		return { ...this.attribution.counts };
 	}
 
+	/** Bytes and connections by the gateway that carried them (Cloudflare, VPS). */
+	get pathStats(): Record<GatewayPath, PathBytes> {
+		return { cloudflare: { ...this.pathBytes.cloudflare }, vps: { ...this.pathBytes.vps } };
+	}
+
+	/** Hole punching counters (no addresses). */
+	get holepunchStats(): HolepunchStats {
+		const s = this.punch?.stats ?? { attempted: 0, connected: 0, failed: {}, unsolicited: 0 };
+		return { ...s, failed: { ...s.failed } };
+	}
+
 	/** Strikes of a peer (`ip:port`), for tests. */
 	strikesOf(key: string): number {
 		return this.attribution.strikesOf(key);
@@ -638,6 +815,17 @@ export class ConnectionManager {
 			messagesSent: this.messagesSent,
 			untestedHighWater: this.untestedHigh,
 			recycles: this.recycles,
+			accepted: this.acceptedCount,
+			escalation: {
+				state: this.escalationState,
+				reason: this.escalation.reason ?? null,
+				afterMs: this.escalatedAt > 0 ? this.escalatedAt - this.startedAt : null,
+				upgrades: this.vpsUpgrades,
+				belowBitrate: this.escalation.belowBitrate,
+				withdrawals: this.escalation.withdrawals,
+			},
+			holepunch: this.holepunchStats,
+			paths: this.pathStats,
 			upload: {
 				enabled: this.uploader.on,
 				active: this.uploader.isActive,
@@ -651,8 +839,294 @@ export class ConnectionManager {
 		};
 	}
 
+	/**
+	 * Ask the gateway to join the swarm (VPS gateway, docs/tunnel-protocol.md
+	 * › Announce and inbound connections): it announces its port with the
+	 * session's info-hash and `trackers` and hands inbound peers to the
+	 * session, which uses them like dialled ones. Resolves with the
+	 * AnnounceStatus (UNSUPPORTED on a gateway without inbound peers). Kept
+	 * across reconnects until withdraw() or the end of the session.
+	 */
+	async announce(trackers: readonly string[] = []): Promise<number> {
+		if (this.stopped) throw new Error("stopped");
+		if (this.sockets.length === 0) await this.openSocket();
+		this.announceTrackers = [...trackers];
+		const sock = this.sockets.find((s) => !s.client.closed);
+		if (!sock) throw new Error("no tunnel socket");
+		return this.announceOn(sock);
+	}
+
+	/** Stop announcing; inbound peers already connected stay. */
+	withdraw(): void {
+		this.announceTrackers = undefined;
+		for (const sock of this.sockets) sock.client.withdraw(this.opts.infoHash);
+	}
+
+	private announceOn(sock: Sock): Promise<number> {
+		return sock.client.announce({ infoHash: this.opts.infoHash, peerId: this.peerId, trackers: this.announceTrackers ?? [] });
+	}
+
+	/** An inbound peer: a peer connection like a dialled one (keyed `in:<ip:port>`, never dialled back: the port is ephemeral). */
+	private onAccepted(sock: Sock, peer: AcceptedPeer): void {
+		const key = `in:${peer.address}`;
+		// Already connected to that address (an inbound uTP peer connects from its listen port): a duplicate.
+		const duplicate = this.lives.has(key) || this.lives.has(peer.address);
+		if (this.stopped || this.settled || sock.client.closed || bytesToHex(peer.infoHash) !== bytesToHex(this.opts.infoHash) || duplicate) {
+			peer.transport.close();
+			return;
+		}
+		this.acceptedCount++;
+		// A hole punch whose target's SYN reached the announced port before our open: that is its connection.
+		if (this.punch?.pending(peer.address)) {
+			this.punch.succeeded(peer.address);
+			this.punched.add(peer.address);
+			this.punchedIn.add(peer.address);
+			this.book.markConnected(peer.address);
+		}
+		if (peer.peerTransport === TunnelTransportKind.UTP) this.utpKeys.add(key);
+		this.attach(sock, key, peer.transport);
+	}
+
 	private markStarted(): void {
 		if (this.startedAt === 0) this.startedAt = this.now();
+	}
+
+	/**
+	 * The VPS `/peers` stream started (true) or ended (false). "Fewer than 2
+	 * peers deliver" counts only once the scout's live candidates are used
+	 * up: the stream is over and none of them waits or is being dialled.
+	 */
+	setDiscovering(running: boolean): void {
+		this.discovering = running;
+	}
+
+	/** The session on a thin swarm: escalation, a rate under the bitrate (no addresses). */
+	swarmHealth(): SwarmHealth {
+		let inbound = 0;
+		if (this.vps) for (const live of this.lives.values()) if (live.sock === this.vps) inbound++;
+		if (this.vpsIsPrimary) for (const live of this.lives.values()) if (live.key.startsWith("in:")) inbound++;
+		return {
+			escalation: this.escalationState,
+			reason: this.escalation.reason ?? null,
+			belowBitrate: this.escalation.belowBitrate,
+			inbound,
+			rate: Math.round(this.recentRate(this.now()) || 0),
+			bitrate: Math.round(this.videoBitrate),
+		};
+	}
+
+	/** The scout's live candidates are used up: discovery over, none left to dial, none being dialled. */
+	private scoutExhausted(): boolean {
+		if (this.discovering) return false;
+		for (const p of this.book.entries()) {
+			if (p.banned || this.book.dialClass(p) !== "scout") continue;
+			if (p.state === "connecting") return false;
+		}
+		return !this.book.candidates(Infinity).some((p) => this.book.dialClass(p) === "scout");
+	}
+
+	/** Bytes/s over the last ESCALATION_RATE_MS (NaN: no sample yet, nothing to judge). */
+	private recentRate(now: number): number {
+		let sum = 0;
+		let n = 0;
+		for (const s of this.samples) {
+			if (s.at <= now - ESCALATION_RATE_MS) continue;
+			sum += s.rate;
+			n++;
+		}
+		return n > 0 ? sum / n : Number.NaN;
+	}
+
+	/**
+	 * A connection the escalation brought: an inbound peer, a uTP connection
+	 * from the announced port (hole punches included), anything on the VPS
+	 * escalation WebSocket.
+	 */
+	private viaEscalation(live: Live): boolean {
+		return live.key.startsWith("in:") || this.utpKeys.has(live.key) || (this.vps !== undefined && live.sock === this.vps);
+	}
+
+	/** Judge the swarm (escalation.ts) and keep the VPS gateway joined once escalated (and only while needed). */
+	private escalationTick(now: number): void {
+		const active = !this.stopped && !this.settled && !this.suspended && (this.recoveries.size > 0 || this.downloading);
+		let delivering = 0;
+		let ownDelivering = 0;
+		let ownRate = 0;
+		if (active) {
+			for (const live of this.lives.values()) {
+				if (!this.isDelivering(live, now)) continue;
+				delivering++;
+				if (this.viaEscalation(live)) continue;
+				ownDelivering++;
+				ownRate += live.rate;
+			}
+		}
+		const verdict = this.escalation.update({
+			now,
+			active,
+			delivering,
+			scoutExhausted: active && this.scoutExhausted(),
+			rate: this.recentRate(now),
+			bitrate: this.videoBitrate,
+			ownDelivering,
+			ownRate,
+		});
+		if (verdict.withdraw && (this.escalationState === "joined" || this.escalationState === "joining")) {
+			this.leaveSwarm();
+			return;
+		}
+		if (verdict.escalate && (this.escalationState === "idle" || this.escalationState === "left")) {
+			if (this.escalatedAt === 0) this.escalatedAt = now;
+			this.escalationState = "joining";
+			this.joinSwarm();
+			return;
+		}
+		// Left the swarm: the VPS WebSocket goes once its last peer has.
+		if (this.escalationState === "left" && this.vps && ![...this.lives.values()].some((l) => l.sock === this.vps)) this.retireVps();
+		// Joined before, and the WebSocket went (a restart, a suspend): back when data is wanted again.
+		const wanted = this.escalationState === "joining" || this.escalationState === "joined";
+		if (active && wanted && !this.vpsIsPrimary && !this.vps && !this.vpsOpening && now >= this.vpsRetryAt) this.joinSwarm();
+	}
+
+	/**
+	 * The escalation is no longer needed (escalation.ts): withdraw the
+	 * announce, so the gateway leaves the swarm (trackers get `stopped`).
+	 * Peers already connected through it stay; a thin swarm later escalates
+	 * again.
+	 */
+	private leaveSwarm(): void {
+		this.escalationState = "left";
+		this.vpsAttempts = 0;
+		if (this.vpsIsPrimary) {
+			this.withdraw();
+			return;
+		}
+		const sock = this.vps;
+		if (!sock) return;
+		// No peer on it: closing the WebSocket ends its announce on the gateway.
+		if (![...this.lives.values()].some((l) => l.sock === sock)) this.retireVps();
+		else sock.client.withdraw(this.opts.infoHash);
+	}
+
+	/** Ask the VPS gateway to announce the session's info-hash and hand over inbound peers. */
+	private joinSwarm(): void {
+		const trackers = [...(this.opts.escalation?.trackers ?? [])];
+		if (this.vps && !this.vps.client.closed && !this.vpsIsPrimary) {
+			// Left earlier, the WebSocket still carries peers: announce on it again.
+			const sock = this.vps;
+			sock.client.announce({ infoHash: this.opts.infoHash, peerId: this.peerId, trackers }).then(
+				(status) => {
+					if (this.vps !== sock || this.escalationState !== "joining") return;
+					this.escalationState = status === AnnounceStatus.ACTIVE ? "joined" : "unavailable";
+				},
+				() => {
+					if (this.vps === sock && this.escalationState === "joining") this.escalationState = "unavailable";
+				},
+			);
+			return;
+		}
+		if (this.vpsIsPrimary) {
+			// The session's own WebSockets go to the VPS: announce there (kept across reconnects).
+			this.announce(trackers).then(
+				(status) => {
+					if (this.escalationState === "joining") this.escalationState = status === AnnounceStatus.ACTIVE ? "joined" : "unavailable";
+				},
+				() => {
+					if (this.escalationState === "joining") this.escalationState = "unavailable";
+				},
+			);
+			return;
+		}
+		void this.openVps(trackers);
+	}
+
+	private async openVps(trackers: string[]): Promise<void> {
+		if (!this.vpsUrl || this.vpsOpening || this.vps) return;
+		this.vpsOpening = true;
+		this.vpsUpgrades++;
+		let sock: Sock | undefined;
+		try {
+			const client = await TunnelClient.connect(tunnelUrl(this.vpsUrl, this.sessionId), {
+				factory: this.opts.factory,
+				batchMs: this.opts.batchMs,
+				timeoutMs: 10_000,
+				lazyMs: this.opts.upload?.flushMs ?? UPLOAD_DEFAULTS.flushMs,
+			});
+			if (this.stopped || this.settled || this.suspended) {
+				client.close();
+				return;
+			}
+			const opened: Sock = { client, path: "vps", untested: 0, untestedHeld: [], emptySince: this.now() };
+			sock = opened;
+			this.vps = opened;
+			client.onClose = () => this.onVpsClosed(opened);
+			client.onAccept = (peer) => this.onAccepted(opened, peer);
+			// The gateway ended the announce on its own (a shutdown, a limit).
+			client.onAnnounced = (_infoHash, status) => {
+				// (The STOPPED that answers our own withdraw finds the state `left`.)
+				const announcing = this.escalationState === "joined" || this.escalationState === "joining";
+				if (this.vps === opened && announcing && status !== AnnounceStatus.ACTIVE) this.escalationState = "unavailable";
+			};
+			const status = await client.announce({ infoHash: this.opts.infoHash, peerId: this.peerId, trackers });
+			if (this.vps !== opened) return;
+			if (status === AnnounceStatus.ACTIVE) {
+				this.escalationState = "joined";
+				this.vpsAttempts = 0;
+			} else {
+				// This gateway takes no inbound peers (or no more): nothing to gain from it.
+				this.escalationState = "unavailable";
+				this.retireVps();
+			}
+		} catch {
+			if (this.stopped) return;
+			if (sock && this.vps === sock) this.retireVps();
+			this.vpsFailed();
+		} finally {
+			this.vpsOpening = false;
+		}
+	}
+
+	/** The VPS WebSocket could not be opened or answered nothing: try again later, a few times. */
+	private vpsFailed(): void {
+		this.vpsAttempts++;
+		if (this.vpsAttempts >= MAX_VPS_ATTEMPTS) this.escalationState = "unavailable";
+		else this.vpsRetryAt = this.now() + VPS_RETRY_MS * 2 ** (this.vpsAttempts - 1);
+	}
+
+	private onVpsClosed(sock: Sock): void {
+		if (this.vps !== sock) return;
+		this.vps = undefined;
+		this.dropLivesOf(sock);
+		if (this.escalationState === "joined" || this.escalationState === "joining") this.vpsFailed();
+	}
+
+	/** Close the VPS WebSocket on purpose (its inbound peers go with it). */
+	private retireVps(): void {
+		const sock = this.vps;
+		if (!sock) return;
+		this.vps = undefined;
+		sock.client.onClose = undefined;
+		sock.client.close();
+		this.dropLivesOf(sock);
+	}
+
+	/** The peers of a socket that closed: their requests go back to the picker. */
+	private dropLivesOf(sock: Sock): void {
+		for (const [key, live] of [...this.lives]) {
+			if (live.sock !== sock) continue;
+			this.lives.delete(key);
+			this.uploader.remove(key);
+			this.requeue(live);
+			this.book.markClosed(key);
+			this.liveGone(key);
+		}
+	}
+
+	/** A connection left the session: it is no longer a relay, and a punched target's entry is free again. */
+	private liveGone(key: string): void {
+		this.utpKeys.delete(key);
+		for (const p of this.punch?.forgetRelay(key) ?? []) this.book.markNotDialled(p.target);
+		if (key.startsWith("in:") && this.punchedIn.delete(key.slice(3))) this.book.markClosed(key.slice(3));
 	}
 
 	/**
@@ -994,8 +1468,13 @@ export class ConnectionManager {
 				client.close();
 				return;
 			}
-			const sock: Sock = { client, untested: 0, untestedHeld: [], emptySince: this.now() };
+			const sock: Sock = { client, path: this.primaryPath, untested: 0, untestedHeld: [], emptySince: this.now() };
 			client.onClose = () => this.onSocketClosed(sock);
+			client.onAccept = (peer) => this.onAccepted(sock, peer);
+			// The announce lives with its WebSocket: a new one takes it over when none has it.
+			if (this.announceTrackers && !this.sockets.some((s) => !s.client.closed && s.client.announcing > 0)) {
+				this.announceOn(sock).catch(() => {});
+			}
 			this.sockets.push(sock);
 			if (this.sockets.length > this.peakSockets) this.peakSockets = this.sockets.length;
 			this.reconnects = 0;
@@ -1016,13 +1495,7 @@ export class ConnectionManager {
 		const i = this.sockets.indexOf(sock);
 		if (i >= 0) this.sockets.splice(i, 1);
 		if (this.sockets.length === 0) this.disconnectedAt = this.now();
-		for (const [key, live] of [...this.lives]) {
-			if (live.sock !== sock) continue;
-			this.lives.delete(key);
-			this.uploader.remove(key);
-			this.requeue(live);
-			this.book.markClosed(key);
-		}
+		this.dropLivesOf(sock);
 		if (!this.stopped && !this.settled && !this.suspended && (this.downloading || this.sessionOpen || this.recoveries.size > 0)) this.scheduleReconnect();
 	}
 
@@ -1045,7 +1518,9 @@ export class ConnectionManager {
 		const now = this.now();
 		this.keepAlives();
 		for (const sock of this.sockets) sock.client.pingIfIdle(now, this.opts.pingIntervalMs);
+		this.vps?.client.pingIfIdle(now, this.opts.pingIntervalMs);
 		this.noteRate(now);
+		this.escalationTick(now);
 		this.recycle(now);
 		this.closeIdleSockets(now);
 		this.uploadTick(now);
@@ -1057,6 +1532,7 @@ export class ConnectionManager {
 		}
 		this.replace();
 		this.fill();
+		this.holepunchTick(now);
 		this.pipeline();
 		this.checkRecoveries();
 	}
@@ -1203,7 +1679,8 @@ export class ConnectionManager {
 	private closeIdleSockets(now: number): void {
 		for (const sock of [...this.sockets]) {
 			if (sock.client.closed) continue;
-			if (sock.client.connections > 0) {
+			// Inbound peers and an announce keep a socket too.
+			if (sock.client.connections > 0 || sock.client.accepted > 0 || sock.client.announcing > 0) {
 				sock.emptySince = now;
 				continue;
 			}
@@ -1345,6 +1822,112 @@ export class ConnectionManager {
 			});
 	}
 
+	/** The session's WebSockets on which the gateway announces the info-hash: where uTP opens are dialled. */
+	private utpSockets(): Sock[] {
+		const all = this.vps ? [...this.sockets, this.vps] : this.sockets;
+		return all.filter((s) => !s.client.closed && s.client.isAnnounced(this.opts.infoHash));
+	}
+
+	/** A connection that may relay: it supports ut_holepunch and reached the gateway's announced port. */
+	private isRelay(key: string, utp: readonly Sock[]): boolean {
+		const live = this.lives.get(key);
+		if (!live || live.peer.closed || !live.peer.supports("ut_holepunch")) return false;
+		return (key.startsWith("in:") || this.utpKeys.has(key)) && utp.includes(live.sock);
+	}
+
+	/** An address worth punching: valid, not connected or being dialled, never reached but by a punch, not said to be reachable. */
+	private isPunchTarget(key: string): boolean {
+		const entry = this.book.get(key);
+		if (!entry || entry.banned || entry.reachableHint) return false;
+		if (entry.connectedBefore && !this.punched.has(key)) return false;
+		if (entry.state === "connecting" || entry.state === "connected") return false;
+		if (this.lives.has(key) || this.lives.has(`in:${key}`)) return false;
+		return this.book.addressForOpen(key) !== undefined;
+	}
+
+	/**
+	 * Hole punching (M4-05): fail the rendezvous left unanswered, then start
+	 * punches while more peers are needed and the VPS gateway can dial uTP.
+	 */
+	private holepunchTick(now: number): void {
+		const punch = this.punch;
+		if (!punch) return;
+		for (const p of punch.expired(now)) this.punchFailed(p.target, "timeout");
+		const active = !this.stopped && !this.settled && !this.suspended && (this.recoveries.size > 0 || this.downloading);
+		if (!active || !this.needMorePeers(now)) return;
+		const utp = this.utpSockets();
+		if (!utp.some((s) => this.room(s) > 0)) return;
+		for (;;) {
+			const p = punch.next(
+				now,
+				(relay) => this.isRelay(relay, utp),
+				(target) => this.isPunchTarget(target),
+			);
+			if (!p) return;
+			const address = this.book.addressForOpen(p.target)!;
+			this.book.markConnecting(p.target);
+			if (!this.lives.get(p.relay)!.peer.sendHolepunch({ type: "rendezvous", address })) this.punchFailed(p.target, "no_support");
+		}
+	}
+
+	/** A relay's `connect` (dial the target over uTP) or `error` (mark it); anything we did not ask for is ignored. */
+	private onHolepunch(live: Live, message: HolepunchMessage): void {
+		const punch = this.punch;
+		if (!punch || this.stopped || this.settled) return;
+		const target = formatAddress(message.address);
+		if (message.type === "error") {
+			const reason = punch.onError(live.key, target, message.error);
+			if (reason !== undefined) this.markPunchFailed(target, reason);
+			return;
+		}
+		if (message.type !== "connect" || !punch.onConnect(live.key, target, this.now())) return;
+		const address = this.book.addressForOpen(target);
+		const utp = this.utpSockets().filter((s) => this.room(s) > 0);
+		// The relay's own socket first: it is the one the target was told about.
+		const sock = utp.find((s) => s === live.sock) ?? utp[0];
+		if (!address || !sock) {
+			punch.fail(target, address ? "busy" : "forbidden_address");
+			this.book.markNotDialled(target);
+			return;
+		}
+		void sock.client
+			.open({ address, infoHash: this.opts.infoHash, peerId: this.peerId, transport: TunnelTransportKind.UTP, urgent: true, timeoutMs: 20_000 })
+			.then(
+				(transport) => {
+					const mine = punch.pending(target)?.phase === "dialling";
+					if (!mine || this.stopped || this.settled || sock.client.closed || this.lives.has(target) || this.lives.has(`in:${target}`)) {
+						// The punch came up as an inbound connection first, or the session moved on.
+						transport.close();
+						if (mine) {
+							punch.fail(target, "closed");
+							this.book.markNotDialled(target);
+						}
+						return;
+					}
+					punch.succeeded(target);
+					this.punched.add(target);
+					this.utpKeys.add(target);
+					this.attach(sock, target, transport);
+				},
+				(e: unknown) => {
+					if (punch.pending(target)?.phase !== "dialling") return;
+					this.punchFailed(target, `open_${e instanceof TunnelOpenError ? failReasonName(e.reason) : "timeout"}`);
+				},
+			);
+	}
+
+	/** A punch failed: counted, and the target marked in the book (`hp_<reason>`) unless it was no fault of its own. */
+	private punchFailed(target: string, reason: string): void {
+		this.punch?.fail(target, reason);
+		this.markPunchFailed(target, reason);
+	}
+
+	private markPunchFailed(target: string, reason: string): void {
+		if (this.book.get(target)?.state !== "connecting") return;
+		if (reason === "relay_closed" || reason === "busy") this.book.markNotDialled(target);
+		else this.book.markFailed(target, `hp_${reason}`.slice(0, 32));
+	}
+
 	private attach(sock: Sock, key: string, transport: Transport): void {
 		const live: Live = {
 			key,
@@ -1358,6 +1941,7 @@ export class ConnectionManager {
 			sampledBytes: 0,
 			failures: 0,
 		};
+		this.pathBytes[sock.path].connections++;
 		const peer = new PeerConnection(transport, {
 			geometry: this.geometry,
 			// Keep-alives are sent together from the sweep (one message, not one per peer).
@@ -1398,9 +1982,13 @@ export class ConnectionManager {
 				},
 				pex: (message) => {
 					this.pex.ingest(message);
+					this.punch?.learn(key, message.added, message.dropped);
 					// Named by a peer that delivered: likely a live swarm member.
 					if (live.downloaded > 0) for (const a of message.added.slice(0, 100)) this.book.vouch(formatAddress({ family: a.family, ip: a.ip, port: a.port }));
 					this.fill();
+				},
+				holepunch: (message) => {
+					if (this.lives.get(key) === live) this.onHolepunch(live, message);
 				},
 				hashes: (request, hashes) => void this.hashes?.onHashes(peer, request, hashes),
 				hashReject: (request) => this.hashes?.onReject(peer, request),
@@ -1411,6 +1999,7 @@ export class ConnectionManager {
 					this.requeue(live);
 					if (sock.client.closed) this.book.markClosed(key);
 					else this.book.markFailed(key, "remote_closed");
+					this.liveGone(key);
 					this.hashes?.onClose(peer);
 					this.opts.onPeerClose?.(peer);
 					if (!sock.client.closed) this.fill();
@@ -1434,7 +2023,8 @@ export class ConnectionManager {
 			// A candidate this socket could dial once a slot frees.
 			if (this.book.candidates(1, this.notDialableOn(sock, now)).length === 0) continue;
 			const views = [...this.lives.values()].filter((l) => l.sock === sock).map((l) => this.view(l, now));
-			const victim = replacementVictim(views, now, this.opts.chokeReplaceAfterMs);
+			const patience = this.opts.seedPatienceMs ?? 4 * this.opts.chokeReplaceAfterMs;
+			const victim = replacementVictim(views, now, this.opts.chokeReplaceAfterMs, patience);
 			if (!victim) continue;
 			const live = this.lives.get(victim.key);
 			if (!live || this.isDelivering(live, now)) continue;
@@ -1462,6 +2052,9 @@ export class ConnectionManager {
 			downloaded: live.downloaded,
 			score: connectionScore(facts, now),
 			openedAt: live.openedAt,
+			// Choked since it last delivered (or connected): a peer that served us earns its wait again.
+			chokedSince: Math.max(live.openedAt, live.lastBlockAt),
+			patient: live.peer.peerChoking && live.peer.isSeed,
 		};
 	}
 
@@ -1499,6 +2092,7 @@ export class ConnectionManager {
 		this.requeue(live);
 		if (reason) this.book.markFailed(live.key, reason);
 		else this.book.markClosed(live.key);
+		this.liveGone(live.key);
 		live.peer.close();
 	}
 
@@ -1611,6 +2205,7 @@ export class ConnectionManager {
 		live.lastBlockAt = now;
 		live.failures = 0;
 		this.downloaded += data.length;
+		this.pathBytes[live.sock.path].downloaded += data.length;
 		this.book.markDelivered(live.key, data.length);
 		if (ours) {
 			this.assigned.delete(key);
@@ -1837,8 +2432,11 @@ export class ConnectionManager {
 		for (const live of lives) {
 			this.requeue(live);
 			this.book.markClosed(live.key);
+			this.liveGone(live.key);
 			live.peer.close();
 		}
+		// The VPS WebSocket goes too (its announce ends with it); escalationTick reopens it when data is wanted again.
+		this.retireVps();
 		// A socket's onClose runs synchronously and splices this.sockets: iterate a copy.
 		for (const sock of this.sockets.splice(0)) {
 			this.sentBefore += sock.client.stats.messagesSent;
@@ -1871,6 +2469,26 @@ export function queueDepth(rate: number, reqq: number, inflightLimit = MAX_INFLI
  */
 export function needsRefill(outstanding: number, depth: number): boolean {
 	return outstanding <= Math.floor(Math.max(1, depth) / 2);
+}
+
+/** A gateway URL the tunnel can open (http(s) or ws(s)), else undefined (escalation off, no error). */
+function validGatewayUrl(raw: string | undefined): string | undefined {
+	if (typeof raw !== "string" || raw.trim() === "") return undefined;
+	try {
+		const url = new URL(tunnelUrl(raw.trim(), "x"));
+		return url.protocol === "ws:" || url.protocol === "wss:" ? raw.trim() : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Both URLs open tunnels on the same gateway. */
+function sameGateway(a: string, b: string): boolean {
+	try {
+		return tunnelUrl(a, "x") === tunnelUrl(b, "x");
+	} catch {
+		return false;
+	}
 }
 
 function ourPeerId(): Uint8Array {

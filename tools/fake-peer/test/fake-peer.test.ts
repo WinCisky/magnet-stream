@@ -415,3 +415,68 @@ describe("v2, hybrid and multi-file torrents", () => {
 		expect(t.magnet).toContain("urn:btmh:1220");
 	});
 });
+
+describe("outbound only (behind NAT)", () => {
+	/** A listener that answers a handshake and reports the peer's first bytes. */
+	function listener(): Promise<{ port: number; got: Promise<Buffer>; server: net.Server }> {
+		return new Promise((resolve) => {
+			let deliver!: (b: Buffer) => void;
+			const got = new Promise<Buffer>((r) => (deliver = r));
+			const server = net.createServer((socket) => {
+				let buf = Buffer.alloc(0);
+				socket.on("data", (chunk) => {
+					buf = Buffer.concat([buf, chunk]);
+					if (buf.length >= 68 && buf.length - chunk.length < 68) {
+						const hs = Buffer.from(buf.subarray(0, 68));
+						hs.write("-GW0001-gatewaygatewa", 48, "latin1");
+						socket.write(hs);
+					}
+					// The handshake, then the extension handshake and have-all after ours.
+					if (buf.length > 68 + 5) deliver(buf);
+				});
+			});
+			server.listen(0, "127.0.0.1", () => resolve({ port: (server.address() as net.AddressInfo).port, got, server }));
+		});
+	}
+
+	it("does not listen, dials out and starts the handshake", async () => {
+		const gw = await listener();
+		const p = await peer({ listen: false, connectTo: [`127.0.0.1:${gw.port}`] });
+		expect(p.port).toBe(0);
+		expect(p.addr).toBe("");
+		const bytes = await gw.got;
+		expect(bytes[0]).toBe(19);
+		expect(Buffer.from(bytes.subarray(28, 48)).equals(Buffer.from(torrent.infoHash))).toBe(true);
+		await until(() => p.stats.handshakes === 1);
+		gw.server.close();
+	});
+
+	it("dials the peers an HTTP tracker names", async () => {
+		const gw = await listener();
+		let announces = 0;
+		const tracker = net.createServer((s) =>
+			s.once("data", () => {
+				announces++;
+				const body = Buffer.concat([Buffer.from("d8:intervali60e5:peers6:"), Buffer.from([127, 0, 0, 1, gw.port >> 8, gw.port & 0xff]), Buffer.from("e")]);
+				s.end(Buffer.concat([Buffer.from(`HTTP/1.1 200 OK\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n`), body]));
+			}),
+		);
+		await new Promise<void>((r) => tracker.listen(0, "127.0.0.1", () => r()));
+		const url = `http://127.0.0.1:${(tracker.address() as net.AddressInfo).port}/announce`;
+		const p = await peer({ listen: false, tracker: url, announceIntervalMs: 100 });
+		await gw.got;
+		await until(() => p.stats.handshakes === 1 && announces >= 2);
+		// One connection per address, however often the tracker names it.
+		expect(p.stats.connections).toBe(1);
+		tracker.close();
+		gw.server.close();
+	});
+});
+
+async function until(pred: () => boolean, ms = 5_000): Promise<void> {
+	const end = Date.now() + ms;
+	while (!pred()) {
+		if (Date.now() > end) throw new Error("timed out");
+		await new Promise((r) => setTimeout(r, 10));
+	}
+}

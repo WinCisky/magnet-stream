@@ -5,6 +5,28 @@ import svelte from '@astrojs/svelte';
 import tailwindcss from '@tailwindcss/vite';
 import { libmediaChunks } from './scripts/vite-libmedia.mjs';
 import { streamWorker } from './scripts/stream-sw.mjs';
+import { resolveEscalation } from './src/lib/magnet/gateway-config.ts';
+
+/**
+ * PUBLIC_DEFAULT_GATEWAY picks the primary tunnel gateway (docs/operations.md
+ * › Default data path): resolved here from the same variables the bundle
+ * reads (.env files included), so an invalid value fails the build (and
+ * `astro dev`) with a clear message instead of shipping a broken site.
+ * @returns {import('vite').Plugin}
+ */
+function defaultGateway() {
+  return {
+    name: 'magnet-stream:default-gateway',
+    configResolved(config) {
+      try {
+        // The gateways and the escalation's thresholds (M4-06).
+        resolveEscalation(config.env);
+      } catch (e) {
+        throw new Error(`invalid gateway configuration: ${e instanceof Error ? e.message : String(e)}`, { cause: e });
+      }
+    },
+  };
+}
 
 // https://astro.build/config
 export default defineConfig({
@@ -27,7 +49,7 @@ export default defineConfig({
         "Cross-Origin-Resource-Policy": "cross-origin",
       },
     },
-    plugins: [tailwindcss(), libmediaChunks()],
+    plugins: [tailwindcss(), libmediaChunks(), defaultGateway()],
     define: {
       // Which build a diagnostics export came from (each deploy builds anew).
       __MW_BUILD__: JSON.stringify(new Date().toISOString().slice(0, 16) + 'Z'),

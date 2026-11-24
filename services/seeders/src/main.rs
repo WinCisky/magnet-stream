@@ -20,6 +20,8 @@ mod swarm;
 mod testpeer;
 mod token;
 mod tracker;
+mod tunnel;
+mod utp;
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Query, State};
@@ -63,7 +65,15 @@ async fn main() {
     let cfg = Arc::new(Config::from_env());
     tracing::info!(?cfg, "starting magnet-seeders");
 
-    let dht = Arc::new(DhtClient::new(cfg.dht_port).expect("failed to start DHT node"));
+    let dht = Arc::new(
+        DhtClient::with_bootstrap(cfg.dht_port, cfg.dht_bootstrap.as_deref())
+            .expect("failed to start DHT node"),
+    );
+    // No bootstrap nodes (DHT_BOOTSTRAP=none): nothing to warm up.
+    if cfg
+        .dht_bootstrap
+        .as_ref()
+        .is_none_or(|nodes| !nodes.is_empty())
     {
         let dht = dht.clone();
         tokio::spawn(async move { dht.warm_up().await });
@@ -77,6 +87,12 @@ async fn main() {
         .build()
         .expect("failed to build HTTP client");
 
+    let announcer = Arc::new(tunnel::inbound::Announcer {
+        http: http_client.clone(),
+        dht: Some(dht.clone()),
+        default_trackers: cfg.default_trackers.clone(),
+        max_trackers: cfg.max_trackers,
+    });
     let lookup = Arc::new(Lookup::new(http_client, dht));
     let cache = Arc::new(PeerCache::new(cfg.peers_cache_bytes));
     // One pool of probes for the scout and /swarm (PROBE_CONCURRENCY).
@@ -106,7 +122,22 @@ async fn main() {
         info,
     };
 
-    let app = router(state);
+    if cfg.allow_private_peers {
+        tracing::warn!(
+            "ALLOW_PRIVATE_PEERS is set: for local tests only (the tunnel honours it only for direct loopback requests)"
+        );
+    }
+    // Tunnels end with a close frame (4002) when the process is asked to stop.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let tunnel = tunnel::Tunnel::with_announcer(
+        cfg.tunnel.clone(),
+        cfg.allowed_origins.clone(),
+        cfg.allow_private_peers,
+        cfg.client_ip_header.clone(),
+        shutdown_rx,
+        announcer,
+    );
+    let app = router(state).merge(tunnel::router(tunnel));
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {}: {e}", cfg.bind_addr));
@@ -116,7 +147,12 @@ async fn main() {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+        // Time for the tunnels' close frames to go out.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    })
     .await
     .expect("server error");
 }

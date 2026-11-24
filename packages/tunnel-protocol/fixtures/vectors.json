@@ -42,6 +42,27 @@
 			]
 		},
 		{
+			"name": "open-utp-ipv4",
+			"description": "open conn 2 to 203.0.113.7:6881 over uTP (trailing transport byte 1)",
+			"file": "open-utp-ipv4.bin",
+			"hex": "01000200000038a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b300000000001000042d4d53303030312d6162636465666768696a6b6c04cb0071071ae101",
+			"frames": [
+				{
+					"type": "open",
+					"conn": 2,
+					"infoHash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3",
+					"reserved": "0000000000100004",
+					"peerId": "2d4d53303030312d6162636465666768696a6b6c",
+					"address": {
+						"family": 4,
+						"ip": "cb007107",
+						"port": 6881
+					},
+					"transport": 1
+				}
+			]
+		},
+		{
 			"name": "opened",
 			"description": "opened conn 1 with the remote's reserved bytes and peer id",
 			"file": "opened.bin",
@@ -115,6 +136,40 @@
 			]
 		},
 		{
+			"name": "accept-utp-ipv6",
+			"description": "accept conn 0xffff from [2001:db8::20]:51413 over uTP",
+			"file": "accept-utp-ipv6.bin",
+			"hex": "06ffff00000044a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b30000000000100004404142434445464748494a4b4c4d4e4f505152530620010db8000000000000000000000020c8d501",
+			"frames": [
+				{
+					"type": "accept",
+					"conn": 65535,
+					"infoHash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3",
+					"reserved": "0000000000100004",
+					"peerId": "404142434445464748494a4b4c4d4e4f50515253",
+					"address": {
+						"family": 6,
+						"ip": "20010db8000000000000000000000020",
+						"port": 51413
+					},
+					"transport": 1
+				}
+			]
+		},
+		{
+			"name": "failed-unsupported-transport",
+			"description": "failed conn 2, reason unsupported transport",
+			"file": "failed-unsupported-transport.bin",
+			"hex": "030002000000010a",
+			"frames": [
+				{
+					"type": "failed",
+					"conn": 2,
+					"reason": 10
+				}
+			]
+		},
+		{
 			"name": "ping-empty",
 			"description": "ping without payload",
 			"file": "ping-empty.bin",
@@ -137,6 +192,82 @@
 					"type": "ping",
 					"conn": 0,
 					"payload": "0102030405060708"
+				}
+			]
+		},
+		{
+			"name": "announce-trackers",
+			"description": "announce the info-hash with two tracker URLs (VPS gateway)",
+			"file": "announce-trackers.bin",
+			"hex": "0800000000006fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b300000000001000042d4d53303030312d6162636465666768696a6b6c0200237564703a2f2f747261636b65722e6578616d706c653a313333372f616e6e6f756e6365001768747470733a2f2f742e6578616d706c652f613f6b3d31",
+			"frames": [
+				{
+					"type": "announce",
+					"conn": 0,
+					"infoHash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3",
+					"reserved": "0000000000100004",
+					"peerId": "2d4d53303030312d6162636465666768696a6b6c",
+					"trackers": [
+						"udp://tracker.example:1337/announce",
+						"https://t.example/a?k=1"
+					]
+				}
+			]
+		},
+		{
+			"name": "announce-bare",
+			"description": "announce without trackers (the gateway's defaults only)",
+			"file": "announce-bare.bin",
+			"hex": "08000000000031a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b300000000001000042d4d53303030312d6162636465666768696a6b6c00",
+			"frames": [
+				{
+					"type": "announce",
+					"conn": 0,
+					"infoHash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3",
+					"reserved": "0000000000100004",
+					"peerId": "2d4d53303030312d6162636465666768696a6b6c",
+					"trackers": []
+				}
+			]
+		},
+		{
+			"name": "announced-active",
+			"description": "announced: active",
+			"file": "announced-active.bin",
+			"hex": "09000000000015a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b300",
+			"frames": [
+				{
+					"type": "announced",
+					"conn": 0,
+					"infoHash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3",
+					"status": 0
+				}
+			]
+		},
+		{
+			"name": "announced-unsupported",
+			"description": "announced: unsupported (a gateway without inbound peers)",
+			"file": "announced-unsupported.bin",
+			"hex": "09000000000015a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b302",
+			"frames": [
+				{
+					"type": "announced",
+					"conn": 0,
+					"infoHash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3",
+					"status": 2
+				}
+			]
+		},
+		{
+			"name": "withdraw",
+			"description": "withdraw the announce",
+			"file": "withdraw.bin",
+			"hex": "0a000000000014a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3",
+			"frames": [
+				{
+					"type": "withdraw",
+					"conn": 0,
+					"infoHash": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3"
 				}
 			]
 		},
@@ -179,9 +310,9 @@
 		},
 		{
 			"name": "err-unknown-type",
-			"description": "type 0x09",
+			"description": "type 0x0b",
 			"file": "err-unknown-type.bin",
-			"hex": "09000100000000",
+			"hex": "0b000100000000",
 			"error": "unknown_type"
 		},
 		{
@@ -241,9 +372,30 @@
 		},
 		{
 			"name": "err-open-length",
-			"description": "IPv4 open one byte too long",
+			"description": "IPv4 open with an explicit transport byte 0 (TCP is the byte left out)",
 			"file": "err-open-length.bin",
 			"hex": "0100010000003800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004cb0071071ae100",
+			"error": "bad_payload"
+		},
+		{
+			"name": "err-open-too-long",
+			"description": "IPv4 open two bytes too long",
+			"file": "err-open-too-long.bin",
+			"hex": "0100010000003900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004cb0071071ae10100",
+			"error": "bad_payload"
+		},
+		{
+			"name": "err-open-ipv6-short",
+			"description": "IPv6 open with an IPv4-sized payload plus a transport byte",
+			"file": "err-open-ipv6-short.bin",
+			"hex": "0100010000003800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006cb0071071ae101",
+			"error": "bad_payload"
+		},
+		{
+			"name": "err-accept-transport-zero",
+			"description": "IPv4 accept with an explicit transport byte 0",
+			"file": "err-accept-transport-zero.bin",
+			"hex": "0680000000003800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004c63364149c4000",
 			"error": "bad_payload"
 		},
 		{
@@ -313,8 +465,71 @@
 			"name": "err-after-valid",
 			"description": "a valid data frame followed by an unknown type",
 			"file": "err-after-valid.bin",
-			"hex": "04000100000001ff0a000100000000",
+			"hex": "04000100000001ff0b000100000000",
 			"error": "unknown_type"
+		},
+		{
+			"name": "err-announce-conn",
+			"description": "announce on conn 1",
+			"file": "err-announce-conn.bin",
+			"hex": "0800010000003100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+			"error": "bad_conn"
+		},
+		{
+			"name": "err-announce-trailing",
+			"description": "announce with 0 trackers and a trailing byte",
+			"file": "err-announce-trailing.bin",
+			"hex": "080000000000320000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+			"error": "bad_payload"
+		},
+		{
+			"name": "err-announce-count",
+			"description": "announce claiming 17 trackers",
+			"file": "err-announce-count.bin",
+			"hex": "0800000000003100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000011",
+			"error": "bad_payload"
+		},
+		{
+			"name": "err-announce-url-short",
+			"description": "announce whose tracker url ends early",
+			"file": "err-announce-url-short.bin",
+			"hex": "080000000000350000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100057564",
+			"error": "bad_payload"
+		},
+		{
+			"name": "err-announce-url-space",
+			"description": "announce whose tracker url holds a space",
+			"file": "err-announce-url-space.bin",
+			"hex": "08000000000036000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010003612062",
+			"error": "bad_payload"
+		},
+		{
+			"name": "err-announce-url-empty",
+			"description": "announce with an empty tracker url",
+			"file": "err-announce-url-empty.bin",
+			"hex": "08000000000033000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000",
+			"error": "bad_payload"
+		},
+		{
+			"name": "err-announced-length",
+			"description": "announced with 20 bytes",
+			"file": "err-announced-length.bin",
+			"hex": "090000000000140000000000000000000000000000000000000000",
+			"error": "bad_payload"
+		},
+		{
+			"name": "err-withdraw-conn",
+			"description": "withdraw on conn 2",
+			"file": "err-withdraw-conn.bin",
+			"hex": "0a0002000000140000000000000000000000000000000000000000",
+			"error": "bad_conn"
+		},
+		{
+			"name": "err-withdraw-length",
+			"description": "withdraw with 21 bytes",
+			"file": "err-withdraw-length.bin",
+			"hex": "0a000000000015000000000000000000000000000000000000000000",
+			"error": "bad_payload"
 		}
 	]
 }

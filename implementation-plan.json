@@ -1,5 +1,5 @@
 {
-  "plan_version": "1.4",
+  "plan_version": "1.5",
   "resolved_decisions": [
     {
       "id": "OQ-01",
@@ -19,10 +19,15 @@
     },
     {
       "id": "OQ-10",
-      "decision": "uTP con libreria esistente solo se largamente utilizzata e se realizza esattamente quanto serve; altrimenti implementazione propria. La verifica è il task M4-03.",
+      "decision": "uTP con libreria esistente solo se largamente utilizzata e se realizza esattamente quanto serve; altrimenti implementazione propria. La verifica è il task M4-03. Esito di M4-03 approvato dal committente il 2026-11-22: implementazione propria (docs/decisions/utp.md); M4-04 è suddiviso in M4-04a…M4-04f, un sotto-task per sessione.",
       "applied_to": [
         "M4-03",
-        "M4-04",
+        "M4-04a",
+        "M4-04b",
+        "M4-04c",
+        "M4-04d",
+        "M4-04e",
+        "M4-04f",
         "M4-05"
       ]
     },
@@ -315,10 +320,21 @@
           "M4-07"
         ],
         [
-          "M4-04",
+          "M4-04a",
           "M4-06"
         ],
         [
+          "M4-04b"
+        ],
+        [
+          "M4-04c",
+          "M4-04d"
+        ],
+        [
+          "M4-04e"
+        ],
+        [
+          "M4-04f",
           "M4-05"
         ],
         [
@@ -2034,12 +2050,12 @@
       ]
     },
     {
-      "id": "M4-04",
+      "id": "M4-04a",
       "parent_id": "T0",
       "milestone": "M4 - Percorso pochi seeder",
       "executor": "agent",
-      "title": "VPS: trasporto uTP",
-      "description": "Seguire l'esito di `docs/decisions/utp.md` (M4-03): usare la libreria indicata, oppure l'implementazione propria secondo la suddivisione approvata in quel documento (in tal caso questo task copre solo il sotto-task assegnato alla sessione). Aggiungere al gateway VPS connessioni uTP (BEP 29) in ingresso e in uscita sullo stesso socket UDP, esposte al browser come normali tunnel (stessi frame; estendere `open` con il tipo di trasporto in `docs/tunnel-protocol.md`). Riferimento: docs/architecture.md §Chunk recovery › Swarms with few seeders (punti 3 e 4), §Target architecture (Fallback gateway).",
+      "title": "uTP (1/6): codec dei pacchetti",
+      "description": "In `services/seeders/src/utp/` (nuovo modulo, senza I/O) implementare il codec dei pacchetti uTP di BEP 29: header di 20 byte (versione 1, tipi ST_DATA/ST_FIN/ST_STATE/ST_RESET/ST_SYN), catena di estensioni (selective ACK; estensioni sconosciute saltate con lunghezza validata), aritmetica dei numeri di sequenza a 16 bit con wrap, timestamp in microsecondi. Riferimento: docs/decisions/utp.md (sotto-task M4-04a), BEP 29. Implementazione propria decisa in M4-03 (`docs/decisions/utp.md`, approvata): nessuna libreria uTP come dipendenza; le implementazioni esistenti (librqbit-utp, libutp) si possono leggere come riferimento, senza copiarne codice senza mantenerne la licenza. Regole comuni del documento (§Split of M4-04): nessuna risposta a pacchetti non associati a una connessione, nessun `ST_RESET` verso sconosciuti, al più un `ST_STATE` per SYN ricevuto; stato limitato per indirizzo remoto e totale; parsing rigoroso; log solo con contatori e codici.",
       "depends_on": [
         "M4-02",
         "M4-03"
@@ -2049,26 +2065,143 @@
       ],
       "blocked_by_open_questions": [],
       "out_of_scope": [
-        "Hole punching (M4-05)",
-        "Scegliere una libreria diversa da quella decisa in M4-03",
+        "Macchina a stati, congestione, socket (M4-04b…d)",
         "Eseguire git commit, push o deploy"
       ],
       "acceptance_criteria": [
-        "L'implementazione corrisponde all'esito registrato in `docs/decisions/utp.md`",
-        "Un download completo via uTP da un peer di test viene verificato",
-        "Connessioni uTP in ingresso passano per lo stesso controllo di sessione attiva del TCP",
-        "Perdita e riordino di pacchetti simulati non corrompono lo stream",
+        "Encode/decode round trip identico su vettori costruiti da BEP 29",
+        "Ogni forma malformata (versione ≠ 1, tipo > 4, estensione troncata o non terminata, bitmask SACK di lunghezza non multipla di 4, payload su tipi diversi da ST_DATA) è rifiutata senza panic",
+        "Confronti di sequenza corretti attorno al wrap a 65535",
         "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
         "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
       ],
       "automated_tests": [
         {
           "type": "unit",
-          "covers": "Macchina a stati uTP o adattatore della libreria scelta"
-        },
+          "covers": "Codec, vettori BEP 29, input malformati, test di proprietà su byte casuali (nessun panic, round trip)"
+        }
+      ],
+      "functional_test": [
+        "1. `cargo test --manifest-path services/seeders/Cargo.toml` → verde"
+      ],
+      "security": [
+        "Il parser non alloca in proporzione a lunghezze dichiarate dal pacchetto e non va mai in panic su input arbitrario",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-04b",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "uTP (2/6): macchina a stati della connessione (sans-IO)",
+      "description": "Implementare la connessione uTP come macchina a stati senza I/O, guidata da `(istante, pacchetto in ingresso) → pacchetti in uscita, byte consegnati`: SYN con ritrasmissione e backoff, SYN-RECV, CONNECTED, FIN, RESET; buffer di riordino; timer di ritrasmissione (RTT/RTO come BEP 29); fast retransmit da selective ACK e ACK duplicati; finestra annunciata; buffer di invio e ricezione limitati; timeout di inattività. Apertura simultanea: un connect in uscita e un SYN in ingresso dallo stesso indirizzo possono completare entrambi (BEP 55), la scelta resta al chiamante. Finestra di congestione fissa in attesa di M4-04c. Riferimento: docs/decisions/utp.md (sotto-task M4-04b). Implementazione propria decisa in M4-03 (`docs/decisions/utp.md`, approvata): nessuna libreria uTP come dipendenza; le implementazioni esistenti (librqbit-utp, libutp) si possono leggere come riferimento, senza copiarne codice senza mantenerne la licenza. Regole comuni del documento (§Split of M4-04): nessuna risposta a pacchetti non associati a una connessione, nessun `ST_RESET` verso sconosciuti, al più un `ST_STATE` per SYN ricevuto; stato limitato per indirizzo remoto e totale; parsing rigoroso; log solo con contatori e codici.",
+      "depends_on": [
+        "M4-04a"
+      ],
+      "parallel_with": [
+        "M4-06"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "LEDBAT (M4-04c)",
+        "Socket UDP e tokio (M4-04d)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Un trasferimento di 16 MiB su un collegamento simulato con 10% di perdita, riordino e duplicazione arriva identico in entrambe le direzioni",
+        "Il SYN perso viene ritrasmesso; il connect fallisce entro un timeout configurabile",
+        "Gli scenari di apertura simultanea completano senza corrompere lo stream",
+        "La memoria per connessione resta entro i limiti configurati anche con un peer che non legge",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Macchina a stati con orologio simulato e collegamento in memoria: perdita, riordino, duplicazione, FIN/RESET, apertura simultanea"
+        }
+      ],
+      "functional_test": [
+        "1. `cargo test --manifest-path services/seeders/Cargo.toml` → verde"
+      ],
+      "security": [
+        "Pacchetti fuori finestra o con ack_nr incoerente sono scartati senza risposta",
+        "Limiti di buffer e di pacchetti in volo per connessione",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-04c",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "uTP (3/6): controllo di congestione LEDBAT",
+      "description": "Implementare LEDBAT come specificato da BEP 29 (target di ritardo 100 ms, storico del ritardo base, finestra minima di un pacchetto, reazione alla perdita) e collegarlo alla macchina a stati di M4-04b; dimensione dei pacchetti da un MTU fisso prudente (payload ≤ 1400 B, nessun probing PMTU). Riferimento: docs/decisions/utp.md (sotto-task M4-04c). Implementazione propria decisa in M4-03 (`docs/decisions/utp.md`, approvata): nessuna libreria uTP come dipendenza; le implementazioni esistenti (librqbit-utp, libutp) si possono leggere come riferimento, senza copiarne codice senza mantenerne la licenza. Regole comuni del documento (§Split of M4-04): nessuna risposta a pacchetti non associati a una connessione, nessun `ST_RESET` verso sconosciuti, al più un `ST_STATE` per SYN ricevuto; stato limitato per indirizzo remoto e totale; parsing rigoroso; log solo con contatori e codici.",
+      "depends_on": [
+        "M4-04b"
+      ],
+      "parallel_with": [
+        "M4-04d",
+        "M4-06"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Probing PMTU",
+        "Socket UDP e tokio (M4-04d)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Su un collegamento simulato il throughput raggiunge una frazione dichiarata della capacità",
+        "La finestra si riduce all'aumentare del ritardo di coda e alla perdita, e non si blocca mai",
+        "Il trasferimento con perdita di M4-04b resta identico",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "LEDBAT con ritardo e banda simulati: convergenza, arretramento, assenza di stalli"
+        }
+      ],
+      "functional_test": [
+        "1. `cargo test --manifest-path services/seeders/Cargo.toml` → verde"
+      ],
+      "security": [
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-04d",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "uTP (4/6): multiplexer sul socket UDP",
+      "description": "Implementare su un unico `tokio::net::UdpSocket` il multiplexer uTP: demultiplexing per (indirizzo, connection id), `connect(addr)` in uscita e accettazione in ingresso sullo stesso socket, cancello di accettazione deciso dal chiamante (listener attivo per un announce, oppure indirizzo atteso per un connect o un hole punch), limiti di connessioni semiaperte per IP e totali, nessuna risposta a pacchetti estranei, e `UtpStream: AsyncRead + AsyncWrite`. Riferimento: docs/decisions/utp.md (sotto-task M4-04d). Implementazione propria decisa in M4-03 (`docs/decisions/utp.md`, approvata): nessuna libreria uTP come dipendenza; le implementazioni esistenti (librqbit-utp, libutp) si possono leggere come riferimento, senza copiarne codice senza mantenerne la licenza. Regole comuni del documento (§Split of M4-04): nessuna risposta a pacchetti non associati a una connessione, nessun `ST_RESET` verso sconosciuti, al più un `ST_STATE` per SYN ricevuto; stato limitato per indirizzo remoto e totale; parsing rigoroso; log solo con contatori e codici.",
+      "depends_on": [
+        "M4-04b"
+      ],
+      "parallel_with": [
+        "M4-04c",
+        "M4-06"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Integrazione nel gateway e nel protocollo del tunnel (M4-04e)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Echo e trasferimento bulk in entrambe le direzioni su loopback attraverso un relay UDP con perdita",
+        "Un pacchetto non associato a una connessione o a un cancello aperto non riceve alcuna risposta",
+        "Un SYN riceve al più un `ST_STATE`; oltre i limiti i SYN sono ignorati",
+        "Connessioni in uscita e in ingresso condividono la porta locale",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
         {
           "type": "integration",
-          "covers": "Peer uTP di test su loopback con perdita simulata: download completo"
+          "covers": "Socket uTP su loopback con relay UDP con perdita: echo, bulk, pacchetti estranei, limiti"
         }
       ],
       "functional_test": [
@@ -2076,7 +2209,98 @@
       ],
       "security": [
         "Protezione da amplificazione/riflessione UDP: nessuna risposta a pacchetti non associati a una connessione o sessione valida",
-        "Limiti di stato per indirizzo remoto",
+        "Limiti di stato per indirizzo remoto e totali",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-04e",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "uTP (5/6): integrazione nel gateway VPS",
+      "description": "Esporre uTP al browser come normali tunnel: estendere `open` con il tipo di trasporto (TCP / uTP) e indicare il trasporto di un `accept` in `docs/tunnel-protocol.md`, nei codec Rust e TS (`packages/tunnel-protocol`) e nei vettori condivisi; dial uTP in uscita in `tunnel/session.rs`; connessioni uTP in ingresso in `tunnel/inbound.rs` con lo stesso handshake gate e lo stesso controllo di sessione attiva del TCP. Il socket UDP usa la porta annunciata e si apre e chiude con il listener TCP; deve essere distinto da `DHT_PORT` (oggi entrambi 6881 di default: aggiornare default, README e `deploy/*.env.example`). L'engine accetta il nuovo campo senza cambiare politica di dial. Riferimento: docs/architecture.md §Chunk recovery › Swarms with few seeders (punti 3 e 4), §Target architecture (Fallback gateway); docs/decisions/utp.md (sotto-task M4-04e). Implementazione propria decisa in M4-03 (`docs/decisions/utp.md`, approvata): nessuna libreria uTP come dipendenza; le implementazioni esistenti (librqbit-utp, libutp) si possono leggere come riferimento, senza copiarne codice senza mantenerne la licenza. Regole comuni del documento (§Split of M4-04): nessuna risposta a pacchetti non associati a una connessione, nessun `ST_RESET` verso sconosciuti, al più un `ST_STATE` per SYN ricevuto; stato limitato per indirizzo remoto e totale; parsing rigoroso; log solo con contatori e codici.",
+      "depends_on": [
+        "M4-04c",
+        "M4-04d"
+      ],
+      "parallel_with": [
+        "M4-06"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Hole punching (M4-05)",
+        "Politica dell'engine su quando usare uTP (M4-05/M4-06)",
+        "Test di interoperabilità con client reali (M4-04f)",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Un download completo via uTP da un peer di test, con perdita simulata, viene verificato",
+        "Connessioni uTP in ingresso passano per lo stesso controllo di sessione attiva del TCP; per un info-hash non annunciato nessuna risposta",
+        "Nessun socket UDP uTP è aperto prima di un announce",
+        "I vettori binari condivisi, incluso il nuovo campo di `open`, sono identici in Rust e TS",
+        "Il gateway Cloudflare rifiuta `open` uTP con un motivo documentato",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "unit",
+          "covers": "Codec del campo trasporto (Rust e TS) sui vettori condivisi"
+        },
+        {
+          "type": "integration",
+          "covers": "Gateway VPS + peer uTP di test su loopback con perdita: open, accept, download completo, info-hash sconosciuto"
+        }
+      ],
+      "functional_test": [
+        "1. `cargo test --manifest-path services/seeders/Cargo.toml` → verde",
+        "2. `npm test -w packages/tunnel-protocol` → verde"
+      ],
+      "security": [
+        "Il gateway avvia connessioni uTP solo verso indirizzi che superano netguard e solo per sessioni attive",
+        "Log senza IP dei peer o info-hash",
+        "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
+      ]
+    },
+    {
+      "id": "M4-04f",
+      "parent_id": "T0",
+      "milestone": "M4 - Percorso pochi seeder",
+      "executor": "agent",
+      "title": "uTP (6/6): interoperabilità con client reali",
+      "description": "Dimostrare R1 di docs/decisions/utp.md invece di assumerlo: test contro libtorrent-rasterbar (ad es. i binding Python) e libutp (Transmission), in CI se praticabile, altrimenti come passo manuale documentato con l'esito registrato in docs/decisions/utp.md: connessioni in ingresso e in uscita e un download completo attraverso il gateway VPS. Le eventuali correzioni di interoperabilità rientrano nel task. Riferimento: docs/decisions/utp.md (sotto-task M4-04f). Implementazione propria decisa in M4-03 (`docs/decisions/utp.md`, approvata): nessuna libreria uTP come dipendenza; le implementazioni esistenti (librqbit-utp, libutp) si possono leggere come riferimento, senza copiarne codice senza mantenerne la licenza. Regole comuni del documento (§Split of M4-04): nessuna risposta a pacchetti non associati a una connessione, nessun `ST_RESET` verso sconosciuti, al più un `ST_STATE` per SYN ricevuto; stato limitato per indirizzo remoto e totale; parsing rigoroso; log solo con contatori e codici.",
+      "depends_on": [
+        "M4-04e"
+      ],
+      "parallel_with": [
+        "M4-05",
+        "M4-06"
+      ],
+      "blocked_by_open_questions": [],
+      "out_of_scope": [
+        "Test contro swarm reali su Internet",
+        "Eseguire git commit, push o deploy"
+      ],
+      "acceptance_criteria": [
+        "Download completo verificato in entrambe le direzioni di connessione con libtorrent-rasterbar e con libutp",
+        "Esito e versioni dei client registrati in docs/decisions/utp.md",
+        "Eventuali nuove dipendenze di test sono solo di sviluppo/CI e passano l'audit delle dipendenze",
+        "`npm run verify` (lint, typecheck, test TS, cargo fmt --check, clippy, cargo test) termina con exit 0",
+        "Nessun commit o push eseguito: le modifiche restano nel working tree per la revisione umana"
+      ],
+      "automated_tests": [
+        {
+          "type": "e2e",
+          "covers": "Gateway VPS ↔ client libtorrent e libutp su loopback"
+        }
+      ],
+      "functional_test": [
+        "1. `cargo test --manifest-path services/seeders/Cargo.toml` → verde",
+        "2. Eseguire il test di interoperabilità (comando documentato) → verde"
+      ],
+      "security": [
+        "Test confinati a loopback; nessun announce verso tracker o DHT reali",
         "Nessun segreto in codice, fixture o config versionati: solo variabili d'ambiente / secret store (verificato dalla secret scan di CI)"
       ]
     },
@@ -2086,11 +2310,13 @@
       "milestone": "M4 - Percorso pochi seeder",
       "executor": "agent",
       "title": "Hole punching (BEP 55)",
-      "description": "Implementare `ut_holepunch`: l'engine nel browser invia il messaggio di rendezvous tramite un peer già connesso che supporta l'estensione e chiede al gateway VPS di avviare la connessione uTP simultanea verso il peer dietro NAT; il risultato è un tunnel come gli altri. Riferimento: docs/architecture.md §Chunk recovery › Swarms with few seeders (punto 4).",
+      "description": "Implementare `ut_holepunch`: l'engine nel browser invia il messaggio di rendezvous tramite un peer già connesso che supporta l'estensione e chiede al gateway VPS di avviare la connessione uTP simultanea verso il peer dietro NAT; il risultato è un tunnel come gli altri. Riferimento: docs/architecture.md §Chunk recovery › Swarms with few seeders (punto 4). Usa l'apertura simultanea della connessione uTP (M4-04b) e il cancello di accettazione per indirizzo atteso del multiplexer (M4-04d).",
       "depends_on": [
-        "M4-04"
+        "M4-04e"
       ],
-      "parallel_with": [],
+      "parallel_with": [
+        "M4-04f"
+      ],
       "blocked_by_open_questions": [],
       "out_of_scope": [
         "Fare da relay per altri peer",
@@ -2132,7 +2358,12 @@
         "M4-02"
       ],
       "parallel_with": [
-        "M4-04"
+        "M4-04a",
+        "M4-04b",
+        "M4-04c",
+        "M4-04d",
+        "M4-04e",
+        "M4-04f"
       ],
       "blocked_by_open_questions": [],
       "out_of_scope": [
@@ -2222,6 +2453,7 @@
       "title": "E2E del percorso pochi seeder",
       "description": "Estendere `tools/harness` con tracker finto e peer 'solo in uscita' (simula un seeder dietro NAT che si connette agli indirizzi annunciati) e aggiungere scenari e2e: unico seed NATed raggiunto via announce + ingresso; seed lento a fare unchoke; mix di leecher parziali che insieme coprono il file; caduta del gateway VPS a metà. Aggiornare le metriche per distinguere i byte per percorso (Cloudflare / VPS).",
       "depends_on": [
+        "M4-04f",
         "M4-05",
         "M4-06",
         "M4-07"

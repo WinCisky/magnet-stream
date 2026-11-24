@@ -9,10 +9,11 @@
 //
 //   npm run e2e:corrupt -w tools/e2e
 //   E2E_GATEWAY_URL=http://127.0.0.1:8787 npm run e2e:corrupt -w tools/e2e   (a running wrangler dev with ALLOW_PRIVATE_PEERS=1)
+//   E2E_GATEWAY=vps npm run e2e:corrupt -w tools/e2e   (through the VPS gateway, services/seeders, instead of wrangler dev)
 
 import { ConnectionManager, parseInfoDict } from "@magnet-stream/engine";
 import { makeTorrent, startFakePeer, type FakePeer, type FakeTorrent } from "@magnet-stream/fake-peer";
-import { startWranglerDev, type WranglerDev } from "@magnet-stream/harness";
+import { gatewayKind, startGateway, type WranglerDev } from "@magnet-stream/harness";
 
 const MiB = 1024 * 1024;
 
@@ -64,15 +65,15 @@ async function scenario(base: string, label: string, torrent: FakeTorrent): Prom
 }
 
 async function main(): Promise<void> {
-	const base = process.env.E2E_GATEWAY_URL ?? (dev = await startWranglerDev({ vars: { ALLOW_PRIVATE_PEERS: "1" } })).url;
+	const base = process.env.E2E_GATEWAY_URL ?? (dev = await startGateway({ vars: { ALLOW_PRIVATE_PEERS: "1" } })).url;
 	const v1 = makeTorrent({ seed: 301, size: 4 * MiB, pieceLength: 256 * 1024 });
 	await scenario(base, "v1", v1);
 	const v2 = makeTorrent({ seed: 302, files: [{ path: ["corrupt.mkv"], length: 4 * MiB }], pieceLength: 256 * 1024, version: 2 });
 	await scenario(base, "v2", v2);
 	if (dev) {
 		const logs = dev.output();
-		check(![v1, v2].some((t) => logs.toLowerCase().includes(t.infoHashHex)), "info-hash absent from gateway logs");
-		check(!peers.some((p) => logs.includes(p.addr)), "peer addresses absent from gateway logs");
+		check(![v1, v2].some((t) => logs.toLowerCase().includes(t.infoHashHex)), `info-hash absent from ${gatewayKind()} gateway logs`);
+		check(!peers.some((p) => logs.includes(p.addr)), `peer addresses absent from ${gatewayKind()} gateway logs`);
 	}
 }
 

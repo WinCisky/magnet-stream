@@ -7,12 +7,21 @@
 // short grace so a quick switch keeps its peers. A later want reopens them.
 
 import type { Metainfo } from "@magnet-stream/engine/metainfo";
-import { SEEDERS_API_URL, WORKER_API_URL, type TorrentFile, type TorrentMetadata } from "$lib/magnet/api";
+import { ESCALATION, GATEWAY_URL, SEEDERS_API_URL, type TorrentFile, type TorrentMetadata } from "$lib/magnet/api";
 import SessionWorker from "./session.worker.ts?worker&inline";
 import type { StoreErrorCode } from "./piece-file.ts";
 import type { LookupFailure, LookupProgress } from "./lookup-wait.ts";
 import { onShareChange, readShare } from "$lib/settings/share";
-import { parseWorkerMessage, type MetadataOrigin, type PageMessage, type SessionDiag, type SessionListing, type WorkerMessage } from "./session-protocol.ts";
+import {
+	parseWorkerMessage,
+	type EscalationStart,
+	type MetadataOrigin,
+	type PageMessage,
+	type SessionDiag,
+	type SessionListing,
+	type SwarmHealth,
+	type WorkerMessage,
+} from "./session-protocol.ts";
 
 export interface LookupResult {
 	metadata: TorrentMetadata;
@@ -87,6 +96,7 @@ export class PageSession {
 	/** The session failed for good (worker error, closed): no retry. */
 	private broken: Error | undefined;
 	private lastDiag: SessionDiag | undefined;
+	private lastHealth: SwarmHealth | undefined;
 	private lookupProgress: LookupProgress | undefined;
 	private closed = false;
 	/** While the lookup waits: peers found, tried, connected (no addresses). */
@@ -118,15 +128,16 @@ export class PageSession {
 	 * list. One /peers request. `capMs`: the lookup's hard cap (default 120 s).
 	 * A LookupFailedError leaves the session open for `retry()`.
 	 */
-	lookup(magnet: string, opts: { gateway?: string; seeders?: string; capMs?: number } = {}): Promise<LookupResult> {
+	lookup(magnet: string, opts: { gateway?: string; seeders?: string; capMs?: number; escalation?: EscalationStart } = {}): Promise<LookupResult> {
 		const done = this.waitFiles();
 		this.post({
 			type: "start",
 			magnet,
-			gatewayUrl: opts.gateway ?? WORKER_API_URL,
+			gatewayUrl: opts.gateway ?? GATEWAY_URL,
 			seedersUrl: opts.seeders ?? SEEDERS_API_URL,
 			...(opts.capMs !== undefined ? { capMs: opts.capMs } : {}),
 			upload: readShare(),
+			escalation: opts.escalation ?? ESCALATION,
 		});
 		return done;
 	}
@@ -150,6 +161,11 @@ export class PageSession {
 	/** The session's counters for the diagnostics, as last reported. */
 	get diag(): SessionDiag | undefined {
 		return this.lastDiag;
+	}
+
+	/** The session on a thin swarm (escalation, a rate under the bitrate), as last reported while recovering. */
+	get health(): SwarmHealth | undefined {
+		return this.lastHealth;
 	}
 
 	/** The lookup's progress, as last reported. */
@@ -338,6 +354,7 @@ export class PageSession {
 			this.stats = { upgrades: msg.upgrades, messages: msg.messages };
 			this.peers = { known: msg.known, delivered: msg.delivered };
 		}
+		else if (msg.type === "health") this.lastHealth = msg.health;
 		else if (msg.type === "diag") {
 			this.lastDiag = msg.diag;
 			this.onDiag?.(msg.diag);

@@ -8,7 +8,7 @@
 import type { EngineObserver, EngineSnapshot } from "$lib/torrent/engine";
 import type { FileRange, Metainfo } from "@magnet-stream/engine/metainfo";
 import type { LookupFailure, LookupProgress } from "$lib/torrent/lookup-wait";
-import type { MetadataOrigin, SessionDiag } from "$lib/torrent/session-protocol";
+import { GATEWAY_PATHS, emptyPaths, type MetadataOrigin, type PathsDiag, type SessionDiag } from "$lib/torrent/session-protocol";
 import type { PlayerEvent } from "$lib/player/player";
 import { allVisits, clearVisits, countVisits, pruneVisits, putVisit } from "./db";
 import { detectEnvironment } from "./env";
@@ -219,6 +219,17 @@ export class Diagnostics {
 		const sessions = visits.sort((a, b) => a.startedAt - b.startedAt).flatMap((v) => v.sessions ?? []);
 		const last = sessions.sort((a, b) => a.startedAt - b.startedAt).findLast((s) => s.tunnel.upload !== undefined);
 		return last?.tunnel.upload ? { ...last.tunnel.upload } : null;
+	}
+
+	/** Bytes by gateway path of the latest torrent session that received any (null: none recorded). */
+	async lastPaths(): Promise<PathsDiag | null> {
+		await this.flush();
+		let visits = await allVisits().catch(() => [] as VisitRecord[]);
+		const current = this.visit;
+		if (current && this.active) visits = [...visits.filter((v) => v.id !== current.id), current];
+		const sessions = visits.flatMap((v) => v.sessions ?? []).sort((a, b) => a.startedAt - b.startedAt);
+		const last = sessions.findLast((s) => s.tunnel.paths !== undefined && s.tunnel.paths.cloudflare.downloaded + s.tunnel.paths.vps.downloaded > 0);
+		return last?.tunnel.paths ? { cloudflare: { ...last.tunnel.paths.cloudflare }, vps: { ...last.tunnel.paths.vps } } : null;
 	}
 
 	async clear(): Promise<void> {
@@ -561,6 +572,24 @@ export class SessionRecorder {
 		u.bytes = Math.max(u.bytes, d.upload.bytes);
 		u.unchoked = Math.max(u.unchoked, d.upload.unchoked);
 		u.messages = Math.max(u.messages, d.upload.messages);
+		const e = d.escalation;
+		const kept = t.escalation;
+		t.escalation = {
+			state: e.state,
+			reason: e.reason ?? kept?.reason ?? null,
+			afterMs: e.afterMs ?? kept?.afterMs ?? null,
+			upgrades: Math.max(kept?.upgrades ?? 0, e.upgrades),
+			accepted: Math.max(kept?.accepted ?? 0, e.accepted),
+		};
+		// Running totals: the most seen, so a late update never lowers them.
+		const paths = (t.paths ??= emptyPaths());
+		for (const name of GATEWAY_PATHS) {
+			const p = paths[name];
+			const q = d.paths[name];
+			p.downloaded = Math.max(p.downloaded, q.downloaded);
+			p.uploaded = Math.max(p.uploaded, q.uploaded);
+			p.connections = Math.max(p.connections, q.connections);
+		}
 		if (d.metadata) this.record.metadata = { ...d.metadata };
 		this.record.scout = { ...d.scout };
 		this.changed();

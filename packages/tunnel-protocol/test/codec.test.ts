@@ -1,11 +1,15 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+	AnnounceStatus,
 	CloseReason,
+	MAX_ANNOUNCE_TRACKERS,
+	MAX_TRACKER_URL_LENGTH,
 	FailReason,
 	FrameDecoder,
 	FrameError,
 	HEADER_LENGTH,
+	Transport,
 	decodeMessage,
 	encodeFrame,
 	encodeFrames,
@@ -35,7 +39,13 @@ const samples: Frame[] = [
 	{ type: "data", conn: 7, payload: Uint8Array.from({ length: 1000 }, (_, i) => i & 0xff) },
 	{ type: "close", conn: 8, reason: CloseReason.PROTOCOL_ERROR },
 	{ type: "accept", conn: 0xffff, infoHash, reserved, peerId, address: { family: 4, ip: Uint8Array.of(8, 8, 4, 4), port: 1024 } },
+	{ type: "open", conn: 2, infoHash, reserved, peerId, address: { family: 4, ip: Uint8Array.of(1, 2, 3, 4), port: 6881 }, transport: Transport.UTP },
+	{ type: "accept", conn: 0x8001, infoHash, reserved, peerId, address: { family: 6, ip: fromHex("2a0100000000000000000000000000ff"), port: 7000 }, transport: Transport.UTP },
 	{ type: "ping", conn: 0, payload: Uint8Array.of(1, 2, 3) },
+	{ type: "announce", conn: 0, infoHash, reserved, peerId, trackers: ["udp://t.example:6969/announce", "http://a.example/announce?x=1"] },
+	{ type: "announce", conn: 0, infoHash, reserved, peerId, trackers: [] },
+	{ type: "announced", conn: 0, infoHash, status: AnnounceStatus.LIMIT_REACHED },
+	{ type: "withdraw", conn: 0, infoHash },
 ];
 
 function json(frames: Frame[]) {
@@ -61,6 +71,35 @@ describe("round-trip", () => {
 	it("uses the header layout [type u8][conn u16][length u32]", () => {
 		const message = encodeFrame({ type: "data", conn: 0x0102, payload: Uint8Array.of(9, 9, 9) });
 		expect(Array.from(message.subarray(0, HEADER_LENGTH))).toEqual([0x04, 0x01, 0x02, 0, 0, 0, 3]);
+	});
+});
+
+describe("transport of open and accept", () => {
+	const tcp: Frame = { type: "open", conn: 1, infoHash, reserved, peerId, address: { family: 4, ip: Uint8Array.of(1, 2, 3, 4), port: 6881 } };
+
+	it("TCP is the byte left out, so v1 frames are unchanged", () => {
+		expect(encodeFrame(tcp).length).toBe(HEADER_LENGTH + 55);
+		expect(encodeFrame({ ...tcp, transport: Transport.TCP })).toEqual(encodeFrame(tcp));
+		const decoded = decodeMessage(encodeFrame(tcp));
+		expect(decoded.ok && "transport" in decoded.frames[0]).toBe(false);
+	});
+
+	it("uTP adds one trailing byte", () => {
+		const bytes = encodeFrame({ ...tcp, transport: Transport.UTP });
+		expect(bytes.length).toBe(HEADER_LENGTH + 56);
+		expect(bytes[bytes.length - 1]).toBe(Transport.UTP);
+		const decoded = decodeMessage(bytes);
+		expect(decoded.ok && decoded.frames[0]).toMatchObject({ type: "open", transport: Transport.UTP });
+	});
+
+	it("an unknown transport decodes (the gateway fails it), an explicit 0 does not", () => {
+		const bytes = encodeFrame({ ...tcp, transport: 7 });
+		const decoded = decodeMessage(bytes);
+		expect(decoded.ok && decoded.frames[0]).toMatchObject({ transport: 7 });
+		bytes[bytes.length - 1] = 0;
+		const zero = decodeMessage(bytes);
+		expect(zero.ok ? "ok" : zero.error.code).toBe("bad_payload");
+		expect(() => encodeFrame({ ...tcp, transport: 256 })).toThrow(RangeError);
 	});
 });
 
@@ -102,6 +141,19 @@ describe("decoder errors", () => {
 		expect(() => encodeFrame({ ...samples[0], conn: 0x8000 } as Frame)).toThrow(RangeError);
 		expect(() => encodeFrame({ type: "ping", conn: 0, payload: new Uint8Array(9) })).toThrow(RangeError);
 		expect(() => encodeFrames([])).toThrow(RangeError);
+		const announce = samples.find((f) => f.type === "announce") as Frame & { type: "announce" };
+		expect(() => encodeFrame({ ...announce, trackers: ["has space"] })).toThrow(RangeError);
+		expect(() => encodeFrame({ ...announce, trackers: [""] })).toThrow(RangeError);
+		expect(() => encodeFrame({ ...announce, trackers: ["u".repeat(MAX_TRACKER_URL_LENGTH + 1)] })).toThrow(RangeError);
+		expect(() => encodeFrame({ ...announce, trackers: Array<string>(MAX_ANNOUNCE_TRACKERS + 1).fill("udp://t:1") })).toThrow(RangeError);
+		expect(() => encodeFrame({ ...announce, trackers: ["http://é.example"] })).toThrow(RangeError);
+	});
+
+	it("accepts the longest announce the limits allow", () => {
+		const announce = samples.find((f) => f.type === "announce") as Frame & { type: "announce" };
+		const trackers = Array<string>(MAX_ANNOUNCE_TRACKERS).fill("u".repeat(MAX_TRACKER_URL_LENGTH));
+		const r = decodeMessage(encodeFrame({ ...announce, trackers }));
+		expect(r.ok && (r.frames[0] as { trackers: string[] }).trackers).toEqual(trackers);
 	});
 });
 
@@ -150,7 +202,7 @@ describe("fixtures", () => {
 
 	it("has vectors for every frame type", () => {
 		const types = new Set(vectors.valid.flatMap((v) => v.frames.map((f) => f.type)));
-		expect([...types].sort()).toEqual(["accept", "close", "data", "failed", "open", "opened", "ping"]);
+		expect([...types].sort()).toEqual(["accept", "announce", "announced", "close", "data", "failed", "open", "opened", "ping", "withdraw"]);
 	});
 
 	for (const v of vectors.valid) {

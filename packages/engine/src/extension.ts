@@ -1,11 +1,11 @@
 // BEP 10 extension protocol: the extended handshake, ut_metadata (BEP 9)
-// and ut_pex (BEP 11) messages. Everything a peer sends is untrusted and
-// bounded here.
+// and ut_pex (BEP 11) messages (ut_holepunch, BEP 55: holepunch.ts).
+// Everything a peer sends is untrusted and bounded here.
 
 import { BencodeError, decodeBencode, decodeBencodePrefix, encodeBencode, getBytes, getDict, getInt, type BencodeDict } from "./bencode.ts";
 
 /** Extension message ids we assign (what peers must use when sending to us). */
-export const LOCAL_EXTENSIONS = { ut_metadata: 1, ut_pex: 2 } as const;
+export const LOCAL_EXTENSIONS = { ut_metadata: 1, ut_pex: 2, ut_holepunch: 3 } as const;
 export type ExtensionName = keyof typeof LOCAL_EXTENSIONS;
 
 /** BEP 9: the info dict travels in 16 KiB pieces. */

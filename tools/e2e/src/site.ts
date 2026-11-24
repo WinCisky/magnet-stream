@@ -7,6 +7,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { extname, join, resolve } from "node:path";
 import { chromium } from "playwright-core";
+import { closedPort, startVpsGateway, startWranglerDev, type WranglerDev } from "@magnet-stream/harness";
 
 export const ROOT = new URL("../../../", import.meta.url).pathname;
 
@@ -24,16 +25,68 @@ export function findChromium(): string | undefined {
 	return [process.env.CHROMIUM_PATH, "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome", bundledChromium()].find((p) => p && existsSync(p));
 }
 
+export type SiteGatewayKind = "cloudflare" | "vps";
+
+/**
+ * The site's primary gateway for the browser sessions: PUBLIC_DEFAULT_GATEWAY
+ * as the build reads it (docs/operations.md › Default data path), `cloudflare`
+ * when unset.
+ */
+export function siteGatewayKind(): SiteGatewayKind {
+	const kind = (process.env.PUBLIC_DEFAULT_GATEWAY ?? "").trim() || "cloudflare";
+	if (kind !== "cloudflare" && kind !== "vps") throw new Error(`PUBLIC_DEFAULT_GATEWAY must be cloudflare or vps, not ${kind}`);
+	return kind;
+}
+
+/** The gateway a built site opens its tunnels to (same interface as wrangler dev). */
+export interface SiteGateway extends WranglerDev {
+	kind: SiteGatewayKind;
+	/** The Cloudflare gateway the site knows; with `vps` a closed port nobody may open a WebSocket to. */
+	cloudflareUrl: string;
+	/** The site's gateway variables (PUBLIC_DEFAULT_GATEWAY, PUBLIC_WORKER_URL, PUBLIC_VPS_GATEWAY_URL). */
+	env: Record<string, string>;
+}
+
+/**
+ * Start the primary gateway siteGatewayKind() names, accepting tunnels from
+ * `pageOrigin` and reaching the loopback fake peers: wrangler dev, or the VPS
+ * service (services/seeders, its `/v1/tunnel`). With `vps` the site still
+ * gets a Cloudflare URL (the fallback), on a closed port, so a WebSocket the
+ * page opens there shows up (`cloudflareSockets`).
+ */
+export async function startSiteGateway(pageOrigin: string): Promise<SiteGateway> {
+	const kind = siteGatewayKind();
+	const vars = { ALLOW_PRIVATE_PEERS: "1", ALLOWED_ORIGINS: pageOrigin };
+	if (kind === "cloudflare") {
+		const dev = await startWranglerDev({ vars });
+		return { ...dev, kind, cloudflareUrl: dev.url, env: { PUBLIC_DEFAULT_GATEWAY: "cloudflare", PUBLIC_WORKER_URL: dev.url } };
+	}
+	const vps = await startVpsGateway({ vars });
+	const cloudflareUrl = `http://127.0.0.1:${await closedPort()}`;
+	return { ...vps, kind, cloudflareUrl, env: { PUBLIC_DEFAULT_GATEWAY: "vps", PUBLIC_WORKER_URL: cloudflareUrl, PUBLIC_VPS_GATEWAY_URL: vps.url } };
+}
+
+/** WebSocket URLs (of those the page opened) that went to the Cloudflare gateway although the VPS is primary. */
+export function cloudflareSockets(gateway: SiteGateway, urls: readonly string[]): string[] {
+	if (gateway.kind !== "vps") return [];
+	const cf = new URL(gateway.cloudflareUrl);
+	return urls.filter((u) => {
+		const url = new URL(u);
+		return url.hostname === cf.hostname && url.port === cf.port;
+	});
+}
+
 /**
  * Build the site as it is deployed (Cloudflare Pages layout, the service
  * URLs baked in) into a temporary directory, so a dev server someone is
  * running in apps/web neither answers for this test nor gets in its way.
+ * `extraEnv`: more public build variables (e.g. the escalation's thresholds).
  */
-export function buildSite(seeders: string, gateway: string, outDir: string): void {
+export function buildSite(seeders: string, gateway: SiteGateway, outDir: string, extraEnv: Record<string, string> = {}): void {
 	const r = spawnSync("npm", ["run", "build", "-w", "apps/web", "--", "--outDir", outDir], {
 		cwd: ROOT,
 		encoding: "utf8",
-		env: { ...process.env, PUBLIC_SEEDERS_URL: seeders, PUBLIC_WORKER_URL: gateway, NO_COLOR: "1" },
+		env: { ...process.env, PUBLIC_VPS_GATEWAY_URL: "", PUBLIC_SEEDERS_URL: seeders, ...gateway.env, ...extraEnv, NO_COLOR: "1" },
 	});
 	if (r.status !== 0) throw new Error(`site build failed:\n${(r.stdout + r.stderr).slice(-3000)}`);
 }

@@ -70,6 +70,19 @@ Service URLs default to production. Override them at build/dev time:
 PUBLIC_SEEDERS_URL=http://127.0.0.1:8080 PUBLIC_WORKER_URL=http://127.0.0.1:8787 npm run dev
 ```
 
+`PUBLIC_DEFAULT_GATEWAY` picks the primary tunnel gateway: `cloudflare`
+(default, `PUBLIC_WORKER_URL`) or `vps` (`PUBLIC_VPS_GATEWAY_URL`, default
+`PUBLIC_SEEDERS_URL`); the other one is the fallback. Any other value fails
+the build (`src/lib/magnet/gateway-config.ts`, docs/operations.md › Default
+data path).
+
+On a thin swarm the session asks the VPS gateway to join it (fewer than 2
+peers delivering, or a rate under the video's bitrate, for
+`PUBLIC_ESCALATION_AFTER_SECONDS`, default 90) and the page says when the
+rate stays under the bitrate (`PUBLIC_SLOW_NOTICE_SECONDS`, default 30);
+`PUBLIC_VPS_GATEWAY_URL=off` turns escalation off (docs/operations.md ›
+Escalation to the VPS gateway).
+
 The file-list lookup waits as long as something is left to try (the
 `/peers` stream still open, live or unknown addresses not dialled yet,
 dials in flight, peers being asked for the metadata), up to a hard cap:

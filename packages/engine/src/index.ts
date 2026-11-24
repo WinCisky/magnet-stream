@@ -14,6 +14,8 @@ export * from "./slots.ts";
 export * from "./upstream.ts";
 export * from "./picker.ts";
 export * from "./connection-manager.ts";
+export * from "./escalation.ts";
+export * from "./holepunch.ts";
 export * from "./peers-stream.ts";
 export * from "./magnet.ts";
 export * from "./metadata.ts";

@@ -41,6 +41,7 @@ function snapshot(over: Partial<EngineSnapshot>): EngineSnapshot {
 		bitrate: 0,
 		windowBytes: 0,
 		rateThreshold: 0,
+		health: null,
 		...over,
 	};
 }
@@ -203,6 +204,8 @@ function diag(over: Partial<SessionDiag> = {}): SessionDiag {
 		untestedHighWater: 3,
 		scout: { state: "done", streams: 1, peers: 40, alive: 5, seeds: 2, dead: 30, unknown: 5, rejected: 1, info: "accepted", firstPeerMs: 300 },
 		upload: { enabled: true, bytes: 0, unchoked: 0, messages: 0 },
+		escalation: { state: "idle", reason: null, afterMs: null, upgrades: 0, accepted: 0 },
+		paths: { cloudflare: { downloaded: 0, uploaded: 0, connections: 0 }, vps: { downloaded: 0, uploaded: 0, connections: 0 } },
 		...over,
 	};
 }
@@ -222,6 +225,10 @@ describe("SessionRecorder", () => {
 		recorder.update(diag());
 		recorder.update(diag({ connected: 2, delivering: 3, firstUnchokeMs: 9_000, upload: { enabled: true, bytes: 65_536, unchoked: 2, messages: 1 } }));
 		recorder.update(diag({ upload: { enabled: true, bytes: 131_072, unchoked: 1, messages: 2 } }));
+		recorder.update(diag({ paths: { cloudflare: { downloaded: 1_000, uploaded: 10, connections: 2 }, vps: { downloaded: 3_000, uploaded: 0, connections: 1 } } }));
+		recorder.update(diag({ paths: { cloudflare: { downloaded: 2_000, uploaded: 5, connections: 1 }, vps: { downloaded: 0, uploaded: 0, connections: 0 } } }));
+		recorder.update(diag({ escalation: { state: "joined", reason: "few_peers", afterMs: 90_500, upgrades: 1, accepted: 2 } }));
+		recorder.update(diag({ escalation: { state: "unavailable", reason: "few_peers", afterMs: 90_500, upgrades: 1, accepted: 1 } }));
 		now = 7_500;
 		recorder.listed("vps");
 		expect(record).toMatchObject({ lookup: "listed", lookupMs: 7_500, retries: 1, metadata: { source: "vps", ms: 900 } });
@@ -229,6 +236,9 @@ describe("SessionRecorder", () => {
 		expect(record.tunnel.dials.untried).toEqual({ attempted: 6, succeeded: 1, failed: { refused: 2, timeout: 3 } });
 		expect(record.scout).toMatchObject({ alive: 5, dead: 30, info: "accepted" });
 		expect(record.tunnel.upload).toEqual({ enabled: true, bytes: 131_072, unchoked: 2, messages: 2 });
+		expect(record.tunnel.escalation).toEqual({ state: "unavailable", reason: "few_peers", afterMs: 90_500, upgrades: 1, accepted: 2 });
+		// Bytes by path: running totals, the most seen.
+		expect(record.tunnel.paths).toEqual({ cloudflare: { downloaded: 2_000, uploaded: 10, connections: 2 }, vps: { downloaded: 3_000, uploaded: 0, connections: 1 } });
 		recorder.end();
 		recorder.update(diag({ connected: 9 }));
 		expect(record.tunnel.connected).toBe(4);

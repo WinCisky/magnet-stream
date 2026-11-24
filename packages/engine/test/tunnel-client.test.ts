@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CloseReason, FailReason, SUBPROTOCOL, decodeMessage, encodeFrames, type Frame } from "@magnet-stream/tunnel-protocol";
+import { AnnounceStatus, CloseReason, FailReason, SUBPROTOCOL, Transport, decodeMessage, encodeFrames, type Frame } from "@magnet-stream/tunnel-protocol";
 import { TunnelClient, TunnelOpenError, type WebSocketLike } from "../src/index.ts";
 
 class FakeWebSocket implements WebSocketLike {
@@ -186,5 +186,74 @@ describe("TunnelClient", () => {
 		now = 21_000;
 		void tunnel.open({ address: "1.2.3.7:6881", infoHash, peerId }).catch(() => {});
 		expect(tunnel.connections).toBe(1);
+	});
+
+	it("dials TCP unless asked otherwise, and passes a transport through", async () => {
+		const { ws, tunnel } = await client();
+		void tunnel.open({ address: "1.2.3.4:6881", infoHash, peerId }).catch(() => {});
+		void tunnel.open({ address: "1.2.3.5:6881", infoHash, peerId, transport: Transport.UTP }).catch(() => {});
+		const [tcp, utp] = ws.sent.flat();
+		expect(tcp.type === "open" && "transport" in tcp).toBe(false);
+		expect(utp).toMatchObject({ type: "open", conn: 2, transport: Transport.UTP });
+		ws.deliver({ type: "failed", conn: 2, reason: FailReason.UNSUPPORTED_TRANSPORT });
+	});
+
+	it("announces, resolves with the gateway's status and hands accepted peers over as transports", async () => {
+		const { ws, tunnel } = await client();
+		const accepted: { address: string; conn: number; peerTransport: number }[] = [];
+		tunnel.onAccept = (p) => {
+			accepted.push({ address: p.address, conn: p.transport.conn, peerTransport: p.peerTransport });
+			p.transport.attach({ data: (b) => received.push(...b), close: () => {} });
+		};
+		const received: number[] = [];
+		const status = tunnel.announce({ infoHash, peerId, trackers: ["udp://t.example:1337/announce", "wss://x.example", "has space"] });
+		const sent = ws.sent.flat();
+		expect(sent).toEqual([
+			{ type: "announce", conn: 0, infoHash, reserved: Uint8Array.of(0, 0, 0, 0, 0, 0x10, 0, 0x04), peerId, trackers: ["udp://t.example:1337/announce"] },
+		]);
+		ws.deliver({ type: "announced", conn: 0, infoHash, status: AnnounceStatus.ACTIVE });
+		expect(await status).toBe(AnnounceStatus.ACTIVE);
+		expect(tunnel.announcing).toBe(1);
+		ws.deliver(
+			{ type: "accept", conn: 0x8000, infoHash, reserved, peerId: new Uint8Array(20).fill(9), address: { family: 4, ip: Uint8Array.of(203, 0, 113, 9), port: 40000 } },
+			{ type: "data", conn: 0x8000, payload: Uint8Array.of(0, 0, 0, 1, 1) },
+		);
+		expect(accepted).toEqual([{ address: "203.0.113.9:40000", conn: 0x8000, peerTransport: Transport.TCP }]);
+		expect(received).toEqual([0, 0, 0, 1, 1]);
+		// An inbound uTP peer is a transport like any other; an unknown transport is closed.
+		ws.sent = [];
+		ws.deliver(
+			{ type: "accept", conn: 0x8003, infoHash, reserved, peerId, address: { family: 4, ip: Uint8Array.of(203, 0, 113, 9), port: 40003 }, transport: Transport.UTP },
+			{ type: "accept", conn: 0x8004, infoHash, reserved, peerId, address: { family: 4, ip: Uint8Array.of(203, 0, 113, 9), port: 40004 }, transport: 7 },
+		);
+		expect(accepted[1]).toEqual({ address: "203.0.113.9:40003", conn: 0x8003, peerTransport: Transport.UTP });
+		expect(accepted).toHaveLength(2);
+		expect(ws.sent.flat()).toEqual([{ type: "close", conn: 0x8004, reason: CloseReason.NORMAL }]);
+		// Accepted peers do not take outbound slots.
+		expect(tunnel.accepted).toBe(2);
+		expect(tunnel.connections).toBe(0);
+		// An accept for an info-hash we did not announce is closed at once.
+		ws.sent = [];
+		ws.deliver({ type: "accept", conn: 0x8001, infoHash: new Uint8Array(20).fill(1), reserved, peerId, address: { family: 4, ip: Uint8Array.of(203, 0, 113, 9), port: 40001 } });
+		expect(ws.sent.flat()).toEqual([{ type: "close", conn: 0x8001, reason: CloseReason.NORMAL }]);
+		// Withdraw: later accepts are refused too.
+		ws.sent = [];
+		tunnel.withdraw(infoHash);
+		expect(ws.sent.flat()).toEqual([{ type: "withdraw", conn: 0, infoHash }]);
+		ws.sent = [];
+		ws.deliver({ type: "accept", conn: 0x8002, infoHash, reserved, peerId, address: { family: 4, ip: Uint8Array.of(203, 0, 113, 9), port: 40002 } });
+		expect(ws.sent.flat()).toEqual([{ type: "close", conn: 0x8002, reason: CloseReason.NORMAL }]);
+		expect(tunnel.accepted).toBe(2);
+	});
+
+	it("a gateway without inbound peers answers unsupported; a closed session rejects pending announces", async () => {
+		const { ws, tunnel } = await client();
+		const status = tunnel.announce({ infoHash, peerId });
+		ws.deliver({ type: "announced", conn: 0, infoHash, status: AnnounceStatus.UNSUPPORTED });
+		expect(await status).toBe(AnnounceStatus.UNSUPPORTED);
+		expect(tunnel.announcing).toBe(0);
+		const pending = tunnel.announce({ infoHash, peerId });
+		ws.close(1006);
+		await expect(pending).rejects.toThrow();
 	});
 });

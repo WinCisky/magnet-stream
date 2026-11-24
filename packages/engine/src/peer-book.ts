@@ -120,6 +120,8 @@ const BACKOFF: Record<string, number> = {
 	useless: 2 * 60_000,
 	/** It caused failed pieces (attribution.ts): never again this session. */
 	corrupt: Infinity,
+	/** A hole-punch relay says the target is ourselves (BEP 55 NoSelf). */
+	hp_no_self: Infinity,
 };
 /** Notes kept per torrent, at most (each about 100 to 200 bytes once stored). */
 export const MAX_PEER_NOTES = 200;

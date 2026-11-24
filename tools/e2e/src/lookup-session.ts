@@ -22,8 +22,8 @@ import type { Server } from "node:http";
 import { join } from "node:path";
 import { chromium, type Page } from "playwright-core";
 import { makeTorrent, startFakePeer, type FakePeer, type FakeTorrent } from "@magnet-stream/fake-peer";
-import { closedPort, freePort, startPeersStub, startWranglerDev, type StubLine, type WranglerDev } from "@magnet-stream/harness";
-import { ROOT, buildSite, findChromium, serveSite, waitFor } from "./site.ts";
+import { closedPort, freePort, startPeersStub, type StubLine } from "@magnet-stream/harness";
+import { ROOT, buildSite, cloudflareSockets, findChromium, serveSite, startSiteGateway, waitFor, type SiteGateway } from "./site.ts";
 
 /** A failed lookup with nothing left to try must say so within this (discovery over, dials failed, 5 s grace). */
 const FAIL_FAST_MS = 15_000;
@@ -34,7 +34,7 @@ if (!chromiumPath) {
 	process.exit(process.env.REQUIRE_BROWSER_E2E ? 1 : 0);
 }
 
-let dev: WranglerDev | undefined;
+let dev: SiteGateway | undefined;
 let site: Server | undefined;
 let siteDir: string | undefined;
 let failed = false;
@@ -83,10 +83,10 @@ async function main(): Promise<void> {
 	try {
 		const port = await freePort();
 		const PAGE = `http://localhost:${port}/`;
-		dev = await startWranglerDev({ vars: { ALLOW_PRIVATE_PEERS: "1", ALLOWED_ORIGINS: `http://localhost:${port}` } });
+		dev = await startSiteGateway(`http://localhost:${port}`);
 		mkdirSync(join(ROOT, "tools/e2e/results"), { recursive: true });
 		siteDir = mkdtempSync(join(ROOT, "tools/e2e/results", "site-"));
-		buildSite(stub.url, dev.url, siteDir);
+		buildSite(stub.url, dev, siteDir);
 		site = await serveSite(siteDir, port);
 		await waitFor(PAGE, 30_000);
 
@@ -167,6 +167,9 @@ async function main(): Promise<void> {
 		const names = [fromVps, forged, decoy, absent, retried].flatMap((t) => [t.infoHashHex, t.name, ...t.files.map((f) => String(f.path).split("/").at(-1)!)]);
 		for (const name of names) check(!text.includes(name), `the report names ${name.length === 40 ? "an info-hash" : `a file (${name})`}`);
 		check(!/magnet:\?|\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b|localhost:\d+/.test(text), "the report names a magnet or an address");
+		// PUBLIC_DEFAULT_GATEWAY=vps: every tunnel on the VPS, none on Cloudflare.
+		const toCloudflare = cloudflareSockets(dev, sockets.map((s) => s.url));
+		check(toCloudflare.length === 0, `${toCloudflare.length} WebSocket(s) to the Cloudflare gateway with the ${dev.kind} gateway primary`);
 
 		await browser.close();
 		const dials = tunnel.dials;

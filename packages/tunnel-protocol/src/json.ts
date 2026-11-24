@@ -5,7 +5,7 @@
 import type { PeerAddress } from "./address.ts";
 import type { Frame } from "./codec.ts";
 
-export type JsonFrame = Record<string, string | number | JsonAddress>;
+export type JsonFrame = Record<string, string | number | string[] | JsonAddress>;
 export interface JsonAddress {
 	family: 4 | 6;
 	ip: string;
@@ -27,6 +27,7 @@ export function frameToJson(frame: Frame): JsonFrame {
 	const out: JsonFrame = {};
 	for (const [key, value] of Object.entries(frame)) {
 		if (value instanceof Uint8Array) out[key] = toHex(value);
+		else if (Array.isArray(value)) out[key] = [...(value as string[])];
 		else if (key === "address") {
 			const a = value as PeerAddress;
 			out[key] = { family: a.family, ip: toHex(a.ip), port: a.port };
@@ -41,7 +42,8 @@ export function frameFromJson(json: JsonFrame): Frame {
 		if (key === "address") {
 			const a = value as JsonAddress;
 			out[key] = { family: a.family, ip: fromHex(a.ip), port: a.port };
-		} else if (key === "type" || typeof value === "number") out[key] = value;
+		} else if (Array.isArray(value)) out[key] = [...value];
+		else if (key === "type" || typeof value === "number") out[key] = value;
 		else out[key] = fromHex(value as string);
 	}
 	return out as unknown as Frame;

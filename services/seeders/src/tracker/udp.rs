@@ -6,7 +6,7 @@
 //! total: each round trip gets a couple of quick, growing-timeout attempts,
 //! and the caller wraps the whole call in its own hard deadline anyway.
 
-use super::{AnnounceParams, TrackerError};
+use super::{AnnounceEvent, AnnounceParams, TrackerError};
 use crate::netguard;
 use rand::random;
 use std::net::SocketAddr;
@@ -121,8 +121,15 @@ async fn do_announce(
     req[12..16].copy_from_slice(&transaction_id.to_be_bytes());
     req[16..36].copy_from_slice(&params.info_hash);
     req[36..56].copy_from_slice(&params.peer_id);
-    // downloaded(56..64)=0, left(64..72)=0, uploaded(72..80)=0, event(80..84)=0=none,
-    // ip(84..88)=0 (let the tracker use the packet's source address) are all left zeroed.
+    // downloaded(56..64)=0, uploaded(72..80)=0 and ip(84..88)=0 (let the
+    // tracker use the packet's source address) are left zeroed.
+    req[64..72].copy_from_slice(&params.left.to_be_bytes());
+    let event: u32 = match params.event {
+        AnnounceEvent::None => 0,
+        AnnounceEvent::Started => 2,
+        AnnounceEvent::Stopped => 3,
+    };
+    req[80..84].copy_from_slice(&event.to_be_bytes());
     req[88..92].copy_from_slice(&params.key.to_be_bytes());
     req[92..96].copy_from_slice(&params.numwant.to_be_bytes());
     req[96..98].copy_from_slice(&params.port.to_be_bytes());

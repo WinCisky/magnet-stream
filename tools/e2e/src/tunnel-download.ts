@@ -6,11 +6,12 @@
 //   npm run e2e                     (from the repo root: this, then the gateway suites)
 //   E2E_SIZE=64MiB npm run e2e -w tools/e2e
 //   E2E_GATEWAY_URL=http://127.0.0.1:8787 npm run e2e -w tools/e2e   (a running wrangler dev with ALLOW_PRIVATE_PEERS=1)
+//   E2E_GATEWAY=vps npm run e2e -w tools/e2e   (through the VPS gateway, services/seeders, instead of wrangler dev)
 
 import { randomBytes } from "node:crypto";
 import { PeerConnection, TunnelClient, downloadAll, geometryOf, parseInfoDict } from "@magnet-stream/engine";
 import { makeTorrent, parseSize, startFakePeer } from "@magnet-stream/fake-peer";
-import { startWranglerDev, type WranglerDev } from "@magnet-stream/harness";
+import { gatewayKind, startGateway, type WranglerDev } from "@magnet-stream/harness";
 
 const MiB = 1024 * 1024;
 const size = parseSize(process.env.E2E_SIZE ?? "32MiB");
@@ -24,7 +25,7 @@ async function main(): Promise<void> {
 	const meta = await parseInfoDict(torrent.info, torrent.infoHashHex);
 	const peer = await startFakePeer({ torrent });
 	try {
-		const base = process.env.E2E_GATEWAY_URL ?? (dev = await startWranglerDev({ vars: { ALLOW_PRIVATE_PEERS: "1" } })).url;
+		const base = process.env.E2E_GATEWAY_URL ?? (dev = await startGateway({ vars: { ALLOW_PRIVATE_PEERS: "1" } })).url;
 		const client = await TunnelClient.connect(`${base.replace(/^http/, "ws")}/v1/tunnel`);
 		const started = Date.now();
 		const transport = await client.open({ address: peer.addr, infoHash: torrent.infoHash, peerId: peerId() });
@@ -57,8 +58,8 @@ async function main(): Promise<void> {
 		if (dev) {
 			// Log hygiene: neither the info-hash nor the peer's address appear in the gateway's logs.
 			const logs = dev.output();
-			check(!logs.toLowerCase().includes(torrent.infoHashHex), "info-hash absent from gateway logs");
-			check(!logs.includes(peer.addr), "peer address absent from gateway logs");
+			check(!logs.toLowerCase().includes(torrent.infoHashHex), `info-hash absent from ${gatewayKind()} gateway logs`);
+			check(!logs.includes(peer.addr), `peer address absent from ${gatewayKind()} gateway logs`);
 		}
 	} finally {
 		await peer.close();

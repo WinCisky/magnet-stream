@@ -72,6 +72,8 @@ describe("session messages", () => {
 			untestedHighWater: 3,
 			scout: { state: "done", streams: 1, peers: 30, alive: 4, seeds: 1, dead: 20, unknown: 6, rejected: 0, info: "rejected", firstPeerMs: 120 },
 			upload: { enabled: true, bytes: 1_048_576, unchoked: 2, messages: 3 },
+			escalation: { state: "joined", reason: "few_peers", afterMs: 91_000, upgrades: 1, accepted: 2 },
+			paths: { cloudflare: { downloaded: 4_194_304, uploaded: 65_536, connections: 2 }, vps: { downloaded: 1_048_576, uploaded: 0, connections: 1 } },
 		};
 		expect(parseWorkerMessage({ type: "diag", diag })).toEqual({ type: "diag", diag });
 		// Anything that could carry an address or is out of shape is refused whole.
@@ -82,6 +84,18 @@ describe("session messages", () => {
 		expect(parseWorkerMessage({ type: "diag", diag: { ...diag, upload: { ...diag.upload, bytes: -1 } } })).toBeNull();
 		expect(parseWorkerMessage({ type: "diag", diag: { ...diag, upload: { ...diag.upload, enabled: "yes" } } })).toBeNull();
 		expect(parseWorkerMessage({ type: "diag", diag: { ...diag, upload: undefined } })).toBeNull();
+		expect(parseWorkerMessage({ type: "diag", diag: { ...diag, escalation: undefined } })).toBeNull();
+		expect(parseWorkerMessage({ type: "diag", diag: { ...diag, escalation: { ...diag.escalation, state: "maybe" } } })).toBeNull();
+		expect(parseWorkerMessage({ type: "diag", diag: { ...diag, escalation: { ...diag.escalation, reason: "1.2.3.4" } } })).toBeNull();
+		expect(parseWorkerMessage({ type: "diag", diag: { ...diag, escalation: { ...diag.escalation, accepted: -1 } } })).toBeNull();
+		// Bytes by path (M4-08): both paths, non-negative integers.
+		expect(parseWorkerMessage({ type: "diag", diag: { ...diag, paths: undefined } })).toBeNull();
+		expect(parseWorkerMessage({ type: "diag", diag: { ...diag, paths: { cloudflare: diag.paths.cloudflare } } })).toBeNull();
+		expect(parseWorkerMessage({ type: "diag", diag: { ...diag, paths: { ...diag.paths, vps: { ...diag.paths.vps, downloaded: 1.5 } } } })).toBeNull();
+		expect(parseWorkerMessage({ type: "diag", diag: { ...diag, paths: { ...diag.paths, vps: { ...diag.paths.vps, uploaded: -1 } } } })).toBeNull();
+		// Unknown path names are dropped, not kept.
+		const extra = parseWorkerMessage({ type: "diag", diag: { ...diag, paths: { ...diag.paths, "1.2.3.4": { downloaded: 1, uploaded: 0, connections: 1 } } } });
+		expect(extra).toEqual({ type: "diag", diag });
 		const many = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`r${String.fromCharCode(97 + i)}`, 1]));
 		expect(parseWorkerMessage({ type: "diag", diag: { ...diag, dials: { ...diag.dials, known: dials(many) } } })).toBeNull();
 
@@ -118,5 +132,35 @@ describe("session messages", () => {
 		expect(parseWorkerMessage({ ...progress, live: undefined })).toBeNull();
 		expect(parseWorkerMessage({ ...progress, windowBytes: -1 })).toBeNull();
 		expect(parseWorkerMessage({ ...progress, rateThreshold: 1.5 })).toBeNull();
+	});
+
+	it("validates the escalation settings of a start and the swarm's health (M4-06)", () => {
+		const start = { type: "start", magnet: "magnet:?xt=urn:btih:aa", gatewayUrl: "http://127.0.0.1:8787", seedersUrl: "http://127.0.0.1:8080" };
+		const escalation = { gatewayUrl: "https://vps.example.org", minDelivering: 2, escalateAfterMs: 90_000, warnAfterMs: 30_000 };
+		expect(parsePageMessage({ ...start, escalation })).toEqual({ ...start, escalation });
+		// The withdraw delay is optional (the engine's default without it).
+		expect(parsePageMessage({ ...start, escalation: { ...escalation, withdrawAfterMs: 600_000 } })).toEqual({ ...start, escalation: { ...escalation, withdrawAfterMs: 600_000 } });
+		// Off: no VPS gateway.
+		expect(parsePageMessage({ ...start, escalation: { ...escalation, gatewayUrl: null } })).toEqual({ ...start, escalation: { ...escalation, gatewayUrl: null } });
+		for (const bad of [
+			{ ...escalation, gatewayUrl: "ftp://x" },
+			{ ...escalation, gatewayUrl: undefined },
+			{ ...escalation, minDelivering: 0 },
+			{ ...escalation, minDelivering: 1.5 },
+			{ ...escalation, escalateAfterMs: -1 },
+			{ ...escalation, warnAfterMs: 1e12 },
+			{ ...escalation, withdrawAfterMs: -5 },
+			{ ...escalation, withdrawAfterMs: "600" },
+			"on",
+		])
+			expect(parsePageMessage({ ...start, escalation: bad })).toBeNull();
+
+		const health = { escalation: "joined", reason: "slow", belowBitrate: true, inbound: 1, rate: 120_000, bitrate: 400_000 };
+		expect(parseWorkerMessage({ type: "health", health })).toEqual({ type: "health", health });
+		expect(parseWorkerMessage({ type: "health", health: { ...health, reason: null, escalation: "off" } })?.type).toBe("health");
+		expect(parseWorkerMessage({ type: "health", health: { ...health, escalation: "left" } })?.type).toBe("health");
+		for (const bad of [{ ...health, escalation: "vps" }, { ...health, reason: "1.2.3.4:6881" }, { ...health, belowBitrate: 1 }, { ...health, rate: -1 }, { ...health, inbound: undefined }]) {
+			expect(parseWorkerMessage({ type: "health", health: bad })).toBeNull();
+		}
 	});
 });

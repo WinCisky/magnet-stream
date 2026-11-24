@@ -5,7 +5,7 @@
 # name.
 
 [Unit]
-Description=magnet-stream discovery API (streamed /peers)
+Description=magnet-stream VPS service (streamed /peers, tunnel gateway /v1/tunnel)
 After=network-online.target
 Wants=network-online.target
 
@@ -15,10 +15,16 @@ ExecStart=/opt/magnet-stream/magnet-stream
 EnvironmentFile=/etc/magnet-stream/magnet-stream.env
 Restart=on-failure
 RestartSec=2
+# Peer sockets: up to TUNNEL_MAX_SOCKETS x TUNNEL_MAX_CONNECTIONS for the
+# tunnels, plus PROBE_CONCURRENCY for the scout.
 LimitNOFILE=65536
 
-# No persistent state, no manual user to manage: systemd creates an
-# ephemeral, unprivileged user/group for this unit at start.
+# Never root: a dedicated, unprivileged user/group "magnet-stream" that
+# systemd creates for this unit at start (no persistent state, no manual
+# user to manage). The service needs no privilege: it listens on ports
+# above 1024 and the tunnel gateway only dials ports >= 1024.
+User=magnet-stream
+Group=magnet-stream
 DynamicUser=yes
 
 # Sandboxing. If the unit fails to start and you can't tell why, comment

@@ -1,5 +1,5 @@
 // wrangler dev + fake peers: open/data/close, failed (refused, timeout,
-// not BitTorrent, info-hash mismatch, forbidden address), the 6-connection
+// not BitTorrent, info-hash mismatch, forbidden address, uTP), the 6-connection
 // limit, Origin and subprotocol checks, several WebSockets per session,
 // idle and session timeouts, socket cleanup, the per-IP upgrade limit, a
 // peer that does not read (closed past the pending-write bound, M3-12).
@@ -9,7 +9,7 @@ import http from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { makeTorrent, startFakePeer, type FakePeer, type PeerBehaviour } from "@magnet-stream/fake-peer";
 import { closedPort, startWranglerDev, type WranglerDev } from "@magnet-stream/harness";
-import { CloseReason, FailReason, SUBPROTOCOL, SessionCloseCode, parseSessionEnd, type Frame, type OpenFrame } from "@magnet-stream/tunnel-protocol";
+import { CloseReason, FailReason, SUBPROTOCOL, SessionCloseCode, Transport, parseSessionEnd, type Frame, type OpenFrame } from "@magnet-stream/tunnel-protocol";
 import { openTunnel } from "./tunnel-client";
 
 const torrent = makeTorrent({ seed: 11, size: 2 * 1024 * 1024, pieceLength: 256 * 1024 });
@@ -177,6 +177,15 @@ describe("tunnel through wrangler dev", () => {
 		const t = await openTunnel(strict.url);
 		t.send(open(1, seed.port));
 		expect(await t.waitFor((f) => f.conn === 1)).toEqual({ type: "failed", conn: 1, reason: FailReason.FORBIDDEN_ADDRESS });
+		expect(seed.stats.connections).toBe(0);
+		t.close();
+	});
+
+	it("refuses an open over uTP with unsupported_transport, without dialling", async () => {
+		const seed = await peer();
+		const t = await openTunnel(dev.url);
+		t.send({ ...open(1, seed.port), transport: Transport.UTP });
+		expect(await t.waitFor((f) => f.conn === 1)).toEqual({ type: "failed", conn: 1, reason: FailReason.UNSUPPORTED_TRANSPORT });
 		expect(seed.stats.connections).toBe(0);
 		t.close();
 	});

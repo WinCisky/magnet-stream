@@ -94,6 +94,16 @@
 	}
 
 	let snapshot: EngineSnapshot | null = $state.raw(null);
+	let videoPlayer: ReturnType<typeof VideoPlayer> | undefined = $state();
+	/** The viewer chose to keep buffering after the "slower than the video" notice. */
+	let buffering = $state(false);
+	const health = $derived(snapshot?.phase === "recovering" ? snapshot.health : null);
+
+	function keepBuffering() {
+		buffering = true;
+		videoPlayer?.pause();
+		diagnostics.count("keep_buffering");
+	}
 	/** File byte the player last read (-1: none yet). */
 	let playhead = $state(-1);
 	let available: [number, number][] = $state.raw([]);
@@ -317,6 +327,7 @@
 
 	{#if playerReady}
 		<VideoPlayer
+			bind:this={videoPlayer}
 			source={engine.stream}
 			url={nativeUrl}
 			name={baseName}
@@ -338,6 +349,37 @@
 			</div>
 		{:else if snapshot?.phase === "error"}
 			<p class="text-center text-sm text-destructive">{snapshot.message}</p>
+		{/if}
+
+		{#if health?.belowBitrate}
+			<!-- Degrade honestly (M4-06): the swarm is slower than the video; the file still completes. -->
+			<div
+				role="status"
+				data-testid="below-bitrate"
+				class="flex flex-col items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-center text-sm"
+			>
+				<p>
+					Peers are sending {formatBytes(health.rate)}/s, less than this video needs ({formatBytes(health.bitrate)}/s): playback
+					will stop now and then to buffer. The whole video is still being recovered.
+				</p>
+				{#if buffering}
+					<p class="text-muted-foreground" data-testid="buffering">Paused to buffer: press play whenever you like.</p>
+				{:else}
+					<Button variant="outline" size="sm" onclick={keepBuffering}>Keep buffering</Button>
+				{/if}
+			</div>
+		{/if}
+		{#if health && (health.escalation === "joining" || health.escalation === "joined" || health.escalation === "unavailable")}
+			<p class="text-center text-sm text-muted-foreground" data-testid="escalation" data-state={health.escalation} data-rate={health.rate} data-bitrate={health.bitrate}>
+				{#if health.escalation === "joining"}
+					{health.reason === "slow" ? "The swarm is slow" : "Few peers are sending data"}: asking the relay server to join the swarm…
+				{:else if health.escalation === "joined"}
+					The relay server joined the swarm{#if health.inbound > 0}&nbsp;· {health.inbound}
+						{health.inbound === 1 ? "peer" : "peers"} connected through it{:else}: waiting for peers to connect to it{/if}
+				{:else}
+					The relay server couldn't join the swarm.
+				{/if}
+			</p>
 		{/if}
 
 		{#if snapshot && snapshot.states.length > 0}

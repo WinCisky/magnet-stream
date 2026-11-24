@@ -1,7 +1,7 @@
 //! HTTP(S) tracker protocol (BEP 3, with the BEP 23 compact extension and
 //! the BEP 7 IPv6 `peers6` extension).
 
-use super::{AnnounceParams, TrackerError};
+use super::{AnnounceEvent, AnnounceParams, TrackerError};
 use crate::bencode::{self, Value};
 use crate::netguard;
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
@@ -29,15 +29,21 @@ pub async fn announce(
     let info_hash_enc = percent_encode(&params.info_hash, NON_ALPHANUMERIC).to_string();
     let peer_id_enc = percent_encode(&params.peer_id, NON_ALPHANUMERIC).to_string();
     let sep = if url.query().is_some() { '&' } else { '?' };
+    let event = match params.event {
+        AnnounceEvent::None => "",
+        AnnounceEvent::Started => "&event=started",
+        AnnounceEvent::Stopped => "&event=stopped",
+    };
 
     let request_url = format!(
-        "{base}{sep}info_hash={ih}&peer_id={pid}&port={port}&uploaded=0&downloaded=0&left=0\
-         &compact=1&numwant={numwant}&key={key}&event=started",
+        "{base}{sep}info_hash={ih}&peer_id={pid}&port={port}&uploaded=0&downloaded=0&left={left}\
+         &compact=1&numwant={numwant}&key={key}{event}",
         base = url,
         sep = sep,
         ih = info_hash_enc,
         pid = peer_id_enc,
         port = params.port,
+        left = params.left,
         numwant = params.numwant,
         key = params.key,
     );

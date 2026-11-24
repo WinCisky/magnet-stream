@@ -67,9 +67,9 @@ jobs:
         run: ./actionlint -color
 
   e2e:
-    name: e2e (fake peer -> wrangler dev -> engine)
+    name: e2e (fake peer / libtorrent / Transmission -> wrangler dev / VPS gateway -> engine)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -78,6 +78,10 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      # The VPS gateway e2e (npm run e2e:vps) builds and runs services/seeders.
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: npm ci
       - name: Chromium for the browser session e2e (Playwright's build)
         run: npx playwright-core install --with-deps chromium
@@ -85,6 +89,9 @@ jobs:
         env:
           # The browser e2e enforces the billed-request budget: never skip it here.
           REQUIRE_BROWSER_E2E: "1"
+          # uTP interop with libtorrent and Transmission (e2e:interop) runs
+          # them in Docker (tools/e2e/interop/Dockerfile): never skip it here.
+          REQUIRE_INTEROP_E2E: "1"
       # The synthetic phase numbers of this run (docs/measurements.md).
       - name: Keep the measurements
         if: always()

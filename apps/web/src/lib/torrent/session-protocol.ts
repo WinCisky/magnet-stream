@@ -77,6 +77,68 @@ export interface UploadDiag {
 	messages: number;
 }
 
+/** The gateways a session's bytes go through (M4-08): the Cloudflare Durable Object, the VPS. */
+export const GATEWAY_PATHS = ["cloudflare", "vps"] as const;
+export type GatewayPathName = (typeof GATEWAY_PATHS)[number];
+
+/** Bytes through one gateway this session (counts only). */
+export interface PathDiag {
+	/** Block bytes received through it. */
+	downloaded: number;
+	/** Piece bytes sent to peers through it. */
+	uploaded: number;
+	/** Connections that came up on it. */
+	connections: number;
+}
+
+export type PathsDiag = Record<GatewayPathName, PathDiag>;
+
+export function emptyPaths(): PathsDiag {
+	return { cloudflare: { downloaded: 0, uploaded: 0, connections: 0 }, vps: { downloaded: 0, uploaded: 0, connections: 0 } };
+}
+
+/** Escalation to the VPS gateway (M4-06): `off` (no VPS gateway), `idle`, `joining`, `joined`, `unavailable`. */
+export const ESCALATION_STATES = ["off", "idle", "joining", "joined", "left", "unavailable"] as const;
+export type EscalationStateName = (typeof ESCALATION_STATES)[number];
+export const ESCALATION_REASONS = ["few_peers", "slow"] as const;
+export type EscalationReasonName = (typeof ESCALATION_REASONS)[number];
+
+/** The escalation as the diagnostics keep it (counts only). */
+export interface EscalationDiag {
+	state: EscalationStateName;
+	reason: EscalationReasonName | null;
+	/** Ms from the session start to the escalation (null: none). */
+	afterMs: number | null;
+	/** WebSockets opened to the VPS gateway for it. */
+	upgrades: number;
+	/** Inbound peers it handed over this session. */
+	accepted: number;
+}
+
+/** The session on a thin swarm, for the page (no addresses). */
+export interface SwarmHealth {
+	escalation: EscalationStateName;
+	reason: EscalationReasonName | null;
+	/** The rate has stayed under the video's bitrate for the notice delay. */
+	belowBitrate: boolean;
+	/** Peers connected now through the VPS gateway (inbound). */
+	inbound: number;
+	/** Bytes/s now, and the video's (0: not known). */
+	rate: number;
+	bitrate: number;
+}
+
+/** Where and when the session escalates (gateway-config.ts resolveEscalation). */
+export interface EscalationStart {
+	/** The VPS gateway; null: escalation off. */
+	gatewayUrl: string | null;
+	minDelivering: number;
+	escalateAfterMs: number;
+	warnAfterMs: number;
+	/** Escalated, and the session's own peers enough this long: withdraw (absent: the engine's 10 min). */
+	withdrawAfterMs?: number;
+}
+
 /** Session counters for the page's diagnostics (anonymous: counts and reason names only). */
 export interface SessionDiag {
 	dials: Record<DialClassName, DialStats>;
@@ -93,14 +155,18 @@ export interface SessionDiag {
 	untestedHighWater: number;
 	scout: ScoutStreamStats;
 	upload: UploadDiag;
+	escalation: EscalationDiag;
+	/** Bytes by the gateway that carried them (M4-08). */
+	paths: PathsDiag;
 }
 
 export type PageMessage =
 	/**
 	 * `capMs`: the lookup's hard cap (lookup-wait.ts; default 120 s).
 	 * `upload`: the "Share with peers" setting (default on).
+	 * `escalation`: the VPS gateway and thresholds (absent: escalation off).
 	 */
-	| { type: "start"; magnet: string; gatewayUrl: string; seedersUrl: string; capMs?: number; upload?: boolean }
+	| { type: "start"; magnet: string; gatewayUrl: string; seedersUrl: string; capMs?: number; upload?: boolean; escalation?: EscalationStart }
 	/** The "Share with peers" setting changed. */
 	| { type: "upload"; enabled: boolean }
 	/** Look for the file list again after a failed lookup, in the same session. */
@@ -174,6 +240,8 @@ export type WorkerMessage =
 	 * (billing), peers known and peers that delivered data.
 	 */
 	| { type: "stats"; upgrades: number; messages: number; known: number; delivered: number }
+	/** The session on a thin swarm: escalation, a rate under the bitrate (while recovering). */
+	| { type: "health"; health: SwarmHealth }
 	| { type: "error"; message: string };
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -221,10 +289,16 @@ export function parsePageMessage(value: unknown): PageMessage | null {
 		if (!gatewayUrl || !seedersUrl) return null;
 		if (msg.upload !== undefined && typeof msg.upload !== "boolean") return null;
 		const upload = msg.upload === undefined ? {} : { upload: msg.upload };
-		if (msg.capMs === undefined) return { type: "start", magnet: msg.magnet, gatewayUrl, seedersUrl, ...upload };
+		let escalation = {};
+		if (msg.escalation !== undefined) {
+			const e = parseEscalationStart(msg.escalation);
+			if (!e) return null;
+			escalation = { escalation: e };
+		}
+		if (msg.capMs === undefined) return { type: "start", magnet: msg.magnet, gatewayUrl, seedersUrl, ...upload, ...escalation };
 		const cap = msg.capMs;
 		if (!Number.isInteger(cap) || (cap as number) < MIN_LOOKUP_CAP_MS || (cap as number) > MAX_LOOKUP_CAP_MS) return null;
-		return { type: "start", magnet: msg.magnet, gatewayUrl, seedersUrl, capMs: cap as number, ...upload };
+		return { type: "start", magnet: msg.magnet, gatewayUrl, seedersUrl, capMs: cap as number, ...upload, ...escalation };
 	}
 	if (msg.type === "recover") {
 		if (![msg.id, msg.offset, msg.size, msg.position].every(count)) return null;
@@ -292,7 +366,70 @@ export function parseWorkerMessage(value: unknown): WorkerMessage | null {
 		const diag = parseDiag(msg.diag);
 		return diag ? { type: "diag", diag } : null;
 	}
+	if (msg.type === "health") {
+		const health = parseHealth(msg.health);
+		return health ? { type: "health", health } : null;
+	}
 	return null;
+}
+
+/** Longest escalation delay a start message may carry (1 h). */
+const MAX_ESCALATION_MS = 3_600_000;
+
+function parseEscalationStart(value: unknown): EscalationStart | null {
+	const e = record(value);
+	if (!e) return null;
+	const gatewayUrl = e.gatewayUrl === null ? null : httpUrl(e.gatewayUrl);
+	if (gatewayUrl === null && e.gatewayUrl !== null) return null;
+	const ms = (v: unknown) => Number.isFinite(v) && (v as number) >= 0 && (v as number) <= MAX_ESCALATION_MS;
+	if (!Number.isInteger(e.minDelivering) || (e.minDelivering as number) < 1 || (e.minDelivering as number) > 64) return null;
+	if (!ms(e.escalateAfterMs) || !ms(e.warnAfterMs)) return null;
+	if (e.withdrawAfterMs !== undefined && !ms(e.withdrawAfterMs)) return null;
+	const withdraw = e.withdrawAfterMs === undefined ? {} : { withdrawAfterMs: e.withdrawAfterMs as number };
+	return { gatewayUrl, minDelivering: e.minDelivering as number, escalateAfterMs: e.escalateAfterMs as number, warnAfterMs: e.warnAfterMs as number, ...withdraw };
+}
+
+function parseHealth(value: unknown): SwarmHealth | null {
+	const h = record(value);
+	if (!h) return null;
+	if (!ESCALATION_STATES.includes(h.escalation as EscalationStateName)) return null;
+	if (h.reason !== null && !ESCALATION_REASONS.includes(h.reason as EscalationReasonName)) return null;
+	if (typeof h.belowBitrate !== "boolean" || ![h.inbound, h.rate, h.bitrate].every(count)) return null;
+	return {
+		escalation: h.escalation as EscalationStateName,
+		reason: h.reason as EscalationReasonName | null,
+		belowBitrate: h.belowBitrate,
+		inbound: h.inbound as number,
+		rate: h.rate as number,
+		bitrate: h.bitrate as number,
+	};
+}
+
+function parseEscalationDiag(value: unknown): EscalationDiag | null {
+	const e = record(value);
+	if (!e) return null;
+	if (!ESCALATION_STATES.includes(e.state as EscalationStateName)) return null;
+	if (e.reason !== null && !ESCALATION_REASONS.includes(e.reason as EscalationReasonName)) return null;
+	if (!nullableCount(e.afterMs) || !count(e.upgrades) || !count(e.accepted)) return null;
+	return {
+		state: e.state as EscalationStateName,
+		reason: e.reason as EscalationReasonName | null,
+		afterMs: e.afterMs as number | null,
+		upgrades: e.upgrades as number,
+		accepted: e.accepted as number,
+	};
+}
+
+export function parsePaths(value: unknown): PathsDiag | null {
+	const p = record(value);
+	if (!p) return null;
+	const out = emptyPaths();
+	for (const name of GATEWAY_PATHS) {
+		const one = record(p[name]);
+		if (!one || ![one.downloaded, one.uploaded, one.connections].every(count)) return null;
+		out[name] = { downloaded: one.downloaded as number, uploaded: one.uploaded as number, connections: one.connections as number };
+	}
+	return out;
 }
 
 function parseProgress(value: unknown): LookupProgress | null {
@@ -360,6 +497,10 @@ export function parseDiag(value: unknown): SessionDiag | null {
 	const u = record(d.upload);
 	if (!u || typeof u.enabled !== "boolean" || ![u.bytes, u.unchoked, u.messages].every(count)) return null;
 	const upload: UploadDiag = { enabled: u.enabled, bytes: u.bytes as number, unchoked: u.unchoked as number, messages: u.messages as number };
+	const escalation = parseEscalationDiag(d.escalation);
+	if (!escalation) return null;
+	const paths = parsePaths(d.paths);
+	if (!paths) return null;
 	const [connected, unchoked, delivering, seeds, sockets, upgrades, messages, recycles, untestedHighWater] = counts as number[];
 	return {
 		dials,
@@ -376,6 +517,8 @@ export function parseDiag(value: unknown): SessionDiag | null {
 		untestedHighWater,
 		scout,
 		upload,
+		escalation,
+		paths,
 	};
 }
 

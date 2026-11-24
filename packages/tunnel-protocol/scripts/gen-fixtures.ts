@@ -6,7 +6,7 @@
 
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { encodeFrames, type Frame } from "../src/codec.ts";
-import { CloseReason, FailReason } from "../src/constants.ts";
+import { AnnounceStatus, CloseReason, FailReason, Transport } from "../src/constants.ts";
 import { frameToJson, fromHex, toHex } from "../src/json.ts";
 
 const dir = new URL("../fixtures/", import.meta.url);
@@ -35,6 +35,11 @@ const valid: { name: string; description: string; frames: Frame[] }[] = [
 			},
 		],
 	},
+	{
+		name: "open-utp-ipv4",
+		description: "open conn 2 to 203.0.113.7:6881 over uTP (trailing transport byte 1)",
+		frames: [{ type: "open", conn: 2, infoHash, reserved, peerId, address: { family: 4, ip: Uint8Array.of(203, 0, 113, 7), port: 6881 }, transport: Transport.UTP }],
+	},
 	{ name: "opened", description: "opened conn 1 with the remote's reserved bytes and peer id", frames: [{ type: "opened", conn: 1, reserved, peerId: bytes(20, 0x30) }] },
 	{ name: "failed-timeout", description: "failed conn 2, reason timeout", frames: [{ type: "failed", conn: 2, reason: FailReason.TIMEOUT }] },
 	{ name: "data", description: "data conn 1 carrying a peer-wire `interested`", frames: [{ type: "data", conn: 1, payload: Uint8Array.of(0, 0, 0, 1, 2) }] },
@@ -44,8 +49,33 @@ const valid: { name: string; description: string; frames: Frame[] }[] = [
 		description: "accept conn 0x8000 from 198.51.100.20:40000",
 		frames: [{ type: "accept", conn: 0x8000, infoHash, reserved, peerId: bytes(20, 0x40), address: { family: 4, ip: Uint8Array.of(198, 51, 100, 20), port: 40000 } }],
 	},
+	{
+		name: "accept-utp-ipv6",
+		description: "accept conn 0xffff from [2001:db8::20]:51413 over uTP",
+		frames: [
+			{
+				type: "accept",
+				conn: 0xffff,
+				infoHash,
+				reserved,
+				peerId: bytes(20, 0x40),
+				address: { family: 6, ip: fromHex("20010db8000000000000000000000020"), port: 51413 },
+				transport: Transport.UTP,
+			},
+		],
+	},
+	{ name: "failed-unsupported-transport", description: "failed conn 2, reason unsupported transport", frames: [{ type: "failed", conn: 2, reason: FailReason.UNSUPPORTED_TRANSPORT }] },
 	{ name: "ping-empty", description: "ping without payload", frames: [{ type: "ping", conn: 0, payload: new Uint8Array(0) }] },
 	{ name: "ping-nonce", description: "ping with an 8-byte payload", frames: [{ type: "ping", conn: 0, payload: bytes(8, 1) }] },
+	{
+		name: "announce-trackers",
+		description: "announce the info-hash with two tracker URLs (VPS gateway)",
+		frames: [{ type: "announce", conn: 0, infoHash, reserved, peerId, trackers: ["udp://tracker.example:1337/announce", "https://t.example/a?k=1"] }],
+	},
+	{ name: "announce-bare", description: "announce without trackers (the gateway's defaults only)", frames: [{ type: "announce", conn: 0, infoHash, reserved, peerId, trackers: [] }] },
+	{ name: "announced-active", description: "announced: active", frames: [{ type: "announced", conn: 0, infoHash, status: AnnounceStatus.ACTIVE }] },
+	{ name: "announced-unsupported", description: "announced: unsupported (a gateway without inbound peers)", frames: [{ type: "announced", conn: 0, infoHash, status: AnnounceStatus.UNSUPPORTED }] },
+	{ name: "withdraw", description: "withdraw the announce", frames: [{ type: "withdraw", conn: 0, infoHash }] },
 	{
 		name: "batch",
 		description: "several frames in one message: data on two connections, a close and a ping",
@@ -63,7 +93,7 @@ const header = (type: number, conn: number, length: number) =>
 
 const invalid: { name: string; description: string; hex: string; error: string; limits?: { maxPayload?: number; maxFrames?: number } }[] = [
 	{ name: "err-empty", description: "empty message", hex: "", error: "empty" },
-	{ name: "err-unknown-type", description: "type 0x09", hex: header(0x09, 1, 0), error: "unknown_type" },
+	{ name: "err-unknown-type", description: "type 0x0b", hex: header(0x0b, 1, 0), error: "unknown_type" },
 	{ name: "err-type-zero", description: "type 0x00", hex: header(0x00, 1, 0), error: "unknown_type" },
 	{ name: "err-truncated-header", description: "message ends inside a header", hex: header(0x04, 1, 1).slice(0, 8), error: "truncated" },
 	{ name: "err-truncated-payload", description: "length says 4, 2 bytes follow", hex: header(0x04, 1, 4) + "aabb", error: "truncated" },
@@ -71,7 +101,10 @@ const invalid: { name: string; description: string; hex: string; error: string; 
 	{ name: "err-too-many-frames", description: "3 frames, maxFrames 2", hex: (header(0x04, 1, 1) + "00").repeat(3), error: "too_many_frames", limits: { maxFrames: 2 } },
 	{ name: "err-open-family", description: "open with address family 5", hex: header(0x01, 1, 55) + "00".repeat(48) + "05" + "00".repeat(6), error: "bad_payload" },
 	{ name: "err-open-short", description: "open with a 10-byte payload", hex: header(0x01, 1, 10) + "00".repeat(10), error: "bad_payload" },
-	{ name: "err-open-length", description: "IPv4 open one byte too long", hex: header(0x01, 1, 56) + "00".repeat(48) + "04" + "cb007107" + "1ae1" + "00", error: "bad_payload" },
+	{ name: "err-open-length", description: "IPv4 open with an explicit transport byte 0 (TCP is the byte left out)", hex: header(0x01, 1, 56) + "00".repeat(48) + "04" + "cb007107" + "1ae1" + "00", error: "bad_payload" },
+	{ name: "err-open-too-long", description: "IPv4 open two bytes too long", hex: header(0x01, 1, 57) + "00".repeat(48) + "04" + "cb007107" + "1ae1" + "0100", error: "bad_payload" },
+	{ name: "err-open-ipv6-short", description: "IPv6 open with an IPv4-sized payload plus a transport byte", hex: header(0x01, 1, 56) + "00".repeat(48) + "06" + "cb007107" + "1ae1" + "01", error: "bad_payload" },
+	{ name: "err-accept-transport-zero", description: "IPv4 accept with an explicit transport byte 0", hex: header(0x06, 0x8000, 56) + "00".repeat(48) + "04" + "c6336414" + "9c40" + "00", error: "bad_payload" },
 	{ name: "err-open-port-zero", description: "open to port 0", hex: header(0x01, 1, 55) + "00".repeat(48) + "04" + "cb007107" + "0000", error: "bad_payload" },
 	{ name: "err-open-conn-zero", description: "open on conn 0", hex: header(0x01, 0, 55) + "00".repeat(48) + "04" + "cb007107" + "1ae1", error: "bad_conn" },
 	{ name: "err-open-gateway-conn", description: "open on a gateway-range conn (0x8000)", hex: header(0x01, 0x8000, 55) + "00".repeat(48) + "04" + "cb007107" + "1ae1", error: "bad_conn" },
@@ -81,7 +114,16 @@ const invalid: { name: string; description: string; hex: string; error: string; 
 	{ name: "err-ping-long", description: "ping with 9 bytes", hex: header(0x07, 0, 9) + "00".repeat(9), error: "bad_payload" },
 	{ name: "err-close-reason-length", description: "close with a 2-byte reason", hex: header(0x05, 1, 2) + "0000", error: "bad_payload" },
 	{ name: "err-opened-length", description: "opened with 27 bytes", hex: header(0x02, 1, 27) + "00".repeat(27), error: "bad_payload" },
-	{ name: "err-after-valid", description: "a valid data frame followed by an unknown type", hex: header(0x04, 1, 1) + "ff" + header(0x0a, 1, 0), error: "unknown_type" },
+	{ name: "err-after-valid", description: "a valid data frame followed by an unknown type", hex: header(0x04, 1, 1) + "ff" + header(0x0b, 1, 0), error: "unknown_type" },
+	{ name: "err-announce-conn", description: "announce on conn 1", hex: header(0x08, 1, 49) + "00".repeat(49), error: "bad_conn" },
+	{ name: "err-announce-trailing", description: "announce with 0 trackers and a trailing byte", hex: header(0x08, 0, 50) + "00".repeat(50), error: "bad_payload" },
+	{ name: "err-announce-count", description: "announce claiming 17 trackers", hex: header(0x08, 0, 49) + "00".repeat(48) + "11", error: "bad_payload" },
+	{ name: "err-announce-url-short", description: "announce whose tracker url ends early", hex: header(0x08, 0, 53) + "00".repeat(48) + "01" + "0005" + "7564", error: "bad_payload" },
+	{ name: "err-announce-url-space", description: "announce whose tracker url holds a space", hex: header(0x08, 0, 54) + "00".repeat(48) + "01" + "0003" + "612062", error: "bad_payload" },
+	{ name: "err-announce-url-empty", description: "announce with an empty tracker url", hex: header(0x08, 0, 51) + "00".repeat(48) + "01" + "0000", error: "bad_payload" },
+	{ name: "err-announced-length", description: "announced with 20 bytes", hex: header(0x09, 0, 20) + "00".repeat(20), error: "bad_payload" },
+	{ name: "err-withdraw-conn", description: "withdraw on conn 2", hex: header(0x0a, 2, 20) + "00".repeat(20), error: "bad_conn" },
+	{ name: "err-withdraw-length", description: "withdraw with 21 bytes", hex: header(0x0a, 0, 21) + "00".repeat(21), error: "bad_payload" },
 ];
 
 mkdirSync(dir, { recursive: true });

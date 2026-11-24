@@ -14,6 +14,10 @@
 // is lazy: it rides on the next upstream message. Without an uploader (or
 // with upload off) the connection behaves as M1-06: no bitfield, `have`,
 // unchoke or piece; requests ignored, metadata and hash requests rejected.
+//
+// Hole punching (BEP 55, M4-05, holepunch.ts): `connect` and `error`
+// messages go to the `holepunch` event; we never relay, so a `rendezvous`
+// is answered here with the error NotConnected.
 
 import {
 	ExtensionError,
@@ -29,6 +33,7 @@ import {
 	type MetadataMessage,
 	type PexMessage,
 } from "./extension.ts";
+import { HolepunchError, decodeHolepunch, encodeHolepunch, type HolepunchMessage } from "./holepunch.ts";
 import {
 	MSG,
 	RESERVED_EXTENSION,
@@ -64,6 +69,8 @@ export interface PeerEvents {
 	metadata?(message: MetadataMessage): void;
 	/** ut_pex addresses (BEP 11). */
 	pex?(message: PexMessage): void;
+	/** A ut_holepunch `connect` or `error` (BEP 55); a `rendezvous` is answered by the connection. */
+	holepunch?(message: HolepunchMessage): void;
 	/** BEP 52 `hashes`. */
 	hashes?(request: HashRequest, hashes: Uint8Array): void;
 	/** BEP 52 `hash reject`. */
@@ -301,6 +308,14 @@ export class PeerConnection implements UploadPeer {
 		return true;
 	}
 
+	/** A ut_holepunch message (BEP 55); false if the peer does not accept the extension. */
+	sendHolepunch(message: HolepunchMessage, mode: "normal" | "lazy" = "normal"): boolean {
+		const id = this.remoteExtensions?.m.get("ut_holepunch");
+		if (!id) return false;
+		this.write(extendedMessage(id, encodeHolepunch(message)), mode);
+		return true;
+	}
+
 	/** BEP 52 hash request. */
 	requestHashes(request: HashRequest): void {
 		this.write(encodeHashRequest(MSG.HASH_REQUEST, request));
@@ -496,6 +511,11 @@ export class PeerConnection implements UploadPeer {
 				} else this.events.metadata?.(msg);
 			} else if (id === LOCAL_EXTENSIONS.ut_pex) {
 				this.events.pex?.(decodePex(payload));
+			} else if (id === LOCAL_EXTENSIONS.ut_holepunch) {
+				const msg = decodeHolepunch(payload);
+				// We relay for nobody (M4-05): say so, on the next upstream message.
+				if (msg.type === "rendezvous") this.sendHolepunch({ type: "error", address: msg.address, error: HolepunchError.NOT_CONNECTED }, "lazy");
+				else this.events.holepunch?.(msg);
 			}
 		} catch (e) {
 			// A malformed extension message: ignore it (the peer may still serve blocks).

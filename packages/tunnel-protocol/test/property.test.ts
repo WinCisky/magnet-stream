@@ -15,6 +15,7 @@ const address = fc.oneof(
 
 const frame: fc.Arbitrary<Frame> = fc.oneof(
 	fc.record({ type: fc.constant("open" as const), conn: clientConn, infoHash: bytes(20), reserved: bytes(8), peerId: bytes(20), address }),
+	fc.record({ type: fc.constant("open" as const), conn: clientConn, infoHash: bytes(20), reserved: bytes(8), peerId: bytes(20), address, transport: fc.integer({ min: 1, max: 255 }) }),
 	fc.record({ type: fc.constant("opened" as const), conn: anyConn, reserved: bytes(8), peerId: bytes(20) }),
 	fc.record({ type: fc.constant("failed" as const), conn: anyConn, reason: fc.integer({ min: 0, max: 255 }) }),
 	fc.record({ type: fc.constant("data" as const), conn: anyConn, payload: fc.uint8Array({ minLength: 1, maxLength: 300 }) }),
@@ -27,7 +28,26 @@ const frame: fc.Arbitrary<Frame> = fc.oneof(
 		peerId: bytes(20),
 		address,
 	}),
+	fc.record({
+		type: fc.constant("accept" as const),
+		conn: fc.integer({ min: 0x8000, max: 0xffff }),
+		infoHash: bytes(20),
+		reserved: bytes(8),
+		peerId: bytes(20),
+		address,
+		transport: fc.integer({ min: 1, max: 255 }),
+	}),
 	fc.record({ type: fc.constant("ping" as const), conn: fc.constant(0 as const), payload: fc.uint8Array({ maxLength: 8 }) }),
+	fc.record({
+		type: fc.constant("announce" as const),
+		conn: fc.constant(0 as const),
+		infoHash: bytes(20),
+		reserved: bytes(8),
+		peerId: bytes(20),
+		trackers: fc.array(fc.stringMatching(/^[\x21-\x7e]{1,40}$/), { maxLength: 16 }),
+	}),
+	fc.record({ type: fc.constant("announced" as const), conn: fc.constant(0 as const), infoHash: bytes(20), status: fc.integer({ min: 0, max: 255 }) }),
+	fc.record({ type: fc.constant("withdraw" as const), conn: fc.constant(0 as const), infoHash: bytes(20) }),
 );
 
 describe("properties", () => {

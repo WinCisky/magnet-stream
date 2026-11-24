@@ -168,6 +168,12 @@
 		void player?.play();
 	}
 
+	/** Pause from outside (the page's "Keep buffering"): the recovery goes on, playback waits for the viewer. */
+	export function pause(): void {
+		if (s?.status === "playing") void player?.pause();
+		pressed = false;
+	}
+
 	/** A tap on the picture shows hidden controls first (touch screens have no hover). */
 	function onPicture() {
 		if (lastPointer === "touch" && !showControls) poke();

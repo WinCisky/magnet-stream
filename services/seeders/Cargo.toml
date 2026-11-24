@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
-axum = { version = "0.8", features = ["query", "json", "http1", "tokio"], default-features = false }
+axum = { version = "0.8", features = ["query", "json", "http1", "tokio", "ws"], default-features = false }
 tower = { version = "0.5", features = ["util", "timeout"] }
 tower-http = { version = "0.7", features = ["cors", "timeout", "trace"] }
 moka = { version = "0.12", features = ["future"] }
@@ -34,3 +34,7 @@ sha2 = "0.11"
 hmac = "0.13"
 base64 = "0.22"
 bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.29"

@@ -12,7 +12,7 @@ import { fileBytes } from "./download";
 import { FileStream } from "./stream";
 import type { PageSession, RecoveryProgress, TunnelRecoveryHandle } from "./page-session";
 import { PieceTracker } from "./tracker";
-import { MAX_BITRATE, MIN_BITRATE } from "./session-protocol";
+import { MAX_BITRATE, MIN_BITRATE, type SwarmHealth } from "./session-protocol";
 
 const SNAPSHOT_MS = 200;
 /** The picker's window follows playback: a position goes to the worker at most this often. */
@@ -82,6 +82,11 @@ export interface EngineSnapshot {
 	windowBytes: number;
 	/** Under this download rate (bytes/s) for 30 s, another WebSocket opens (0: none). */
 	rateThreshold: number;
+	/**
+	 * The swarm while recovering (M4-06): escalation to the VPS gateway, and
+	 * whether the rate has stayed under the video's bitrate. Null otherwise.
+	 */
+	health: SwarmHealth | null;
 }
 
 export interface EngineOptions {
@@ -434,6 +439,7 @@ export class RecoveryEngine {
 			bitrate: this.bitrate,
 			windowBytes: this.progress?.windowBytes ?? 0,
 			rateThreshold: this.progress?.rateThreshold ?? 0,
+			health: this.phase === "recovering" ? (this.opts.session?.health ?? null) : null,
 		});
 	}
 

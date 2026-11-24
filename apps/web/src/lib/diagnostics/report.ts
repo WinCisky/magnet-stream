@@ -6,6 +6,7 @@ import type { Environment } from "./env";
 import { measurementRow, phaseMetrics } from "./phase";
 import type { Milestone, PlaybackRecord, RecoveryRecord, SessionRecord, Timed, VisitRecord } from "./records";
 import { MS_BOUNDS, RATE_BOUNDS, add, bump, hist, merge, mergeCounts, quantile, type Counts, type Hist } from "./stats";
+import { GATEWAY_PATHS, emptyPaths, type GatewayPathName, type PathDiag } from "$lib/torrent/session-protocol";
 
 export type Status = "good" | "fair" | "poor" | "no data";
 
@@ -183,7 +184,8 @@ function listedMs(sessions: SessionRecord[]): number[] {
 /** The tunnel gateway: dials by class and outcome, peers reached, unchoked, delivering. */
 function tunnel(sessions: SessionRecord[]): PartHealth {
 	const title = "Tunnel (gateway dials and peers)";
-	const used = sessions.filter((s) => dialsOf(s).attempted > 0);
+	// Sessions that dialled, or whose peers only came in through the VPS gateway.
+	const used = sessions.filter((s) => dialsOf(s).attempted > 0 || pathConnections(s) > 0);
 	if (used.length === 0) return noData(title);
 	const th = THRESHOLDS.tunnel;
 	const reached = used.filter((s) => s.tunnel.connected > 0).length / used.length;
@@ -207,6 +209,7 @@ function tunnel(sessions: SessionRecord[]): PartHealth {
 	const allFailed: Counts = {};
 	for (const c of Object.values(byClass)) mergeCounts(allFailed, c.failed);
 	const top = topKey(allFailed);
+	const paths = pathTotals(used);
 	const share = (k: string) => {
 		const c = byClass[k];
 		return c.attempted ? `${pct(c.succeeded / c.attempted)} (${c.succeeded}/${c.attempted})` : "none";
@@ -222,7 +225,8 @@ function tunnel(sessions: SessionRecord[]): PartHealth {
 			`untried ${share("untried")}, known ${share("known")}` +
 			(unchokeP50 !== null ? `; first unchoke within ${sec(unchokeP50)} for half, ${sec(unchokeP90)} for 90%` : "; never unchoked") +
 			`; median peers connected ${median(used.map((s) => s.tunnel.connected))}, delivering ${median(used.map((s) => s.tunnel.delivering))}` +
-			(top ? `; most common dial failure: ${top}` : ""),
+			(top ? `; most common dial failure: ${top}` : "") +
+			`; received ${mbOf(paths.cloudflare.downloaded)} MB through Cloudflare, ${mbOf(paths.vps.downloaded)} MB through the VPS`,
 		details: {
 			sessions: used.length,
 			reachedShare: round(reached),
@@ -243,8 +247,48 @@ function tunnel(sessions: SessionRecord[]): PartHealth {
 				messages: sum(used, (s) => s.tunnel.upload?.messages ?? 0),
 				maxUnchoked: Math.max(0, ...used.map((s) => s.tunnel.upload?.unchoked ?? 0)),
 			},
+			// Swarms with few seeders (M4-06): sessions that asked the VPS gateway to join the swarm.
+			escalation: {
+				sessionsEscalated: used.filter((s) => s.tunnel.escalation?.reason != null).length,
+				fewPeers: used.filter((s) => s.tunnel.escalation?.reason === "few_peers").length,
+				slow: used.filter((s) => s.tunnel.escalation?.reason === "slow").length,
+				joined: used.filter((s) => s.tunnel.escalation?.state === "joined").length,
+				left: used.filter((s) => s.tunnel.escalation?.state === "left").length,
+				unavailable: used.filter((s) => s.tunnel.escalation?.state === "unavailable").length,
+				inboundPeers: sum(used, (s) => s.tunnel.escalation?.accepted ?? 0),
+				medianAfterMs: median(used.flatMap((s) => (s.tunnel.escalation?.afterMs != null ? [s.tunnel.escalation.afterMs] : []))),
+			},
+			// Bytes by the gateway that carried them (M4-08): totals, and sessions with any byte on each.
+			paths: {
+				cloudflare: { ...paths.cloudflare, sessions: used.filter((s) => (s.tunnel.paths?.cloudflare.downloaded ?? 0) > 0).length },
+				vps: { ...paths.vps, sessions: used.filter((s) => (s.tunnel.paths?.vps.downloaded ?? 0) > 0).length },
+				vpsShare: paths.cloudflare.downloaded + paths.vps.downloaded > 0 ? round(paths.vps.downloaded / (paths.cloudflare.downloaded + paths.vps.downloaded)) : null,
+			},
 		},
 	};
+}
+
+function pathConnections(s: SessionRecord): number {
+	return (s.tunnel.paths?.cloudflare.connections ?? 0) + (s.tunnel.paths?.vps.connections ?? 0);
+}
+
+/** Bytes and connections by gateway path, summed over sessions (records from before M4-08 count nothing). */
+function pathTotals(sessions: SessionRecord[]): Record<GatewayPathName, PathDiag> {
+	const out = emptyPaths();
+	for (const s of sessions) {
+		for (const name of GATEWAY_PATHS) {
+			const p = s.tunnel.paths?.[name];
+			if (!p) continue;
+			out[name].downloaded += p.downloaded;
+			out[name].uploaded += p.uploaded;
+			out[name].connections += p.connections;
+		}
+	}
+	return out;
+}
+
+function mbOf(bytes: number): string {
+	return bytes === 0 ? "0" : bytes < MB ? (bytes / MB).toFixed(2) : (bytes / MB).toFixed(1);
 }
 
 function dialsOf(s: SessionRecord): { attempted: number; succeeded: number } {

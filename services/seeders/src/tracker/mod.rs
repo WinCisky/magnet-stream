@@ -25,6 +25,15 @@ pub enum TrackerError {
     Timeout,
 }
 
+/// The `event` of an announce (BEP 3 / BEP 15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnounceEvent {
+    /// A regular (re-)announce.
+    None,
+    Started,
+    Stopped,
+}
+
 /// Parameters for a single BEP 3 / BEP 15 announce, shared across every
 /// tracker queried for one incoming API request.
 #[derive(Debug, Clone)]
@@ -34,6 +43,10 @@ pub struct AnnounceParams {
     pub port: u16,
     pub key: u32,
     pub numwant: i32,
+    /// Bytes left to download: 0 says "seed" (lookups), more says "leecher"
+    /// (a session's announce, so trackers hand our address to seeders).
+    pub left: u64,
+    pub event: AnnounceEvent,
     /// Let tracker URLs reach loopback/private addresses. Tests only: the
     /// SSRF guard (netguard) is on in every real configuration.
     pub allow_private: bool,
@@ -50,6 +63,8 @@ impl AnnounceParams {
             port: 6881,
             key: rand::random(),
             numwant: 200,
+            left: 0,
+            event: AnnounceEvent::Started,
             allow_private: false,
         }
     }

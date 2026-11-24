@@ -37,5 +37,8 @@ EXPOSE 8080/tcp
 # Mainline DHT node (UDP). Must be published for DHT peer discovery to work;
 # match this to DHT_PORT if you override it.
 EXPOSE 6881/udp
+# Tunnel inbound peers (TUNNEL_INBOUND_ADDR, unset by default): TCP and UDP
+# (uTP) on one port that differs from DHT_PORT; publish both if you set it,
+# e.g. -p 6883:6883/tcp -p 6883:6883/udp with TUNNEL_INBOUND_ADDR=0.0.0.0:6883.
 
 ENTRYPOINT ["/magnet-seeders"]

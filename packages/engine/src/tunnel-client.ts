@@ -1,24 +1,38 @@
 // Client side of the tunnel protocol (docs/tunnel-protocol.md): one
 // WebSocket to a gateway, multiplexing up to 6 peer connections by `conn`
 // id. Each opened connection is a Transport for PeerConnection.
+//
+// On the VPS gateway the client may also `announce` an info-hash: the
+// gateway joins its swarm and hands over inbound peers (`accept`). An
+// accepted connection is a Transport like an opened one (the peer started
+// the handshake; the gateway answered with our reserved bytes and peer id)
+// and does not take one of the 6 outbound slots.
 
 import {
+	AnnounceStatus,
 	CLIENT_CONN_MAX,
 	CLIENT_CONN_MIN,
 	CLOSE_SLOT_GRACE_MS,
 	CloseReason,
 	FAILED_CONNECT_HOLD_MS,
 	FailReason,
+	GATEWAY_CONN_MIN,
+	MAX_ANNOUNCE_TRACKERS,
 	MAX_CONNECTIONS_PER_SOCKET,
 	SUBPROTOCOL,
+	Transport,
 	decodeMessage,
 	encodeFrames,
+	formatAddress,
+	isTrackerUrlText,
 	parseAddress,
 	type Frame,
 	type PeerAddress,
 } from "@magnet-stream/tunnel-protocol";
 import { BufferedTransport, type HandshakeInfo } from "./transport.ts";
 import { UpstreamBatcher, type FlushMode } from "./upstream.ts";
+
+export { AnnounceStatus, type AnnounceStatusCode } from "@magnet-stream/tunnel-protocol";
 
 /** The part of the WebSocket API the client uses (browser, worker or Node). */
 export interface WebSocketLike {
@@ -42,6 +56,37 @@ export interface OpenRequest {
 	reserved?: Uint8Array;
 	/** Give up waiting for `opened` after this long (default 20 s; the gateway has its own timeouts). */
 	timeoutMs?: number;
+	/**
+	 * Transport the gateway dials with (Transport.TCP by default; uTP only on
+	 * the VPS gateway while this session announces the info-hash, else the
+	 * open fails with UNSUPPORTED_TRANSPORT). The engine dials uTP only for
+	 * a hole punch (M4-05, holepunch.ts).
+	 */
+	transport?: number;
+	/** Send the `open` at once instead of with the next batch (a hole punch: the remote's SYN is on its way). */
+	urgent?: boolean;
+}
+
+export interface AnnounceRequest {
+	infoHash: Uint8Array;
+	/** Our peer id: the gateway answers inbound handshakes with it. */
+	peerId: Uint8Array;
+	/** Our reserved bytes (default: BEP 6 fast bit and BEP 10). */
+	reserved?: Uint8Array;
+	/** The magnet's trackers (http, https, udp); others and the excess are left out. */
+	trackers?: readonly string[];
+	/** Give up waiting for `announced` after this long (default 10 s). */
+	timeoutMs?: number;
+}
+
+/** An inbound peer the gateway accepted for an info-hash we announce. */
+export interface AcceptedPeer {
+	transport: TunnelTransport;
+	infoHash: Uint8Array;
+	/** `ip:port` the peer connected from (not a port it listens on). */
+	address: string;
+	/** How it reached the gateway: Transport.TCP or Transport.UTP. */
+	peerTransport: number;
 }
 
 export interface TunnelStats {
@@ -127,6 +172,15 @@ export class TunnelClient {
 	private readonly batcher: UpstreamBatcher | undefined;
 	/** Called once when the session ends. */
 	onClose: ((error?: Error) => void) | undefined;
+	/** An inbound peer (VPS gateway). Without a handler it is closed. */
+	onAccept: ((peer: AcceptedPeer) => void) | undefined;
+	/** The gateway changed the state of an announce (e.g. stopped it). */
+	onAnnounced: ((infoHash: Uint8Array, status: number) => void) | undefined;
+	/** Info-hashes (hex) we announce, with the reserved bytes we announced. */
+	private readonly announces = new Map<string, Uint8Array>();
+	/** Info-hashes (hex) the gateway answered ACTIVE for (and still announces). */
+	private readonly active = new Set<string>();
+	private readonly announceWaits = new Map<string, { resolve(status: number): void; reject(e: Error): void; timer: ReturnType<typeof setTimeout> }[]>();
 
 	/** Connections allowed at once (the protocol's 6; more only to probe a gateway, see tools/spike). */
 	readonly maxConnections: number;
@@ -174,9 +228,68 @@ export class TunnelClient {
 		return this.ended !== undefined;
 	}
 
-	/** Slots taken at the gateway: connections opening or open, and slots it still holds. */
+	/** Outbound slots taken at the gateway: connections opening or open, and slots it still holds. */
 	get connections(): number {
-		return this.pending.size + this.transports.size + this.heldSlots();
+		return this.pending.size + this.transports.size - this.acceptedCount() + this.heldSlots();
+	}
+
+	/** Inbound connections the gateway handed over (`accept`), open now. */
+	get accepted(): number {
+		return this.acceptedCount();
+	}
+
+	/** Info-hashes announced on this socket. */
+	get announcing(): number {
+		return this.announces.size;
+	}
+
+	/**
+	 * The gateway announces `infoHash` for this socket (it answered ACTIVE):
+	 * the session's uTP `open`s for it are dialled (VPS gateway).
+	 */
+	isAnnounced(infoHash: Uint8Array): boolean {
+		return !this.ended && this.active.has(hex(infoHash));
+	}
+
+	private acceptedCount(): number {
+		let n = 0;
+		for (const conn of this.transports.keys()) if (conn >= GATEWAY_CONN_MIN) n++;
+		return n;
+	}
+
+	/**
+	 * Ask the gateway to join the swarm of `infoHash` and hand inbound peers
+	 * to `onAccept`. Resolves with the gateway's AnnounceStatus (ACTIVE, or
+	 * UNSUPPORTED on a gateway without inbound peers, LIMIT_REACHED, ...).
+	 */
+	announce(request: AnnounceRequest): Promise<number> {
+		if (this.ended) return Promise.reject(this.ended);
+		if (request.infoHash.length !== 20 || request.peerId.length !== 20) return Promise.reject(new RangeError("bad info-hash or peer id"));
+		const reserved = request.reserved ?? DEFAULT_RESERVED;
+		const trackers = (request.trackers ?? [])
+			.filter((t) => isTrackerUrlText(t) && /^(https?|udp):\/\//i.test(t))
+			.slice(0, MAX_ANNOUNCE_TRACKERS);
+		const key = hex(request.infoHash);
+		this.announces.set(key, reserved.slice());
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				const list = this.announceWaits.get(key);
+				const i = list?.findIndex((w) => w.timer === timer) ?? -1;
+				if (list && i >= 0) list.splice(i, 1);
+				reject(new Error("no answer to announce"));
+			}, request.timeoutMs ?? 10_000);
+			const list = this.announceWaits.get(key) ?? [];
+			list.push({ resolve, reject, timer });
+			this.announceWaits.set(key, list);
+			this.send([{ type: "announce", conn: 0, infoHash: request.infoHash, reserved, peerId: request.peerId, trackers }], true);
+		});
+	}
+
+	/** Stop the announce of `infoHash` (inbound peers already accepted stay). */
+	withdraw(infoHash: Uint8Array): void {
+		this.active.delete(hex(infoHash));
+		if (!this.announces.delete(hex(infoHash))) return;
+		this.send([{ type: "withdraw", conn: 0, infoHash }], true);
 	}
 
 	/** Slots held after a failed connect or a close (see `held`). */
@@ -206,7 +319,8 @@ export class TunnelClient {
 				reject(new TunnelOpenError(FailReason.TIMEOUT, "no answer from the gateway"));
 			}, request.timeoutMs ?? 20_000);
 			this.pending.set(conn, { resolve, reject, timer, reserved, startedAt: this.now() });
-			this.send([{ type: "open", conn, infoHash: request.infoHash, reserved, peerId: request.peerId, address }]);
+			const transport = request.transport ?? Transport.TCP;
+			this.send([{ type: "open", conn, infoHash: request.infoHash, reserved, peerId: request.peerId, address, ...(transport === Transport.TCP ? {} : { transport }) }], request.urgent === true);
 		});
 	}
 
@@ -245,7 +359,7 @@ export class TunnelClient {
 
 	/** @internal A transport closed locally. The close is urgent: the slot must free before the next dial. */
 	release(conn: number, notifyGateway: boolean): void {
-		if (this.transports.delete(conn)) this.hold(this.now() + CLOSE_SLOT_GRACE_MS);
+		if (this.transports.delete(conn) && conn < GATEWAY_CONN_MIN) this.hold(this.now() + CLOSE_SLOT_GRACE_MS);
 		if (notifyGateway) this.send([{ type: "close", conn, reason: CloseReason.NORMAL }], true);
 	}
 
@@ -311,7 +425,7 @@ export class TunnelClient {
 				return;
 			case "close": {
 				const t = this.transports.get(frame.conn);
-				if (this.transports.delete(frame.conn)) this.hold(this.now() + CLOSE_SLOT_GRACE_MS);
+				if (this.transports.delete(frame.conn) && frame.conn < GATEWAY_CONN_MIN) this.hold(this.now() + CLOSE_SLOT_GRACE_MS);
 				t?.remoteClosed(frame.reason);
 				// A close for a pending open: the gateway gave up on it.
 				const p = this.pending.get(frame.conn);
@@ -322,10 +436,40 @@ export class TunnelClient {
 				}
 				return;
 			}
+			case "accept":
+				return this.onAcceptFrame(frame.conn, frame.infoHash, frame.reserved, frame.peerId, frame.address, frame.transport ?? Transport.TCP);
+			case "announced": {
+				const key = hex(frame.infoHash);
+				if (frame.status !== AnnounceStatus.ACTIVE) {
+					this.announces.delete(key);
+					this.active.delete(key);
+				} else if (this.announces.has(key)) this.active.add(key);
+				const waits = this.announceWaits.get(key);
+				const wait = waits?.shift();
+				if (waits && waits.length === 0) this.announceWaits.delete(key);
+				if (wait) {
+					clearTimeout(wait.timer);
+					wait.resolve(frame.status);
+				} else this.onAnnounced?.(frame.infoHash.slice(), frame.status);
+				return;
+			}
 			default:
-				// ping needs no answer; accept is VPS-only (M4).
+				// ping needs no answer; open/announce/withdraw never come from a gateway.
 				return;
 		}
+	}
+
+	/** An inbound peer: kept only for an info-hash we announce, a free id and a transport we know. */
+	private onAcceptFrame(conn: number, infoHash: Uint8Array, reserved: Uint8Array, peerId: Uint8Array, address: PeerAddress, peerTransport: number): void {
+		const local = this.announces.get(hex(infoHash));
+		const known = peerTransport === Transport.TCP || peerTransport === Transport.UTP;
+		if (!local || !known || this.transports.has(conn) || !this.onAccept) {
+			this.send([{ type: "close", conn, reason: CloseReason.NORMAL }], true);
+			return;
+		}
+		const t = new TunnelTransport(this, conn, { reserved: reserved.slice(), peerId: peerId.slice() }, local);
+		this.transports.set(conn, t);
+		this.onAccept({ transport: t, infoHash: infoHash.slice(), address: formatAddress(address), peerTransport });
 	}
 
 	private fail(error: Error): void {
@@ -346,6 +490,15 @@ export class TunnelClient {
 		this.pending.clear();
 		for (const t of this.transports.values()) t.sessionEnded(this.ended);
 		this.transports.clear();
+		this.announces.clear();
+		this.active.clear();
+		for (const waits of this.announceWaits.values()) {
+			for (const w of waits) {
+				clearTimeout(w.timer);
+				w.reject(this.ended);
+			}
+		}
+		this.announceWaits.clear();
 		this.onClose?.(error);
 	}
 }
@@ -406,4 +559,8 @@ export class TunnelTransport extends BufferedTransport {
 	sessionEnded(error: Error): void {
 		this.finish(error);
 	}
+}
+
+function hex(bytes: Uint8Array): string {
+	return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }

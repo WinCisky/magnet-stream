@@ -3,7 +3,7 @@
 // billed-request budget (docs/measurements.md, decision OQ-19). The video is
 // saved in OPFS, still listed after a reload, and gone once deleted.
 //
-//   chromium (system or CHROMIUM_PATH) + fake peers + /peers stub + wrangler dev + the site's production build
+//   chromium (system or CHROMIUM_PATH) + fake peers + /peers stub + wrangler dev (PUBLIC_DEFAULT_GATEWAY=vps: the VPS gateway) + the site's production build
 //
 // The swarm: 2 fast seeds, 1 slow seed, 1 partial peer (first half), 2 peers
 // that never unchoke, 1 tit-for-tat leecher (second half), 3 dead addresses.
@@ -20,8 +20,8 @@ import type { Server } from "node:http";
 import { dirname, join, resolve } from "node:path";
 import { chromium } from "playwright-core";
 import { makeTorrent, startFakePeer } from "@magnet-stream/fake-peer";
-import { closedPort, freePort, startPeersStub, startWranglerDev, type WranglerDev } from "@magnet-stream/harness";
-import { ROOT, buildSite, findChromium, serveSite, waitFor } from "./site.ts";
+import { closedPort, freePort, startPeersStub } from "@magnet-stream/harness";
+import { ROOT, buildSite, cloudflareSockets, findChromium, serveSite, startSiteGateway, waitFor, type SiteGateway } from "./site.ts";
 
 /** Agreed budget (OQ-19): billed Cloudflare requests per GB. */
 const BUDGET_PER_GB = 40;
@@ -41,7 +41,7 @@ if (!chromiumPath) {
 	process.exit(process.env.REQUIRE_BROWSER_E2E ? 1 : 0);
 }
 
-let dev: WranglerDev | undefined;
+let dev: SiteGateway | undefined;
 let site: Server | undefined;
 let siteDir: string | undefined;
 let failed = false;
@@ -69,11 +69,13 @@ async function main(): Promise<void> {
 		// apps/web (someone's local stack) must not answer for this test.
 		const port = await freePort();
 		const PAGE = `http://localhost:${port}/`;
-		dev = await startWranglerDev({ vars: { ALLOW_PRIVATE_PEERS: "1", ALLOWED_ORIGINS: `http://localhost:${port}` } });
+		dev = await startSiteGateway(`http://localhost:${port}`);
 		// Inside the repository (git-ignored): Astro moves files into it, which fails across filesystems.
 		mkdirSync(join(ROOT, "tools/e2e/results"), { recursive: true });
 		siteDir = mkdtempSync(join(ROOT, "tools/e2e/results", "site-"));
-		buildSite(stub.url, dev.url, siteDir);
+		// A healthy swarm never escalates (M4-06): with a short threshold, a VPS tunnel would show up
+		// as a WebSocket off the primary gateway (the escalation target is the /peers host here).
+		buildSite(stub.url, dev, siteDir, { PUBLIC_ESCALATION_AFTER_SECONDS: "20" });
 		site = await serveSite(siteDir, port);
 		await waitFor(PAGE, 30_000);
 
@@ -119,6 +121,13 @@ async function main(): Promise<void> {
 			unchoked: Number((await uploadShown.locator('[data-metric="upload-unchoked"]').innerText()).trim()),
 			messages: Number((await uploadShown.locator('[data-metric="upload-messages"]').innerText()).trim()),
 			setting: (await uploadShown.locator('[data-metric="upload-enabled"]').innerText()).trim(),
+		};
+		// Bytes by path (M4-08): all of them through the primary gateway, none through the other.
+		const pathsShown = page.getByTestId("path-metrics");
+		await pathsShown.waitFor({ timeout: 10_000 });
+		const paths = {
+			cloudflare: Number(await pathsShown.locator('[data-metric="path-cloudflare-mb"]').getAttribute("data-bytes")),
+			vps: Number(await pathsShown.locator('[data-metric="path-vps-mb"]').getAttribute("data-bytes")),
 		};
 		await page.keyboard.press("Escape");
 
@@ -208,11 +217,23 @@ async function main(): Promise<void> {
 		check(peers.length === 1, `expected 1 /peers request, got ${peers.length}`);
 		check(tunnels.length >= 1 && tunnels.length <= 3, `expected 1–3 tunnels, got ${tunnels.length}`);
 		check(tunnels.every((s) => s.closed), "tunnel WebSockets were not closed");
+		// The primary gateway (PUBLIC_DEFAULT_GATEWAY) carries every tunnel of both sessions; with
+		// `vps`, not one WebSocket goes to the Cloudflare gateway.
+		const primary = new URL(dev!.url);
+		const elsewhere = sockets.filter((s) => {
+			const url = new URL(s.url);
+			return url.hostname !== primary.hostname || url.port !== primary.port;
+		});
+		check(elsewhere.length === 0, `${elsewhere.length} WebSocket(s) not on the ${dev!.kind} gateway`);
+		const toCloudflare = cloudflareSockets(dev!, sockets.map((s) => s.url));
+		check(toCloudflare.length === 0, `${toCloudflare.length} WebSocket(s) to the Cloudflare gateway with the VPS primary`);
 		check(firstStubRequests === 1, `stub saw ${firstStubRequests} /peers requests`);
 		check(uploaded.setting === "on" && uploaded.bytes > 0, `the page uploaded ${uploaded.bytes} bytes (setting ${uploaded.setting})`);
 		check(leecherBefore.bytes > 0 && leecherBefore.badBlocks === 0, `the leecher got ${leecherBefore.bytes} bytes, ${leecherBefore.badBlocks} bad blocks`);
 		check(leecher.stats.titForTatUnchokes > 0, "the tit-for-tat leecher never unchoked the page");
 		check(live.slice(0, 4).some((p) => p.stats.served > 0), "no live peer served a block");
+		const other = dev!.kind === "vps" ? "cloudflare" : "vps";
+		check(paths[dev!.kind] > 0 && paths[other] === 0, `bytes by path on the page: ${JSON.stringify(paths)} (primary ${dev!.kind})`);
 
 		// Billed requests, counted from the browser's side of the tunnel.
 		const messages = tunnels.reduce((n, s) => n + s.sent, 0);
@@ -224,17 +245,21 @@ async function main(): Promise<void> {
 
 		const result = {
 			kind: "synthetic",
-			swarm: "2 fast seeds, 1 slow seed, 1 partial (half), 2 never unchoke, 1 tit-for-tat leecher (other half), 3 dead; local wrangler dev",
+			swarm: `2 fast seeds, 1 slow seed, 1 partial (half), 2 never unchoke, 1 tit-for-tat leecher (other half), 3 dead; ${dev!.kind === "vps" ? "local VPS gateway" : "local wrangler dev"}`,
+			gateway: dev!.kind,
 			date: new Date().toISOString(),
 			commit: process.env.GITHUB_SHA ?? null,
 			fileBytes: torrent.totalLength,
 			recoveryMs,
 			measured: { websockets: tunnels.length, messagesSent: messages, billedRequests: Number(billed.toFixed(2)), billedRequestsPerGB: Number(perGB.toFixed(1)) },
 			page: page3,
+			// Bytes received by gateway path, as the page's diagnostics report them.
+			pathBytes: paths,
 			upload: { bytes: uploaded.bytes, peersUnchoked: uploaded.unchoked, uploadOnlyMessages: uploaded.messages, leecherReceived: leecherBefore.bytes },
 			budgetPerGB: BUDGET_PER_GB,
 		};
-		const out = resolve(ROOT, process.env.MEASUREMENTS_OUT ?? "tools/e2e/results/browser-session.json");
+		// The VPS run gets its own file: the budget is Cloudflare's, its numbers are not the default path's.
+		const out = resolve(ROOT, process.env.MEASUREMENTS_OUT ?? `tools/e2e/results/browser-session${dev!.kind === "vps" ? "-vps" : ""}.json`);
 		mkdirSync(dirname(out), { recursive: true });
 		writeFileSync(out, `${JSON.stringify(result, null, 1)}\n`);
 		console.log(`browser session: ${peers.length} /peers, ${tunnels.length} websocket(s), no legacy calls`);

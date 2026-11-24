@@ -170,6 +170,109 @@ for `/metadata`, if it isn't cached):
 Errors: as for `/metadata`, plus `422` for an info dict with no v1 file
 list (a BitTorrent v2-only torrent).
 
+## Tunnel gateway: `GET /v1/tunnel`
+
+The fallback data path (docs/architecture.md › Target architecture,
+*Fallback gateway*): a WebSocket endpoint speaking the same protocol as the
+Cloudflare gateway (`docs/tunnel-protocol.md`, subprotocol
+`magnet-tunnel.v1`) for **outbound TCP** to peers. The engine's
+`TunnelClient` uses it by changing only the gateway URL. Code:
+`src/tunnel/` (`codec.rs` checked against the shared vectors in
+`packages/tunnel-protocol/fixtures`, `gate.rs` the handshake gate,
+`session.rs` one WebSocket and its connections).
+
+- **Same rules as the Cloudflare gateway**: handshake gate (nothing is
+  relayed before the remote's valid handshake for the same info-hash),
+  6 connections per WebSocket, 3 WebSockets per `?session=`, no
+  private/reserved addresses (`src/netguard.rs`, the same policy as
+  `packages/tunnel-protocol`) and no ports below 1024, idle timeout 90 s,
+  session timeout 2 h, 4 MiB held for a peer that does not read, 30
+  upgrades per minute per IP, the same close codes and close-reason
+  counters. A connect that timed out does not keep its slot for 20 s (that
+  hold is a Cloudflare platform quirk, OQ-03).
+- **Access** (OQ-09): no browser authentication and no secret. `Origin`
+  outside `ALLOWED_ORIGINS` gets **403 before the upgrade** (browsers do not
+  apply CORS to WebSocket upgrades); requests without `Origin` are not from
+  a page and pass, limited like the rest by the handshake gate and the
+  limits. Beyond Cloudflare's rules, concurrent WebSockets are capped per IP
+  and in total (`TUNNEL_SOCKETS_PER_IP`, `TUNNEL_MAX_SOCKETS`).
+- **Logs**: `tunnel.session_start` / `tunnel.session_end` with counters and
+  reason codes (per-connection events at `debug`); never the client IP, a
+  peer address or an info-hash.
+- **Shutdown**: SIGTERM closes every tunnel with code 4002 and `close`
+  SESSION_ENDING frames; the browser reconnects.
+- **Announce and inbound peers** (M4-02, `src/tunnel/inbound.rs`,
+  docs/tunnel-protocol.md › Announce and inbound connections): on a
+  session's `announce` frame the gateway announces its port for that
+  info-hash to the session's trackers, the defaults and the DHT, opens the
+  listener (`TUNNEL_INBOUND_ADDR`) and hands every peer that connects in
+  with a valid handshake for an announced info-hash to that WebSocket
+  (`accept`). Anything else is closed without a reply. Nothing is announced
+  and no port listens until a session asks; `withdraw` or the end of the
+  WebSocket sends `stopped` to the trackers and, with no announce left,
+  closes the port. Unset `TUNNEL_INBOUND_ADDR`: `announced` UNSUPPORTED.
+  The port must be reachable from the Internet over TCP and UDP (firewall),
+  at least 1024 (the service is not root) and different from `DHT_PORT`
+  (both use UDP: on a clash inbound peers are turned off, logged).
+- **uTP in the tunnel** (M4-04e, docs/tunnel-protocol.md › Peer fields):
+  while it listens, the gateway also binds a UDP socket on the listener's
+  port number and speaks uTP there. Inbound uTP peers go through the same
+  handshake gate, session check and limits as TCP ones and reach the
+  browser as `accept` with transport uTP; a refused one is forgotten
+  without a single packet in reply. An `open` with transport uTP dials
+  from that port, only while the `open`'s session announces its
+  info-hash, only to addresses `netguard` allows (else `failed`
+  UNSUPPORTED_TRANSPORT / FORBIDDEN_ADDRESS). Nothing is bound on UDP for
+  uTP before the first announce; the uTP gate closes with the TCP listener
+  and the socket is released once its last uTP connection ends
+  (`src/tunnel/inbound.rs`, `src/tunnel/stream.rs`).
+- **Hole punching** (M4-05, BEP 55, docs/tunnel-protocol.md › Hole
+  punching): the browser sends the rendezvous through a relay and, on its
+  `connect`, a uTP `open` to the peer behind NAT. While that connect is
+  pending the gateway holds the multiplexer's acceptor for the peer's
+  exact address, so the peer's own SYN (sent at the same time, through
+  its NAT) is that `open`'s and not an inbound peer; every connection to
+  the address that comes up gets the handshake and the first that
+  answers it is kept, the others closed (`src/tunnel/punch.rs`). No new
+  frame, setting or rule: uTP `open`s stay limited to sessions that
+  announce and to addresses `netguard` allows.
+- **uTP** (BEP 29, our own implementation: docs/decisions/utp.md):
+  `src/utp/packet.rs` is the packet codec (M4-04a; strict parsing, no
+  allocation sized by the packet, no I/O). `src/utp/conn.rs` is the
+  connection state machine (M4-04b), sans-IO: SYN retransmitted with
+  backoff until the connect timeout, one `ST_STATE` per received SYN and
+  never a retransmitted one, FIN/RESET, reorder buffer with selective ACK,
+  RTT/RTO as BEP 29, fast retransmit, send/receive buffers and packets in
+  flight bounded per connection, idle timeout; packets out of window or
+  acknowledging unsent data are dropped without a reply.
+  `src/utp/ledbat.rs` is the congestion control (M4-04c): LEDBAT as BEP 29
+  (100 ms target queueing delay, base delay = minimum of the last two
+  minutes, at most 3 000 B of growth per round trip, halving on loss once
+  per window, one packet after a timeout, never below one packet), plus
+  slow start and no growth while application-limited, as libutp; packets
+  carry at most 1 400 B (no PMTU probing). On a simulated bottleneck it
+  reaches over 80 % of capacity with about 100 ms of queueing
+  (`src/utp/ledbat_sim_tests.rs`). `src/utp/socket.rs` is the
+  multiplexer on one UDP socket (M4-04d): connections demultiplexed by
+  (address, connection id), outbound connects and inbound connections on
+  the same local port, `UtpStream: AsyncRead + AsyncWrite` (like a
+  `TcpStream`: 0 at the remote's FIN, `shutdown` sends ours, a dropped
+  stream closes gracefully and is aborted after a linger time). A SYN is
+  answered only through a gate the caller opens: the listener (with an
+  optional address filter), an expected address (hole punch), or the
+  address of a pending connect (simultaneous open); anything else, and any
+  packet for an unknown connection, gets no reply, never an `ST_RESET`.
+  Connections in total and per IP, half-open connections in total and per
+  IP and each acceptor's backlog are bounded; SYNs beyond them are
+  ignored. The gateway uses it on its announced port (above).
+  Interoperability (M4-04f): full verified downloads over uTP from
+  libtorrent-rasterbar 2.0 and Transmission 4.0 (its libutp), with the
+  gateway dialling and with the client dialling in, run by
+  `npm run e2e:interop -w tools/e2e` (Docker; docs/decisions/utp.md ›
+  Interoperability).
+- nginx must forward WebSocket
+  upgrades on `/v1/tunnel` (production setup: M5-04).
+
 ## Configuration
 
 All configuration is via environment variables; every one is optional and
@@ -187,6 +290,7 @@ never a hard crash).
 | `MAX_TRACKERS` | `20` | Cap on how many trackers are queried per request (magnet's own + defaults, deduplicated) |
 | `PEERS_CACHE_MB` | `16` | Memory for cached discovery results, weighed in bytes (each of the two caches: streamed `/peers` and the legacy one) |
 | `DHT_PORT` | `6881` | UDP port for the DHT node |
+| `DHT_BOOTSTRAP` | unset | DHT bootstrap nodes: unset, the DHT library's public routers; `none`, no bootstrap (the node never contacts the public DHT: the test harness sets it); or a comma-separated `host:port` list |
 | `PROBE_CONCURRENCY` | `256` | Max peer probes (TCP connections) in flight in total, scout and `/swarm` together |
 | `MAX_PROBE_PEERS` | `1000` | Max peers probed per swarm build, and per info-hash per `SCOUT_REPROBE_SECS` window by the scout (beyond it, `/peers` sends addresses unprobed) |
 | `PROBE_CONNECT_TIMEOUT_MS` | `2500` | TCP connect timeout for a probe or metadata fetch |
@@ -206,12 +310,34 @@ never a hard crash).
 | `SCOUT_IDLE_SECS` | `7200` | Scout: an info-hash nobody asked about for this long is forgotten |
 | `SCOUT_CACHE_MB` | `16` | Scout: memory for remembered scores (about 96 bytes per address) |
 | `SCOUT_MAX_ADDRS` | `1000` | Scout: addresses remembered per info-hash (oldest dead dropped first) |
-| `ALLOW_PRIVATE_PEERS` | `false` | Stream and probe loopback/private peer addresses. Only for local testing |
+| `ALLOW_PRIVATE_PEERS` | `false` | `1` or `true`: stream and probe loopback/private peer addresses, and let tunnels dial them for requests made straight to a loopback listener on a loopback host without `CLIENT_IP_HEADER` (never through nginx). Only for local testing |
 | `PEERS_STREAM_SECS` | `30` | Streamed `/peers?ih=`: the response closes after this long (1–120) |
 | `PEERS_PER_IP_PER_MINUTE` | `30` | Streamed `/peers`: requests per minute per client IP, then 429 |
 | `PEERS_STREAMS_PER_IP` | `4` | Streamed `/peers`: concurrent streams per client IP, then 429 |
 | `PEERS_STREAMS_TOTAL` | `200` | Streamed `/peers`: concurrent streams in total, then 429 |
 | `CLIENT_IP_HEADER` | `X-Real-IP` | Header with the client IP set by the reverse proxy; trusted only on connections from loopback |
+| `TUNNEL_CONNECT_TIMEOUT_MS` | `5000` | Tunnel: TCP connect timeout of an `open` (100–60000) |
+| `TUNNEL_HANDSHAKE_TIMEOUT_MS` | `10000` | Tunnel: wait for the remote's BitTorrent handshake (100–60000) |
+| `TUNNEL_MAX_CONNECTIONS` | `6` | Tunnel: connections per WebSocket (1–64) |
+| `TUNNEL_IDLE_TIMEOUT_MS` | `90000` | Tunnel: a connection, or a WebSocket, without traffic is closed after this (1000–600000) |
+| `TUNNEL_SESSION_TIMEOUT_S` | `7200` | Tunnel: maximum session length (5–86400) |
+| `TUNNEL_SOCKETS_PER_SESSION` | `3` | Tunnel: WebSockets per `?session=` (1–8), then 429 |
+| `TUNNEL_UPGRADES_PER_MINUTE` | `30` | Tunnel: upgrades per minute per client IP (1–600), then 429 |
+| `TUNNEL_MAX_PENDING_WRITE_BYTES` | `4194304` | Tunnel: bytes held for a peer that does not read before its connection is closed (65536–268435456) |
+| `TUNNEL_SOCKETS_PER_IP` | `12` | Tunnel: concurrent WebSockets per client IP (1–1000), then 429 |
+| `TUNNEL_MAX_SOCKETS` | `256` | Tunnel: concurrent WebSockets in total (1–100000), then 503 |
+| `TUNNEL_INBOUND_ADDR` | unset | Inbound peers: listen address while a session announces (e.g. `0.0.0.0:6883`), TCP and UDP (uTP) on the same port, which must differ from `DHT_PORT`; unset: no announce, no listener |
+| `TUNNEL_ANNOUNCE_PORT` | `0` | Port announced to trackers and the DHT; `0` = the listener's (else 1024–65535, for a forwarded port) |
+| `TUNNEL_ANNOUNCE_INTERVAL_S` | `900` | Re-announce period while announcing (60–3600) |
+| `TUNNEL_ANNOUNCE_DHT` | `1` | Also announce to the DHT (`0` to disable) |
+| `TUNNEL_INBOUND_PER_SESSION` | `16` | Inbound connections per session (1–256) |
+| `TUNNEL_INBOUND_MAX` | `256` | Inbound connections in total (1–100000) |
+| `TUNNEL_INBOUND_PENDING` | `64` | Inbound connections still handshaking, in total (1–10000) |
+| `TUNNEL_ANNOUNCES_PER_SOCKET` | `2` | Info-hashes one WebSocket may announce (1–16) |
+| `TUNNEL_ANNOUNCES_MAX` | `64` | Info-hashes announced at once on the gateway (1–10000) |
+| `TUNNEL_ANNOUNCES_PER_IP` | `4` | Info-hashes the WebSockets of one client IP (an IPv6 /64) may announce at once (1–1000) |
+| `TUNNEL_ANNOUNCE_ROUNDS_PER_IP_PER_MINUTE` | `6` | Announce rounds (a new swarm, or trackers added to one) a client IP may start per minute (1–600) |
+| `TUNNEL_ANNOUNCE_ROUNDS_PER_MINUTE` | `60` | Announce rounds started per minute on the gateway, all clients together (1–10000) |
 
 Example:
 
@@ -319,6 +445,13 @@ your other services the standard way.
 
    ```sh
    sudo ufw allow 6881/udp   # optional
+   ```
+
+   With `TUNNEL_INBOUND_ADDR` set (tunnel inbound peers), its port must be
+   open inbound for TCP and UDP (uTP), and differ from the DHT's:
+
+   ```sh
+   sudo ufw allow 6883/tcp && sudo ufw allow 6883/udp
    ```
 
 5. **DNS.** Point your subdomain (e.g. `peers.example.com`) at the VPS's

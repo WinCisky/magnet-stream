@@ -19,6 +19,10 @@ pub struct Config {
     /// Byte budget of each discovery result cache (`PEERS_CACHE_MB`).
     pub peers_cache_bytes: u64,
     pub dht_port: u16,
+    /// DHT bootstrap nodes (`DHT_BOOTSTRAP`): `None` the DHT library's
+    /// defaults (public routers); an empty list (`none`) no bootstrap at all,
+    /// so the node never contacts the public DHT (hermetic tests).
+    pub dht_bootstrap: Option<Vec<String>>,
     /// Max peer probes in flight across all swarms.
     pub probe_concurrency: usize,
     /// Max peers probed per swarm refresh, and per info-hash per
@@ -70,6 +74,158 @@ pub struct Config {
     /// Header carrying the client IP, set by the reverse proxy (nginx's
     /// `X-Real-IP`); trusted only on connections from loopback.
     pub client_ip_header: String,
+    /// The tunnel gateway `/v1/tunnel` (`TUNNEL_*`, docs/tunnel-protocol.md).
+    pub tunnel: TunnelSettings,
+}
+
+/// Limits of the tunnel gateway. Same variable names and defaults as the
+/// Cloudflare gateway (apps/gateway/src/tunnel/config.ts) where they exist;
+/// a value that is not an integer within its range is logged and replaced
+/// by the default.
+#[derive(Debug, Clone)]
+pub struct TunnelSettings {
+    /// TCP connect timeout of an `open` (`TUNNEL_CONNECT_TIMEOUT_MS`, 5000, 100..=60000).
+    pub connect_timeout: Duration,
+    /// Wait for the remote's handshake (`TUNNEL_HANDSHAKE_TIMEOUT_MS`, 10000, 100..=60000).
+    pub handshake_timeout: Duration,
+    /// Connections per WebSocket (`TUNNEL_MAX_CONNECTIONS`, 6, 1..=64).
+    pub max_connections: usize,
+    /// A connection, or a WebSocket, without traffic is closed after this
+    /// (`TUNNEL_IDLE_TIMEOUT_MS`, 90000, 1000..=600000).
+    pub idle_timeout: Duration,
+    /// Maximum session length (`TUNNEL_SESSION_TIMEOUT_S`, 7200, 5..=86400).
+    pub session_timeout: Duration,
+    /// WebSockets per session (`TUNNEL_SOCKETS_PER_SESSION`, 3, 1..=8).
+    pub sockets_per_session: usize,
+    /// Upgrades per minute per client IP (`TUNNEL_UPGRADES_PER_MINUTE`, 30, 1..=600).
+    pub upgrades_per_minute: u32,
+    /// Bytes held for a peer that does not read before its connection is
+    /// closed (`TUNNEL_MAX_PENDING_WRITE_BYTES`, 4 MiB, 64 KiB..=256 MiB).
+    pub max_pending_write: usize,
+    /// Concurrent WebSockets per client IP (`TUNNEL_SOCKETS_PER_IP`, 12, 1..=1000).
+    pub sockets_per_ip: u32,
+    /// Concurrent WebSockets in total (`TUNNEL_MAX_SOCKETS`, 256, 1..=100000):
+    /// with `TUNNEL_MAX_CONNECTIONS` it bounds the peer sockets (and file
+    /// descriptors) the gateway holds.
+    pub max_sockets: u32,
+    /// Inbound peers (docs/tunnel-protocol.md › Announce and inbound
+    /// connections): where the listener binds while a session announces
+    /// (`TUNNEL_INBOUND_ADDR`, e.g. `0.0.0.0:6883`): TCP and, on the same
+    /// port number, UDP for uTP, so the port must differ from `DHT_PORT`
+    /// (a clash turns inbound peers off). Unset: no announce, no listener
+    /// (`announced` UNSUPPORTED).
+    pub inbound_addr: Option<SocketAddr>,
+    /// Port announced to trackers and the DHT (`TUNNEL_ANNOUNCE_PORT`, 0 =
+    /// the listener's own; else 1024..=65535, for a forwarded port).
+    pub announce_port: u16,
+    /// Re-announce period while a session announces (`TUNNEL_ANNOUNCE_INTERVAL_S`, 900, 60..=3600).
+    pub announce_interval: Duration,
+    /// Announce to the DHT too (`TUNNEL_ANNOUNCE_DHT`, on unless `0`/`false`).
+    pub announce_dht: bool,
+    /// Inbound connections per session (`TUNNEL_INBOUND_PER_SESSION`, 16, 1..=256).
+    pub inbound_per_session: usize,
+    /// Inbound connections in total (`TUNNEL_INBOUND_MAX`, 256, 1..=100000).
+    pub inbound_max: usize,
+    /// Inbound connections still handshaking, in total (`TUNNEL_INBOUND_PENDING`, 64, 1..=10000).
+    pub inbound_pending: usize,
+    /// Info-hashes one WebSocket may announce (`TUNNEL_ANNOUNCES_PER_SOCKET`, 2, 1..=16).
+    pub announces_per_socket: usize,
+    /// Info-hashes announced at once on the gateway (`TUNNEL_ANNOUNCES_MAX`, 64, 1..=10000).
+    pub announces_max: usize,
+    /// Info-hashes the WebSockets of one client IP (an IPv6 /64) may
+    /// announce at once (`TUNNEL_ANNOUNCES_PER_IP`, 4, 1..=1000).
+    pub announces_per_ip: usize,
+    /// Announce rounds a client IP may start per minute: a new swarm, or
+    /// trackers added to one (`TUNNEL_ANNOUNCE_ROUNDS_PER_IP_PER_MINUTE`, 6, 1..=600).
+    pub announce_rounds_per_ip: u32,
+    /// Announce rounds started per minute on the gateway, all clients
+    /// together (`TUNNEL_ANNOUNCE_ROUNDS_PER_MINUTE`, 60, 1..=10000).
+    pub announce_rounds_max: u32,
+}
+
+impl TunnelSettings {
+    /// The inbound port takes uTP on UDP too, so it cannot be the DHT
+    /// node's UDP port: on a clash inbound peers are turned off (logged).
+    pub fn without_dht_clash(mut self, dht_port: u16) -> Self {
+        if let Some(addr) = self.inbound_addr {
+            if addr.port() != 0 && addr.port() == dht_port {
+                tracing::warn!(
+                    port = dht_port,
+                    "TUNNEL_INBOUND_ADDR uses DHT_PORT (both need UDP): inbound peers are off"
+                );
+                self.inbound_addr = None;
+            }
+        }
+        self
+    }
+
+    pub fn from_env() -> Self {
+        Self {
+            connect_timeout: Duration::from_millis(env_range(
+                "TUNNEL_CONNECT_TIMEOUT_MS",
+                5_000,
+                100,
+                60_000,
+            )),
+            handshake_timeout: Duration::from_millis(env_range(
+                "TUNNEL_HANDSHAKE_TIMEOUT_MS",
+                10_000,
+                100,
+                60_000,
+            )),
+            max_connections: env_range("TUNNEL_MAX_CONNECTIONS", 6, 1, 64) as usize,
+            idle_timeout: Duration::from_millis(env_range(
+                "TUNNEL_IDLE_TIMEOUT_MS",
+                90_000,
+                1_000,
+                600_000,
+            )),
+            session_timeout: Duration::from_secs(env_range(
+                "TUNNEL_SESSION_TIMEOUT_S",
+                7_200,
+                5,
+                86_400,
+            )),
+            sockets_per_session: env_range("TUNNEL_SOCKETS_PER_SESSION", 3, 1, 8) as usize,
+            upgrades_per_minute: env_range("TUNNEL_UPGRADES_PER_MINUTE", 30, 1, 600) as u32,
+            max_pending_write: env_range(
+                "TUNNEL_MAX_PENDING_WRITE_BYTES",
+                4 * MIB,
+                64 * 1024,
+                256 * MIB,
+            ) as usize,
+            sockets_per_ip: env_range("TUNNEL_SOCKETS_PER_IP", 12, 1, 1_000) as u32,
+            max_sockets: env_range("TUNNEL_MAX_SOCKETS", 256, 1, 100_000) as u32,
+            inbound_addr: env_addr("TUNNEL_INBOUND_ADDR"),
+            announce_port: match env_range("TUNNEL_ANNOUNCE_PORT", 0, 0, 65_535) {
+                port @ (0 | 1024..) => port as u16,
+                port => {
+                    tracing::warn!(
+                        port,
+                        "TUNNEL_ANNOUNCE_PORT below 1024, using the listener's"
+                    );
+                    0
+                }
+            },
+            announce_interval: Duration::from_secs(env_range(
+                "TUNNEL_ANNOUNCE_INTERVAL_S",
+                900,
+                60,
+                3_600,
+            )),
+            announce_dht: env_flag_or("TUNNEL_ANNOUNCE_DHT", true),
+            inbound_per_session: env_range("TUNNEL_INBOUND_PER_SESSION", 16, 1, 256) as usize,
+            inbound_max: env_range("TUNNEL_INBOUND_MAX", 256, 1, 100_000) as usize,
+            inbound_pending: env_range("TUNNEL_INBOUND_PENDING", 64, 1, 10_000) as usize,
+            announces_per_socket: env_range("TUNNEL_ANNOUNCES_PER_SOCKET", 2, 1, 16) as usize,
+            announces_max: env_range("TUNNEL_ANNOUNCES_MAX", 64, 1, 10_000) as usize,
+            announces_per_ip: env_range("TUNNEL_ANNOUNCES_PER_IP", 4, 1, 1_000) as usize,
+            announce_rounds_per_ip: env_range("TUNNEL_ANNOUNCE_ROUNDS_PER_IP_PER_MINUTE", 6, 1, 600)
+                as u32,
+            announce_rounds_max: env_range("TUNNEL_ANNOUNCE_ROUNDS_PER_MINUTE", 60, 1, 10_000)
+                as u32,
+        }
+    }
 }
 
 /// A config value that must never end up in logs (`Config` is logged at
@@ -149,6 +305,7 @@ impl Config {
     }
 
     pub fn from_env() -> Self {
+        let dht_port = env_parse("DHT_PORT", 6881u16);
         Config {
             bind_addr: env_parse("BIND_ADDR", "0.0.0.0:8080".parse().unwrap()),
             cache_ttl: env_secs("CACHE_TTL_SECS", 300),
@@ -158,7 +315,8 @@ impl Config {
             default_trackers: default_trackers_from_env(),
             max_trackers: env_parse("MAX_TRACKERS", 20usize),
             peers_cache_bytes: env_parse("PEERS_CACHE_MB", 16u64).max(1) * MIB,
-            dht_port: env_parse("DHT_PORT", 6881u16),
+            dht_port,
+            dht_bootstrap: dht_bootstrap_from_env(),
             probe_concurrency: env_parse("PROBE_CONCURRENCY", 256usize).max(1),
             max_probe_peers: env_parse("MAX_PROBE_PEERS", 1000usize),
             probe_connect_timeout: env_millis("PROBE_CONNECT_TIMEOUT_MS", 2500),
@@ -183,7 +341,7 @@ impl Config {
             scout_idle: env_secs("SCOUT_IDLE_SECS", 7200).max(Duration::from_secs(1)),
             scout_cache_bytes: env_parse("SCOUT_CACHE_MB", 16u64).max(1) * MIB,
             scout_max_addrs: env_parse("SCOUT_MAX_ADDRS", 1000usize).max(1),
-            allow_private_peers: env_parse("ALLOW_PRIVATE_PEERS", false),
+            allow_private_peers: env_flag("ALLOW_PRIVATE_PEERS"),
             peers_stream_deadline: env_secs("PEERS_STREAM_SECS", 30)
                 .clamp(Duration::from_secs(1), Duration::from_secs(120)),
             peers_per_ip_per_minute: env_parse("PEERS_PER_IP_PER_MINUTE", 30u32).max(1),
@@ -194,6 +352,7 @@ impl Config {
                 .map(|s| s.trim().to_ascii_lowercase())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "x-real-ip".to_string()),
+            tunnel: TunnelSettings::from_env().without_dht_clash(dht_port),
         }
     }
 }
@@ -232,6 +391,29 @@ fn default_trackers_from_env() -> Vec<String> {
     }
 }
 
+/// `DHT_BOOTSTRAP`: unset or empty = the library's defaults; `none` (or
+/// `off`) = no bootstrap; else a comma-separated list of `host:port`.
+fn dht_bootstrap_from_env() -> Option<Vec<String>> {
+    parse_dht_bootstrap(env::var("DHT_BOOTSTRAP").ok().as_deref())
+}
+
+fn parse_dht_bootstrap(raw: Option<&str>) -> Option<Vec<String>> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.eq_ignore_ascii_case("none") || raw.eq_ignore_ascii_case("off") {
+        return Some(Vec::new());
+    }
+    Some(
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     match env::var(key) {
         Ok(raw) => raw.trim().parse().unwrap_or_else(|_| {
@@ -242,10 +424,115 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     }
 }
 
+/// A switch: `1` or `true` (any case) turns it on; unset, empty, `0` or
+/// `false` leave it off; anything else is logged and leaves it off.
+fn env_flag(key: &str) -> bool {
+    let Ok(raw) = env::var(key) else {
+        return false;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => true,
+        "" | "0" | "false" => false,
+        _ => {
+            tracing::warn!(key, value = %raw, "invalid switch, leaving it off");
+            false
+        }
+    }
+}
+
+/// A switch with a default for unset or empty: `1`/`true` on, `0`/`false`
+/// off; anything else is logged and gives the default.
+fn env_flag_or(key: &str, default: bool) -> bool {
+    let Ok(raw) = env::var(key) else {
+        return default;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => true,
+        "0" | "false" => false,
+        "" => default,
+        _ => {
+            tracing::warn!(key, value = %raw, "invalid switch, using the default");
+            default
+        }
+    }
+}
+
+/// A socket address (`0.0.0.0:6881`, `[::]:6881`); unset or empty: None;
+/// anything else is logged and gives None.
+fn env_addr(key: &str) -> Option<SocketAddr> {
+    let raw = env::var(key).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.parse() {
+        Ok(addr) => Some(addr),
+        Err(_) => {
+            tracing::warn!(key, value = %raw, "invalid address, leaving it unset");
+            None
+        }
+    }
+}
+
+/// An integer variable within `min..=max`; anything else is logged and
+/// replaced by `default`.
+fn env_range(key: &str, default: u64, min: u64, max: u64) -> u64 {
+    let value = env_parse(key, default);
+    if (min..=max).contains(&value) {
+        value
+    } else {
+        tracing::warn!(
+            key,
+            value,
+            min,
+            max,
+            "config value out of range, using default"
+        );
+        default
+    }
+}
+
 fn env_secs(key: &str, default_secs: u64) -> Duration {
     Duration::from_secs(env_parse(key, default_secs))
 }
 
 fn env_millis(key: &str, default_millis: u64) -> Duration {
     Duration::from_millis(env_parse(key, default_millis))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dht_bootstrap_defaults_none_or_a_list() {
+        assert_eq!(parse_dht_bootstrap(None), None);
+        assert_eq!(parse_dht_bootstrap(Some(" ")), None);
+        assert_eq!(parse_dht_bootstrap(Some("none")), Some(vec![]));
+        assert_eq!(parse_dht_bootstrap(Some("OFF")), Some(vec![]));
+        assert_eq!(
+            parse_dht_bootstrap(Some("127.0.0.1:6881, router.example:6881,")),
+            Some(vec![
+                "127.0.0.1:6881".to_string(),
+                "router.example:6881".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn the_inbound_port_cannot_be_the_dht_port() {
+        let with = |addr: &str| TunnelSettings {
+            inbound_addr: Some(addr.parse().unwrap()),
+            ..TunnelSettings::from_env()
+        };
+        assert_eq!(
+            with("0.0.0.0:6881").without_dht_clash(6881).inbound_addr,
+            None
+        );
+        let other = with("0.0.0.0:6883").without_dht_clash(6881);
+        assert_eq!(other.inbound_addr, Some("0.0.0.0:6883".parse().unwrap()));
+        // Port 0 (tests) picks a free port, never the DHT's.
+        let any = with("127.0.0.1:0").without_dht_clash(6881);
+        assert!(any.inbound_addr.is_some());
+    }
 }

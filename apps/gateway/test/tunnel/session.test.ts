@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+	AnnounceStatus,
 	CloseReason,
 	FailReason,
+	Transport,
 	FrameType,
 	decodeMessage,
 	encodeFrames,
@@ -257,6 +259,18 @@ describe("tunnel session", () => {
 		expect(t.frames().map((f) => (f as { reason: number }).reason)).toEqual(Array(4).fill(FailReason.FORBIDDEN_ADDRESS));
 	});
 
+	it("refuses an open over uTP (no UDP on Workers) without connecting", async () => {
+		const t = setup(() => ({ kind: "peer" }));
+		t.send({ ...open(1), transport: Transport.UTP }, { ...open(2), transport: 9 }, open(3));
+		await until(() => t.frames().some((f) => f.type === "opened"));
+		expect(t.frames().slice(0, 2)).toEqual([
+			{ type: "failed", conn: 1, reason: FailReason.UNSUPPORTED_TRANSPORT },
+			{ type: "failed", conn: 2, reason: FailReason.UNSUPPORTED_TRANSPORT },
+		]);
+		expect(t.connected).toHaveLength(1);
+		expect(t.session.activeSlots).toBe(1);
+	});
+
 	it("allows at most 6 connections per WebSocket", async () => {
 		const t = setup(() => ({ kind: "peer" }));
 		t.send(...[1, 2, 3, 4, 5, 6, 7].map((c) => open(c)));
@@ -293,6 +307,21 @@ describe("tunnel session", () => {
 		const v = setup([]);
 		v.session.onMessage("hello");
 		expect(v.wsClosed[0].code).toBe(1003);
+	});
+
+	it("answers announce with unsupported and withdraw with stopped, without connecting anything", async () => {
+		const t = setup([]);
+		t.send({ type: "announce", conn: 0, infoHash: INFO_HASH, reserved: RESERVED, peerId: PEER_ID, trackers: ["udp://t.example:1337/announce"] });
+		t.send({ type: "withdraw", conn: 0, infoHash: INFO_HASH });
+		expect(t.frames()).toEqual([
+			{ type: "announced", conn: 0, infoHash: INFO_HASH, status: AnnounceStatus.UNSUPPORTED },
+			{ type: "announced", conn: 0, infoHash: INFO_HASH, status: AnnounceStatus.STOPPED },
+		]);
+		expect(t.connected).toEqual([]);
+		expect(t.wsClosed).toEqual([]);
+		// `announced` only flows gateway → client.
+		t.send({ type: "announced", conn: 0, infoHash: INFO_HASH, status: 0 });
+		expect(t.wsClosed[0].code).toBe(1002);
 	});
 
 	it("closing the WebSocket closes every TCP socket", async () => {

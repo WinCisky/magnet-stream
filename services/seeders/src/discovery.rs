@@ -146,7 +146,7 @@ impl Limiter {
 /// dial (they refuse ports below 1024). `allow_private` (local tests and
 /// development only, `ALLOW_PRIVATE_PEERS`) lifts the public-IP rule.
 pub fn is_dialable(addr: &SocketAddr, allow_private: bool) -> bool {
-    addr.port() >= 1024 && (allow_private || netguard::is_public(addr.ip()))
+    netguard::tunnel_may_dial(addr, allow_private)
 }
 
 /// A probed address: `{"peer":…,"score":…,"alive":true,"seed":…,…}` for a

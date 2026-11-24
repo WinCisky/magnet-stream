@@ -85,6 +85,9 @@ describe("upload through the gateway", () => {
 		// Counted when queued: blocks still waiting for the lazy flush die with stop().
 		expect(stats.bytes).toBeGreaterThanOrEqual(leecher.stats.received.bytes);
 		expect(d.upload.bytes).toBe(stats.bytes);
+		// One gateway (a Cloudflare one): every byte, both ways, went through it.
+		expect(d.paths.cloudflare).toEqual({ downloaded: s.mgr.downloadedBytes, uploaded: stats.bytes, connections: 1 });
+		expect(d.paths.vps).toEqual({ downloaded: 0, uploaded: 0, connections: 0 });
 		// Every read was for a verified piece, through a request that passed the checks.
 		expect(s.source.reads).toBe(stats.reads);
 		// Upstream: one batch per 400 ms per socket at most, plus the upload flushes (one per 2 s per socket).

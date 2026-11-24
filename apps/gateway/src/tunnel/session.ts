@@ -9,6 +9,7 @@
 //     the same info-hash;
 //   - at most 6 connections per WebSocket (a slot frees once its socket closed);
 //   - only public addresses on ports >= 1024 (address-policy.ts);
+//   - TCP only: an `open` over uTP fails with UNSUPPORTED_TRANSPORT;
 //   - a malformed frame closes the whole session;
 //   - bytes held for a peer and not yet written to it are bounded (4 MiB):
 //     a peer that does not read is closed (`close` WRITE_OVERFLOW), the
@@ -22,12 +23,14 @@
 // Nothing is stored; logs carry no client IP, peer address or info-hash.
 
 import {
+	AnnounceStatus,
 	CloseReason,
 	DEFAULT_IDLE_TIMEOUT_MS,
 	DEFAULT_MAX_PENDING_WRITE_BYTES,
 	FailReason,
 	MAX_CONNECTIONS_PER_SOCKET,
 	SessionCloseCode,
+	Transport,
 	decodeMessage,
 	encodeFrames,
 	formatSessionEnd,
@@ -257,8 +260,14 @@ export class TunnelSession {
 			}
 			case "ping":
 				return;
+			case "announce":
+				// No inbound peers on Workers (no listening socket): the VPS gateway does this.
+				this.log("tunnel.announce", { status: "unsupported" });
+				return this.emit([{ type: "announced", conn: 0, infoHash: frame.infoHash.slice(), status: AnnounceStatus.UNSUPPORTED }]);
+			case "withdraw":
+				return this.emit([{ type: "announced", conn: 0, infoHash: frame.infoHash.slice(), status: AnnounceStatus.STOPPED }]);
 			default:
-				// opened / failed / accept only flow gateway → client.
+				// opened / failed / accept / announced only flow gateway → client.
 				this.log("tunnel.protocol_error", { code: `unexpected_${frame.type}` });
 				return this.abort(SessionCloseCode.PROTOCOL_ERROR, "protocol_error");
 		}
@@ -269,6 +278,8 @@ export class TunnelSession {
 		if (this.conns.has(frame.conn)) return this.fail(frame.conn, FailReason.CONN_IN_USE);
 		if (this.slots >= this.opts.maxConnections) return this.fail(frame.conn, FailReason.TOO_MANY_CONNECTIONS);
 		if (checkAddress(frame.address, this.opts.allowPrivate) !== "ok") return this.fail(frame.conn, FailReason.FORBIDDEN_ADDRESS);
+		// Workers have outbound TCP only: no UDP, so no uTP (docs/tunnel-protocol.md › Peer fields).
+		if ((frame.transport ?? Transport.TCP) !== Transport.TCP) return this.fail(frame.conn, FailReason.UNSUPPORTED_TRANSPORT);
 
 		const c: Conn = { id: frame.conn, state: "opening", writes: Promise.resolve(), pending: 0, lastActivity: this.opts.now() };
 		this.conns.set(c.id, c);
